@@ -1,0 +1,248 @@
+name: RMG
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-24.04, features: ON, architecture: x86_64, configuration: Release }
+          - { os: ubuntu-24.04, features: ON, architecture: x86_64, configuration: Debug }
+          - { os: ubuntu-24.04, features: OFF, architecture: x86_64, configuration: Release }
+          - { os: ubuntu-24.04, features: OFF, architecture: x86_64, configuration: Debug }
+          - { os: ubuntu-24.04-arm, features: ON, architecture: aarch64, configuration: Release }
+          - { os: ubuntu-24.04-arm, features: ON, architecture: aarch64, configuration: Debug }
+          - { os: ubuntu-24.04-arm, features: OFF, architecture: aarch64, configuration: Release }
+          - { os: ubuntu-24.04-arm, features: OFF, architecture: aarch64, configuration: Debug }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: linux-${{ matrix.architecture }}-${{ matrix.features }}-${{ matrix.configuration }}
+      - name: Install Packages
+        run: |
+          # remove and disable snap, this fixes long update times
+          # taken from https://github.com/ading2210/gh-actions-remove-snap/blob/main/workflow.sh
+          sudo systemctl disable --now snapd
+          sudo apt-get purge -y snapd
+          echo "Package: snapd"    | sudo tee /etc/apt/preferences.d/disable-snap.pref
+          echo "Pin: release a=*"  | sudo tee -a /etc/apt/preferences.d/disable-snap.pref
+          echo "Pin-Priority: -10" | sudo tee -a /etc/apt/preferences.d/disable-snap.pref
+          sudo apt-mark hold firefox
+
+          sudo apt-get -y update
+          sudo apt-get -y upgrade
+          sudo apt-get -y install cmake libusb-1.0-0-dev libhidapi-dev libsamplerate0-dev libspeex-dev libminizip-dev libfreetype6-dev \
+            libgl1-mesa-dev libglu1-mesa-dev pkg-config zlib1g-dev binutils-dev libspeexdsp-dev qt6-base-dev qt6-tools-dev qt6-translations-l10n libqt6svg6-dev libqt6websockets6-dev libvulkan-dev \
+            build-essential nasm git zip appstream xvfb qt6ct mesa-vulkan-drivers
+
+          # sdl3 dependencies
+          sudo apt-get -y install build-essential git make \
+            pkg-config cmake ninja-build gnome-desktop-testing libasound2-dev libpulse-dev \
+            libaudio-dev libjack-dev libsndio-dev libx11-dev libxext-dev \
+            libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
+            libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev libgles2-mesa-dev \
+            libegl1-mesa-dev libdbus-1-dev libibus-1.0-dev libudev-dev
+      - name: Prepare Environment
+        run: |
+          echo "GIT_REVISION=$(git describe --tags --always)" >> $GITHUB_ENV
+      - name: Build SDL3
+        run: |
+          export sdl_dir="$(pwd)/../SDL3"
+
+          git clone https://github.com/libsdl-org/SDL.git "$sdl_dir" -b release-3.2.28 --depth=1
+
+          mkdir -p "$sdl_dir/build"
+          cmake -S "$sdl_dir" -B "$sdl_dir/build" \
+                -DCMAKE_BUILD_TYPE="Release" \
+                -DCMAKE_INSTALL_LIBDIR="lib/${{ matrix.architecture }}-linux-gnu" \
+                -DCMAKE_INSTALL_FULL_LIBDIR="/usr/lib/${{ matrix.architecture }}-linux-gnu" \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+          cmake --build "$sdl_dir/build" --parallel "$(nproc)"
+          sudo cmake --install "$sdl_dir/build" --prefix /usr/
+      - name: Build RMG (AppImage)
+        run: |
+          export src_dir="$(pwd)"
+          export build_dir="$(pwd)/Build/AppImage"
+          export bin_dir="$(pwd)/Bin/AppImage"
+    
+          mkdir $build_dir Bin/ -p
+          cmake -S "$src_dir" -B "$build_dir" -DCMAKE_BUILD_TYPE="${{ matrix.configuration }}" \
+                -DNETPLAY=${{ matrix.features }} \
+                -DVRU=${{ matrix.features }} \
+                -DUSE_ANGRYLION=${{ matrix.features }} \
+                -DUPDATER=${{ matrix.features }} \
+                -DAPPIMAGE_UPDATER=${{ matrix.features }} \
+                -DPORTABLE_INSTALL=OFF \
+                -DCMAKE_INSTALL_PREFIX="/usr" \
+                -DCMAKE_INSTALL_LIBDIR="lib"  \
+                -G "Unix Makefiles"
+
+          cmake --build "$build_dir" --parallel "$(nproc)"
+          cmake --install "$build_dir" --strip --prefix="$bin_dir/usr"
+        shell: bash
+      - name: Create AppImage
+        if: ${{ matrix.features == 'ON' && matrix.architecture == 'x86_64' && matrix.configuration == 'Release' }}
+        run: |
+          ./Package/AppImage/Create.sh
+        shell: bash
+      - name: Upload RMG (AppImage)
+        if: ${{ matrix.features == 'ON' && matrix.architecture == 'x86_64' && matrix.configuration == 'Release' }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: RMG-K-Portable-Linux64-${{ env.GIT_REVISION }}
+          path: Bin/*.AppImage
+
+  build-windows:
+    runs-on: windows-2025
+    strategy:
+      matrix:
+        include:
+          - { features: ON, configuration: Release }
+          - { features: ON, configuration: Debug }
+          - { features: OFF, configuration: Release }
+          - { features: OFF, configuration: Debug }
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: windows-${{ matrix.features }}-${{ matrix.configuration }}-crt-r3
+      - uses: msys2/setup-msys2@v2
+        with:
+          path-type: inherit
+          update: true
+          msystem: ucrt64
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-freetype
+            mingw-w64-ucrt-x86_64-libpng
+            mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-qt6
+            mingw-w64-ucrt-x86_64-libusb
+            mingw-w64-ucrt-x86_64-hidapi
+            mingw-w64-ucrt-x86_64-speexdsp
+            mingw-w64-ucrt-x86_64-libsamplerate
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            git
+            curl
+      # Temporary mitigation for the CRT-triggered AV detections; recheck newer CRTs before updating.
+      - name: Pin tested MinGW CRT
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          package=mingw-w64-ucrt-x86_64-crt
+          version=14.0.0.r3.g5356cf297-1
+          archive="$package-$version-any.pkg.tar.zst"
+          checksum=0281f4947d26acf996805d76fc30532a8aa9c9bb7c9acacae3ae504faa90ac51
+          cd "$RUNNER_TEMP"
+          curl --fail --location --retry 3 --proto '=https' --proto-redir '=https' \
+            "https://repo.msys2.org/mingw/ucrt64/$archive" -o "$archive"
+          printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check -
+          pacman -U --needed --noconfirm "$archive"
+          test "$(pacman -Q "$package")" = "$package $version"
+      - name: Install minizip 1.3.1
+        shell: msys2 {0}
+        run: |
+          pacman -U --noconfirm \
+            "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-minizip-1.3.1-1-any.pkg.tar.zst"
+      - name: Prepare Environment
+        run: |
+          $env:revision = git describe --tags --always
+          echo "GIT_REVISION=$env:revision" >> $env:GITHUB_ENV
+        shell: pwsh
+      # n02 Kaillera client is now compiled as a static library (Source/n02/)
+      # No need to download kailleraclient.dll
+      - name: Build RMG (Portable)
+        run: |
+          export src_dir="$(pwd)"
+          export build_dir="$(pwd)/Build/${{ matrix.configuration }}"
+
+          cmake -S "$src_dir" -B "$build_dir" -DCMAKE_BUILD_TYPE="${{ matrix.configuration }}" \
+                -DNETPLAY=${{ matrix.features }} \
+                -DVRU=${{ matrix.features }} \
+                -DUSE_ANGRYLION=${{ matrix.features }} \
+                -DUPDATER=${{ matrix.features }} \
+                -DPORTABLE_INSTALL=ON \
+                -G "MSYS Makefiles"
+
+          cmake --build "$build_dir" --parallel "$(nproc)"
+          cmake --install "$build_dir" --strip --prefix="$src_dir"
+          cmake --build "$build_dir" --target=bundle_dependencies
+        shell: msys2 {0}
+      - name: Create Installer
+        if: ${{ matrix.features == 'ON' && matrix.configuration == 'Release' }}
+        run: .\Build\Release\Source\Installer\CreateInstaller.bat
+      - name: Configure RMG (Portable)
+        if: ${{ matrix.features == 'ON' && matrix.configuration == 'Release' }}
+        run: touch Bin/Release/portable.txt
+        shell: msys2 {0}
+      - name: Upload RMG (Portable)
+        if: ${{ matrix.features == 'ON' && matrix.configuration == 'Release' }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: RMG-K-Portable-Windows64-${{ env.GIT_REVISION }}
+          path: Bin/Release/*
+      - name: Upload RMG (Installer)
+        if: ${{ matrix.features == 'ON' && matrix.configuration == 'Release' }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: RMG-K-Setup-Windows64-${{ env.GIT_REVISION }}
+          path: Bin/*.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Get version from tag
+        run: |
+          echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+
+          # Find and move Linux AppImage
+          find artifacts -name "*.AppImage" -exec cp {} release/ \;
+
+          # Zip Windows portable build
+          if [ -d "artifacts/RMG-K-Portable-Windows64-${{ env.VERSION }}" ]; then
+            cd "artifacts/RMG-K-Portable-Windows64-${{ env.VERSION }}"
+            zip -r "../../release/RMG-K-Portable-Windows64-${{ env.VERSION }}.zip" .
+            cd ../..
+          fi
+
+          # Copy Windows installer
+          find artifacts -name "RMG-K-Setup*.exe" -exec cp {} release/ \;
+
+          ls -la release/
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(env.VERSION, '-') }}

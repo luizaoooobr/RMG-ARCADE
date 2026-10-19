@@ -1,0 +1,792 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>639</width>
+    <height>543</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>RMG Arcade Edition</string>
+  </property>
+  <property name="windowIcon">
+   <iconset resource="UIResources.qrc">
+    <normaloff>:/Resource/RMG.png</normaloff>:/Resource/RMG.png</iconset>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QHBoxLayout" name="horizontalLayout"/>
+  </widget>
+  <widget class="QMenuBar" name="menubar">
+   <property name="geometry">
+    <rect>
+     <x>0</x>
+     <y>0</y>
+     <width>639</width>
+     <height>30</height>
+    </rect>
+   </property>
+   <widget class="QMenu" name="menuSystem">
+    <property name="title">
+     <string>&amp;Game</string>
+    </property>
+    <widget class="QMenu" name="menuReset">
+     <property name="title">
+      <string>&amp;Reset</string>
+     </property>
+     <property name="icon">
+      <iconset theme="restart-line"/>
+     </property>
+     <addaction name="action_System_SoftReset"/>
+     <addaction name="action_System_HardReset"/>
+    </widget>
+    <widget class="QMenu" name="menuCurrent_Save_State">
+     <property name="title">
+      <string>&amp;Current Save State</string>
+     </property>
+     <property name="icon">
+      <iconset theme="save-3-line"/>
+     </property>
+     <addaction name="actionSlot_0"/>
+     <addaction name="actionSlot_1"/>
+     <addaction name="actionSlot_2"/>
+     <addaction name="actionSlot_3"/>
+     <addaction name="actionSlot_4"/>
+     <addaction name="actionSlot_5"/>
+     <addaction name="actionSlot_6"/>
+     <addaction name="actionSlot_7"/>
+     <addaction name="actionSlot_8"/>
+     <addaction name="actionSlot_9"/>
+    </widget>
+    <widget class="QMenu" name="menuSpeedFactor">
+     <property name="enabled">
+      <bool>true</bool>
+     </property>
+     <property name="title">
+      <string>Speed &amp;Factor</string>
+     </property>
+     <property name="icon">
+      <iconset theme="speed-line"/>
+     </property>
+     <addaction name="actionSpeed25"/>
+     <addaction name="actionSpeed50"/>
+     <addaction name="actionSpeed75"/>
+     <addaction name="actionSpeed100"/>
+     <addaction name="actionSpeed125"/>
+     <addaction name="actionSpeed150"/>
+     <addaction name="actionSpeed175"/>
+     <addaction name="actionSpeed200"/>
+     <addaction name="actionSpeed225"/>
+     <addaction name="actionSpeed250"/>
+     <addaction name="actionSpeed275"/>
+     <addaction name="actionSpeed300"/>
+    </widget>
+    <widget class="QMenu" name="menuNetplay">
+     <property name="title">
+      <string>Netplay</string>
+     </property>
+     <addaction name="action_Rollback_Lobby"/>
+     <addaction name="action_Netplay_P2P"/>
+     <addaction name="action_Netplay_BrowseSessions"/>
+    </widget>
+    <addaction name="action_System_StartRom"/>
+    <addaction name="action_System_OpenCombo"/>
+    <addaction name="separator"/>
+    <addaction name="action_System_Shutdown"/>
+    <addaction name="menuReset"/>
+    <addaction name="action_System_Pause"/>
+    <addaction name="separator"/>
+    <addaction name="action_System_Screenshot"/>
+    <addaction name="separator"/>
+    <addaction name="action_System_LimitFPS"/>
+    <addaction name="menuSpeedFactor"/>
+    <addaction name="separator"/>
+    <addaction name="action_System_SaveState"/>
+    <addaction name="action_System_SaveAs"/>
+    <addaction name="action_System_LoadState"/>
+    <addaction name="action_System_Load"/>
+    <addaction name="menuCurrent_Save_State"/>
+    <addaction name="separator"/>
+    <addaction name="menuNetplay"/>
+    <addaction name="separator"/>
+    <addaction name="action_System_Cheats"/>
+    <addaction name="action_System_GSButton"/>
+    <addaction name="separator"/>
+    <addaction name="action_System_Exit"/>
+   </widget>
+   <widget class="QMenu" name="menuView">
+    <property name="title">
+     <string>&amp;Video</string>
+    </property>
+    <addaction name="action_Settings_Graphics"/>
+    <addaction name="action_Settings_Rsp"/>
+    <addaction name="separator"/>
+    <addaction name="action_View_Fullscreen"/>
+    <addaction name="separator"/>
+    <addaction name="action_View_GameList"/>
+    <addaction name="action_View_GameGrid"/>
+    <addaction name="action_View_UniformSize"/>
+   </widget>
+   <widget class="QMenu" name="menuAudio">
+    <property name="title">
+     <string>&amp;Audio</string>
+    </property>
+    <addaction name="action_Settings_Audio"/>
+   </widget>
+   <widget class="QMenu" name="menuInput">
+    <property name="title">
+     <string>&amp;Input</string>
+    </property>
+    <widget class="QMenu" name="menuArcade">
+     <property name="title">
+      <string>Arcade</string>
+     </property>
+     <addaction name="action_Arcade_Input"/>
+     <addaction name="action_Arcade_Dip"/>
+    </widget>
+    <addaction name="action_Settings_Input"/>
+    <addaction name="separator"/>
+    <addaction name="menuArcade"/>
+   </widget>
+   <widget class="QMenu" name="menuSettings">
+    <property name="title">
+     <string>Mi&amp;sc</string>
+    </property>
+    <widget class="QMenu" name="menuRollback">
+     <property name="title">
+      <string>Debug</string>
+     </property>
+     <addaction name="action_Rollback_SaveState"/>
+     <addaction name="action_Rollback_LoadState"/>
+     <addaction name="separator"/>
+     <addaction name="action_Rollback_StartDebugReplay"/>
+     <addaction name="action_Rollback_VerifyDebugReplay"/>
+     <addaction name="action_Rollback_VerifyDebugReplayWithGraphics"/>
+     <addaction name="action_Rollback_StressDebugReplay"/>
+     <addaction name="separator"/>
+     <addaction name="action_Rollback_ClientInputReplay"/>
+    </widget>
+    <addaction name="action_Settings_Settings"/>
+    <addaction name="action_Settings_Plugins"/>
+    <addaction name="separator"/>
+    <addaction name="action_View_Toolbar"/>
+    <addaction name="action_View_StatusBar"/>
+    <addaction name="separator"/>
+    <addaction name="action_View_RefreshRoms"/>
+    <addaction name="action_View_ClearRomCache"/>
+    <addaction name="separator"/>
+    <addaction name="action_View_Log"/>
+    <addaction name="action_View_Search"/>
+    <addaction name="separator"/>
+    <addaction name="menuRollback"/>
+   </widget>
+   <widget class="QMenu" name="menuHelp">
+    <property name="title">
+     <string>He&amp;lp</string>
+    </property>
+    <addaction name="action_Help_Github"/>
+    <addaction name="separator"/>
+    <addaction name="action_Help_Update"/>
+    <addaction name="separator"/>
+    <addaction name="action_Help_About"/>
+   </widget>
+   <addaction name="menuSystem"/>
+   <addaction name="menuView"/>
+   <addaction name="menuAudio"/>
+   <addaction name="menuInput"/>
+   <addaction name="menuSettings"/>
+   <addaction name="menuHelp"/>
+  </widget>
+  <widget class="QStatusBar" name="statusbar"/>
+  <widget class="QToolBar" name="toolBar">
+   <property name="windowTitle">
+    <string>toolBar</string>
+   </property>
+   <property name="movable">
+    <bool>true</bool>
+   </property>
+   <property name="styleSheet">
+    <string>QToolButton { min-width: 70px; }</string>
+   </property>
+   <property name="toolButtonStyle">
+    <enum>Qt::ToolButtonStyle::ToolButtonTextUnderIcon</enum>
+   </property>
+   <property name="floatable">
+    <bool>false</bool>
+   </property>
+   <attribute name="toolBarArea">
+    <enum>TopToolBarArea</enum>
+   </attribute>
+   <attribute name="toolBarBreak">
+    <bool>false</bool>
+   </attribute>
+   <addaction name="action_System_StartRom"/>
+   <addaction name="action_System_Shutdown"/>
+   <addaction name="separator"/>
+   <addaction name="action_Netplay_Start"/>
+   <addaction name="separator"/>
+   <addaction name="action_View_Fullscreen"/>
+   <addaction name="action_Settings_Settings"/>
+   <addaction name="action_Settings_Plugins"/>
+   <addaction name="action_Toolbar_Input"/>
+   <addaction name="action_Toolbar_Playback"/>
+  </widget>
+  <action name="action_System_StartRom">
+   <property name="icon">
+    <iconset theme="file-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Load Game...</string>
+   </property>
+  </action>
+  <action name="action_System_OpenCombo">
+   <property name="icon">
+    <iconset theme="aed-electrodes-fill"/>
+   </property>
+   <property name="text">
+    <string>Load Co&amp;mbo...</string>
+   </property>
+  </action>
+  <action name="action_System_Shutdown">
+   <property name="icon">
+    <iconset theme="shut-down-line"/>
+   </property>
+   <property name="text">
+    <string>Exit &amp;Game</string>
+   </property>
+  </action>
+  <action name="action_Netplay_Start">
+   <property name="icon">
+    <iconset theme="server-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Netplay</string>
+   </property>
+  </action>
+  <action name="action_System_SoftReset">
+   <property name="icon">
+    <iconset theme="restart-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Soft Reset</string>
+   </property>
+  </action>
+  <action name="action_System_HardReset">
+   <property name="icon">
+    <iconset theme="restart-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Hard Reset</string>
+   </property>
+  </action>
+  <action name="action_System_Pause">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="icon">
+    <iconset theme="pause-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Pause</string>
+   </property>
+  </action>
+  <action name="action_System_Screenshot">
+   <property name="icon">
+    <iconset theme="screenshot-2-line"/>
+   </property>
+   <property name="text">
+    <string>Scree&amp;nshot</string>
+   </property>
+  </action>
+  <action name="action_System_LimitFPS">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="icon">
+    <iconset theme="speed-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Limit FPS</string>
+   </property>
+  </action>
+  <action name="action_System_SaveState">
+   <property name="icon">
+    <iconset theme="save-3-line"/>
+   </property>
+   <property name="text">
+    <string>Sa&amp;ve State</string>
+   </property>
+  </action>
+  <action name="action_System_SaveAs">
+   <property name="icon">
+    <iconset theme="save-3-line"/>
+   </property>
+   <property name="text">
+    <string>Save As...</string>
+   </property>
+  </action>
+  <action name="action_System_LoadState">
+   <property name="icon">
+    <iconset theme="folder-open-line"/>
+   </property>
+   <property name="text">
+    <string>L&amp;oad State</string>
+   </property>
+  </action>
+  <action name="action_System_Load">
+   <property name="icon">
+    <iconset theme="folder-open-line"/>
+   </property>
+   <property name="text">
+    <string>Loa&amp;d...</string>
+   </property>
+  </action>
+  <action name="actionSlot_0">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>&amp;Slot 0</string>
+   </property>
+  </action>
+  <action name="actionSlot_1">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Slot &amp;1</string>
+   </property>
+  </action>
+  <action name="actionSlot_2">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Slot &amp;2</string>
+   </property>
+  </action>
+  <action name="actionSlot_3">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Slot &amp;3</string>
+   </property>
+  </action>
+  <action name="actionSlot_4">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Slot &amp;4</string>
+   </property>
+  </action>
+  <action name="actionSlot_5">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Slot &amp;5</string>
+   </property>
+  </action>
+  <action name="actionSlot_6">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Slot &amp;6</string>
+   </property>
+  </action>
+  <action name="actionSlot_7">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Slot &amp;7</string>
+   </property>
+  </action>
+  <action name="actionSlot_8">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Slot &amp;8</string>
+   </property>
+  </action>
+  <action name="actionSlot_9">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Slot &amp;9</string>
+   </property>
+  </action>
+  <action name="action_System_Cheats">
+   <property name="icon">
+    <iconset theme="code-box-line"/>
+   </property>
+   <property name="text">
+    <string>Cheats...</string>
+   </property>
+  </action>
+  <action name="action_System_GSButton">
+   <property name="icon">
+    <iconset theme="checkbox-blank-circle-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;GS Button</string>
+   </property>
+  </action>
+  <action name="action_System_Exit">
+   <property name="icon">
+    <iconset theme="door-open-line"/>
+   </property>
+   <property name="text">
+    <string>Exit &amp;Emulator</string>
+   </property>
+  </action>
+  <action name="action_Settings_Graphics">
+   <property name="icon">
+    <iconset theme="brush-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Graphics</string>
+   </property>
+  </action>
+  <action name="action_Settings_Input">
+   <property name="icon">
+    <iconset theme="gamepad-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Input</string>
+   </property>
+  </action>
+  <action name="action_Arcade_Input">
+   <property name="icon">
+    <iconset theme="gamepad-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Map Game Inputs...</string>
+   </property>
+  </action>
+  <action name="action_Arcade_Dip">
+   <property name="icon">
+    <iconset theme="settings-3-line"/>
+   </property>
+   <property name="text">
+    <string>Set &amp;DIP Switches...</string>
+   </property>
+  </action>
+  <action name="action_Settings_Rsp">
+   <property name="icon">
+    <iconset theme="settings-3-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;RSP</string>
+   </property>
+  </action>
+  <action name="action_Settings_Audio">
+   <property name="icon">
+    <iconset theme="volume-up-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Audio</string>
+   </property>
+  </action>
+  <action name="action_Settings_Settings">
+   <property name="icon">
+    <iconset theme="settings-3-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Settings</string>
+   </property>
+  </action>
+  <action name="action_Settings_Plugins">
+   <property name="icon">
+    <iconset theme="plug-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Plugins</string>
+   </property>
+  </action>
+  <action name="action_Toolbar_Input">
+   <property name="icon">
+    <iconset theme="gamepad-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Input</string>
+   </property>
+  </action>
+  <action name="action_Toolbar_Playback">
+   <property name="icon">
+    <iconset theme="play-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Playback</string>
+   </property>
+  </action>
+  <action name="action_View_Fullscreen">
+   <property name="icon">
+    <iconset theme="fullscreen-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Fullscreen</string>
+   </property>
+  </action>
+  <action name="action_Help_Github">
+   <property name="icon">
+    <iconset theme="github-fill"/>
+   </property>
+   <property name="text">
+    <string>&amp;Github Repository</string>
+   </property>
+  </action>
+  <action name="action_Help_About">
+   <property name="icon">
+    <iconset theme="information-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;About RMG</string>
+   </property>
+  </action>
+  <action name="action_View_Toolbar">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="icon">
+    <iconset theme="tools-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Toolbar</string>
+   </property>
+  </action>
+  <action name="action_View_StatusBar">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="icon">
+    <iconset theme="information-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Status Bar</string>
+   </property>
+  </action>
+  <action name="action_View_GameList">
+   <property name="icon">
+    <iconset theme="list-check"/>
+   </property>
+   <property name="text">
+    <string>&amp;Game List</string>
+   </property>
+  </action>
+  <action name="action_View_GameGrid">
+   <property name="icon">
+    <iconset theme="function-line"/>
+   </property>
+   <property name="text">
+    <string>Ga&amp;me Grid</string>
+   </property>
+  </action>
+  <action name="action_View_RefreshRoms">
+   <property name="icon">
+    <iconset theme="refresh-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Refresh ROMs</string>
+   </property>
+  </action>
+  <action name="action_View_Log">
+   <property name="icon">
+    <iconset theme="file-list-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Log</string>
+   </property>
+  </action>
+  <action name="action_View_ClearRomCache">
+   <property name="icon">
+    <iconset theme="delete-bin-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Clear ROM Cache</string>
+   </property>
+  </action>
+  <action name="action_View_UniformSize">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="icon">
+    <iconset theme="function-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Uniform Size (Grid View)</string>
+   </property>
+  </action>
+  <action name="actionSpeed25">
+   <property name="checkable">
+    <bool>false</bool>
+   </property>
+   <property name="text">
+    <string>&amp;25%</string>
+   </property>
+  </action>
+  <action name="actionSpeed50">
+   <property name="text">
+    <string>&amp;50%</string>
+   </property>
+  </action>
+  <action name="actionSpeed100">
+   <property name="text">
+    <string>&amp;100%</string>
+   </property>
+  </action>
+  <action name="actionSpeed125">
+   <property name="text">
+    <string>125%</string>
+   </property>
+  </action>
+  <action name="actionSpeed150">
+   <property name="text">
+    <string>150%</string>
+   </property>
+  </action>
+  <action name="actionSpeed200">
+   <property name="text">
+    <string>2&amp;00%</string>
+   </property>
+  </action>
+  <action name="actionSpeed75">
+   <property name="text">
+    <string>&amp;75%</string>
+   </property>
+  </action>
+  <action name="actionSpeed175">
+   <property name="text">
+    <string>175%</string>
+   </property>
+  </action>
+  <action name="actionSpeed225">
+   <property name="text">
+    <string>225%</string>
+   </property>
+  </action>
+  <action name="actionSpeed250">
+   <property name="text">
+    <string>250%</string>
+   </property>
+  </action>
+  <action name="actionSpeed275">
+   <property name="text">
+    <string>275%</string>
+   </property>
+  </action>
+  <action name="actionSpeed300">
+   <property name="text">
+    <string>&amp;300%</string>
+   </property>
+  </action>
+  <action name="action_Help_Update">
+   <property name="icon">
+    <iconset theme="download-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Check For Updates</string>
+   </property>
+  </action>
+  <action name="action_Netplay_BrowseSessions">
+   <property name="text">
+    <string>Legacy Server</string>
+   </property>
+  </action>
+  <action name="action_Netplay_P2P">
+   <property name="icon">
+    <iconset theme="links-line"/>
+   </property>
+   <property name="text">
+    <string>Peer to Peer</string>
+   </property>
+  </action>
+  <action name="action_Rollback_Lobby">
+   <property name="icon">
+    <iconset theme="group-line"/>
+   </property>
+   <property name="text">
+    <string>Rollback Lobby</string>
+   </property>
+  </action>
+  <action name="action_View_Search">
+    <property name="icon">
+      <iconset theme="search-line"/>
+     </property>
+   <property name="text">
+    <string>Search</string>
+   </property>
+  </action>
+  <action name="action_Rollback_SaveState">
+   <property name="icon">
+    <iconset theme="save-3-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Save Rollback State</string>
+   </property>
+  </action>
+  <action name="action_Rollback_LoadState">
+   <property name="icon">
+    <iconset theme="folder-open-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Load Rollback State</string>
+   </property>
+  </action>
+  <action name="action_Rollback_StartDebugReplay">
+   <property name="icon">
+    <iconset theme="record-circle-line"/>
+   </property>
+   <property name="text">
+    <string>Start Recording Debug Replay</string>
+   </property>
+  </action>
+  <action name="action_Rollback_VerifyDebugReplay">
+   <property name="icon">
+    <iconset theme="check-double-line"/>
+   </property>
+   <property name="text">
+    <string>Verify Debug Replay (Fast Forward)</string>
+   </property>
+  </action>
+  <action name="action_Rollback_VerifyDebugReplayWithGraphics">
+   <property name="icon">
+    <iconset theme="movie-line"/>
+   </property>
+   <property name="text">
+    <string>Verify Debug Replay (with Graphics)</string>
+   </property>
+  </action>
+  <action name="action_Rollback_StressDebugReplay">
+   <property name="icon">
+    <iconset theme="repeat-line"/>
+   </property>
+   <property name="text">
+    <string>Stress Debug Replay (Rollback 2 Every 5)</string>
+   </property>
+  </action>
+  <action name="action_Rollback_ClientInputReplay">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="icon">
+    <iconset theme="record-circle-line"/>
+   </property>
+   <property name="text">
+    <string>Client Record/Replay 600 Inputs</string>
+   </property>
+  </action>
+ </widget>
+ <resources>
+  <include location="UIResources.qrc"/>
+ </resources>
+ <connections/>
+</ui>

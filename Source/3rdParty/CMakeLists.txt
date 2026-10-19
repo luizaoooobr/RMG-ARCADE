@@ -1,0 +1,394 @@
+#
+# 3rdParty CMakeLists.txt
+#
+include(ExternalProject)
+
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+if (NETPLAY AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libjuice/CMakeLists.txt")
+    set(NO_SERVER ON CACHE BOOL "Disable the unused libjuice STUN/TURN server" FORCE)
+    set(NO_TESTS ON CACHE BOOL "Disable libjuice tests in the RMG build" FORCE)
+    add_subdirectory(libjuice EXCLUDE_FROM_ALL)
+endif()
+
+set(M64P_CORE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-core)
+if(WIN32)
+    set(SO_EXT "dll")
+    set(GCA_LIB "mupen64plus_input_gca.${SO_EXT}")
+    set(CORE_FILE "mupen64plus.dll")
+else(WIN32)
+    set(SO_EXT "so")
+    set(GCA_LIB "libmupen64plus_input_gca.${SO_EXT}")
+    set(CORE_FILE "libmupen64plus.so")
+endif(WIN32)
+
+set(BASE_CMAKE_CONFIGURE_ARGS -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} 
+    -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER} -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+    -DCMAKE_C_FLAGS=${CMAKE_C_FLAGS} -DCMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS})
+if (USE_CCACHE)
+    set(CMAKE_CONFIGURE_ARGS ${BASE_CMAKE_CONFIGURE_ARGS} -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache)
+    set(MAKE_CC_COMPILER "ccache ${CMAKE_C_COMPILER}")
+    set(MAKE_CXX_COMPILER "ccache ${CMAKE_CXX_COMPILER}")
+else(USE_CCACHE)
+    set(CMAKE_CONFIGURE_ARGS ${BASE_CMAKE_CONFIGURE_ARGS})
+    set(MAKE_CC_COMPILER "${CMAKE_C_COMPILER}")
+    set(MAKE_CXX_COMPILER "${CMAKE_CXX_COMPILER}")
+endif(USE_CCACHE)
+
+# use sub-make when available
+if ("${CMAKE_GENERATOR}" STREQUAL "Unix Makefiles" OR
+    "${CMAKE_GENERATOR}" STREQUAL "MSYS Makefiles")
+    set(MAKE_CMD "$(MAKE)")
+else()
+    set(MAKE_CMD "make")
+endif()
+
+if ("${CMAKE_C_FLAGS}" STREQUAL "")
+    set(MAKE_OPTFLAGS "-O3")
+else()
+    set(MAKE_OPTFLAGS "${CMAKE_C_FLAGS}")
+endif()
+
+if ("${CMAKE_BUILD_TYPE}" STREQUAL "RelWithDebInfo")
+    set(MAKE_DEBUG "0")
+    set(MAKE_OPTFLAGS "${MAKE_OPTFLAGS} -g")
+elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
+    set(MAKE_DEBUG "1")
+else()
+    set(MAKE_DEBUG "0")
+endif()
+
+# TODO: when SDL3_net has made a release,
+# remove the vendored SDL3_net
+set(SDL3NET_DIR ${CMAKE_CURRENT_SOURCE_DIR}/SDL_net)
+set(SDL3NET_SOURCES
+    ${SDL3NET_DIR}/src/SDL_net.c
+)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SDL3 REQUIRED sdl3)
+add_library(SDL3_net STATIC ${SDL3NET_SOURCES})
+target_include_directories(SDL3_net PRIVATE ${SDL3NET_DIR}/include)
+set(SDL3NET_CFLAGS "-DUSE_SDL3NET -I${SDL3NET_DIR}/include")
+# for some reason MingW needs SDL3 to be linked after SDL3_net,
+# else we get a lot of missing symbol errors, should be harmless
+# on other platforms
+set(SDL3NET_LDLIBS "$<TARGET_FILE:SDL3_net> -l${SDL3_LIBRARIES}")
+if (WIN32)
+    set(SDL3NET_LDLIBS "${SDL3NET_LDLIBS} -liphlpapi -lws2_32")
+endif (WIN32)
+
+if(EXISTS "${CMAKE_SOURCE_DIR}/GekkoNet-main/GekkoLib/CMakeLists.txt")
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build vendored GekkoNet as a static library" FORCE)
+    set(BUILD_DOCS OFF CACHE BOOL "Disable GekkoNet docs" FORCE)
+    set(NO_ASIO_BUILD OFF CACHE BOOL "Build GekkoNet with ASIO networking" FORCE)
+    add_subdirectory("${CMAKE_SOURCE_DIR}/GekkoNet-main/GekkoLib" "${CMAKE_BINARY_DIR}/GekkoNet")
+endif()
+
+set(M64P_CORE_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/mupen64plus-core")
+file(RELATIVE_PATH M64P_CORE_MAKEFILE "${M64P_CORE_BUILD_DIR}" "${M64P_CORE_DIR}/projects/unix/Makefile")
+file(RELATIVE_PATH M64P_CORE_SRCDIR "${M64P_CORE_BUILD_DIR}" "${M64P_CORE_DIR}/src")
+file(RELATIVE_PATH M64P_CORE_SUBDIR "${M64P_CORE_BUILD_DIR}" "${M64P_CORE_DIR}/subprojects")
+file(RELATIVE_PATH SDL3NET_INCLUDE_DIR_FOR_CORE "${M64P_CORE_BUILD_DIR}" "${SDL3NET_DIR}/include")
+set(SDL3NET_CFLAGS_FOR_CORE "-DUSE_SDL3NET -I${SDL3NET_INCLUDE_DIR_FOR_CORE}")
+set(SDL3NET_LDLIBS_FOR_CORE "../$<TARGET_FILE_NAME:SDL3_net> -l${SDL3_LIBRARIES}")
+if (WIN32)
+    set(SDL3NET_LDLIBS_FOR_CORE "${SDL3NET_LDLIBS_FOR_CORE} -liphlpapi -lws2_32")
+endif (WIN32)
+
+ExternalProject_Add(mupen64plus-core
+    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-core/
+
+    CONFIGURE_COMMAND ""
+    INSTALL_COMMAND ""
+
+    BUILD_COMMAND ${MAKE_CMD} all -f ${M64P_CORE_MAKEFILE}
+        SRCDIR=${M64P_CORE_SRCDIR}
+        SUBDIR=${M64P_CORE_SUBDIR}
+        OSD=0 NEW_DYNAREC=1 NO_ASM=$<BOOL:${NO_ASM}> 
+        KEYBINDINGS=0 ACCURATE_FPU=1 VULKAN=0 NETPLAY=$<BOOL:${NETPLAY}> 
+        TARGET=${CORE_FILE} DEBUG=${MAKE_DEBUG}
+        CC=${MAKE_CC_COMPILER} CXX=${MAKE_CXX_COMPILER}
+        OPTFLAGS=${MAKE_OPTFLAGS}
+        # TODO: when SDL3_net has made a release,
+        # remove the vendored SDL3_net
+        SDLNET_CFLAGS=${SDL3NET_CFLAGS_FOR_CORE} SDLNET_LDLIBS=${SDL3NET_LDLIBS_FOR_CORE}
+    BUILD_IN_SOURCE False
+    BUILD_ALWAYS True
+    BINARY_DIR ${M64P_CORE_BUILD_DIR}
+
+    BUILD_BYPRODUCTS ${M64P_CORE_BUILD_DIR}/${CORE_FILE}
+    DEPENDS SDL3_net
+)
+
+set(APIDIR "${M64P_CORE_DIR}/src/api")
+
+set(M64P_RSP_CXD4_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/mupen64plus-rsp-cxd4")
+file(RELATIVE_PATH M64P_RSP_CXD4_MAKEFILE "${M64P_RSP_CXD4_BUILD_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-rsp-cxd4/projects/unix/Makefile")
+file(RELATIVE_PATH M64P_RSP_CXD4_SRCDIR "${M64P_RSP_CXD4_BUILD_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-rsp-cxd4")
+file(RELATIVE_PATH M64P_RSP_CXD4_APIDIR "${M64P_RSP_CXD4_BUILD_DIR}" "${APIDIR}")
+
+ExternalProject_Add(mupen64plus-rsp-cxd4
+    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-rsp-cxd4/
+
+    CONFIGURE_COMMAND ""
+    INSTALL_COMMAND ""
+
+    BUILD_COMMAND ${MAKE_CMD} all -f ${M64P_RSP_CXD4_MAKEFILE}
+        SRCDIR=${M64P_RSP_CXD4_SRCDIR}
+        APIDIR=${M64P_RSP_CXD4_APIDIR} DEBUG=${MAKE_DEBUG} POSTFIX=
+        CC=${MAKE_CC_COMPILER} CXX=${MAKE_CXX_COMPILER}
+        OPTFLAGS=${MAKE_OPTFLAGS}
+    BUILD_IN_SOURCE False
+    BUILD_ALWAYS True
+    BINARY_DIR ${M64P_RSP_CXD4_BUILD_DIR}
+
+    BUILD_BYPRODUCTS ${M64P_RSP_CXD4_BUILD_DIR}/mupen64plus-rsp-cxd4.${SO_EXT}
+)
+
+set(M64P_RSP_HLE_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/mupen64plus-rsp-hle")
+file(RELATIVE_PATH M64P_RSP_HLE_MAKEFILE "${M64P_RSP_HLE_BUILD_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-rsp-hle/projects/unix/Makefile")
+file(RELATIVE_PATH M64P_RSP_HLE_SRCDIR "${M64P_RSP_HLE_BUILD_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-rsp-hle/src")
+file(RELATIVE_PATH M64P_RSP_HLE_APIDIR "${M64P_RSP_HLE_BUILD_DIR}" "${APIDIR}")
+
+ExternalProject_Add(mupen64plus-rsp-hle
+    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-rsp-hle/
+
+    CONFIGURE_COMMAND ""
+    INSTALL_COMMAND ""
+
+    BUILD_COMMAND ${MAKE_CMD} all -f ${M64P_RSP_HLE_MAKEFILE}
+        SRCDIR=${M64P_RSP_HLE_SRCDIR}
+        APIDIR=${M64P_RSP_HLE_APIDIR} DEBUG=${MAKE_DEBUG}
+        CC=${MAKE_CC_COMPILER} CXX=${MAKE_CXX_COMPILER}
+        OPTFLAGS=${MAKE_OPTFLAGS}
+    BUILD_IN_SOURCE False
+    BUILD_ALWAYS True
+    BINARY_DIR ${M64P_RSP_HLE_BUILD_DIR}
+
+    BUILD_BYPRODUCTS ${M64P_RSP_HLE_BUILD_DIR}/mupen64plus-rsp-hle.${SO_EXT}
+)
+
+ExternalProject_Add(mupen64plus-rsp-parallel
+    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-rsp-parallel/
+
+    INSTALL_COMMAND ""
+
+    BUILD_IN_SOURCE False
+    BUILD_ALWAYS True
+    CMAKE_ARGS -DUSE_IPO=OFF ${CMAKE_CONFIGURE_ARGS}
+    BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/mupen64plus-rsp-parallel
+
+    BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/mupen64plus-rsp-parallel/mupen64plus-rsp-parallel.${SO_EXT}
+)
+
+set(M64P_INPUT_RAPHNETRAW_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/mupen64plus-input-raphnetraw")
+file(RELATIVE_PATH M64P_INPUT_RAPHNETRAW_MAKEFILE "${M64P_INPUT_RAPHNETRAW_BUILD_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-input-raphnetraw/projects/unix/Makefile")
+file(RELATIVE_PATH M64P_INPUT_RAPHNETRAW_SRCDIR "${M64P_INPUT_RAPHNETRAW_BUILD_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-input-raphnetraw/src")
+file(RELATIVE_PATH M64P_INPUT_RAPHNETRAW_APIDIR "${M64P_INPUT_RAPHNETRAW_BUILD_DIR}" "${APIDIR}")
+
+ExternalProject_Add(mupen64plus-input-raphnetraw
+    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-input-raphnetraw/
+
+    CONFIGURE_COMMAND ""
+    INSTALL_COMMAND ""
+
+    BUILD_COMMAND ${MAKE_CMD} all -f ${M64P_INPUT_RAPHNETRAW_MAKEFILE}
+        SRCDIR=${M64P_INPUT_RAPHNETRAW_SRCDIR}
+        APIDIR=${M64P_INPUT_RAPHNETRAW_APIDIR} DEBUG=${MAKE_DEBUG}
+        CC=${MAKE_CC_COMPILER} CXX=${MAKE_CXX_COMPILER}
+        OPTFLAGS=${MAKE_OPTFLAGS}
+    BUILD_IN_SOURCE False
+    BUILD_ALWAYS True
+    BINARY_DIR ${M64P_INPUT_RAPHNETRAW_BUILD_DIR}
+
+    BUILD_BYPRODUCTS ${M64P_INPUT_RAPHNETRAW_BUILD_DIR}/mupen64plus-input-raphnetraw.${SO_EXT}
+)
+
+set(GLIDEN64_DIR "${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-video-GLideN64")
+set(GLIDEN64_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/mupen64plus-video-GLideN64")
+set(GLIDEN64_CUSTOM_INI "${GLIDEN64_DIR}/ini/GLideN64.custom.ini")
+# taken from GLideN64's CMakeLists.txt
+if("${CMAKE_BUILD_TYPE}" STREQUAL "Release" OR
+    "${CMAKE_BUILD_TYPE}" STREQUAL "MinSizeRel" OR
+    "${CMAKE_BUILD_TYPE}" STREQUAL "RelWithDebInfo")
+    set(GLIDEN64_BUILD_TYPE Release)
+elseif("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
+    set(GLIDEN64_BUILD_TYPE Debug)
+endif()
+
+if (USE_ANGRYLION)
+    ExternalProject_Add(mupen64plus-video-angrylion-plus
+        SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-video-angrylion-plus
+
+        INSTALL_COMMAND ""
+
+        BUILD_IN_SOURCE False
+        BUILD_ALWAYS True
+        CMAKE_ARGS -DBUILD_MUPEN64PLUS=ON -DBUILD_PROJECT64=OFF -DUSE_QT5=OFF -DUSE_IPO=OFF ${CMAKE_CONFIGURE_ARGS}
+        BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/mupen64plus-video-angrylion-plus
+
+        BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/mupen64plus-video-angrylion-plus/mupen64plus-video-angrylion-plus.${SO_EXT}
+    )
+endif(USE_ANGRYLION)
+
+ExternalProject_Add(mupen64plus-video-GLideN64
+    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-video-GLideN64
+
+    INSTALL_COMMAND ""
+
+    BUILD_IN_SOURCE False
+    BUILD_ALWAYS True
+    CMAKE_ARGS -DMUPENPLUSAPI=ON -DMUPENPLUSAPI_GLIDENUI=ON -DGLIDENUI_QT6=ON -DUSE_IPO=OFF -DUSE_SYSTEM_LIBS=ON ${CMAKE_CONFIGURE_ARGS}
+
+    SOURCE_SUBDIR ./src/
+    BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/mupen64plus-video-GLideN64
+
+    BUILD_BYPRODUCTS ${GLIDEN64_BUILD_DIR}/plugin/${GLIDEN64_BUILD_TYPE}/mupen64plus-video-GLideN64.${SO_EXT}
+)
+
+ExternalProject_Add(mupen64plus-video-parallel
+    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-video-parallel
+
+    INSTALL_COMMAND ""
+
+    BUILD_IN_SOURCE False
+    BUILD_ALWAYS True
+    CMAKE_ARGS -DCONFIG_GUI=ON -DUSE_IPO=OFF ${CMAKE_CONFIGURE_ARGS}
+    BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/mupen64plus-video-parallel
+
+    BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/mupen64plus-video-parallel/mupen64plus-video-parallel.${SO_EXT}
+)
+
+set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/imgui)
+set(IMGUI_SOURCES
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp 
+    ${IMGUI_DIR}/imgui_widgets.cpp 
+    ${IMGUI_DIR}/imgui.cpp 
+    ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_opengl3.h 
+    ${IMGUI_DIR}/backends/imgui_impl_opengl3_loader.h 
+)
+add_library(imgui STATIC ${IMGUI_SOURCES})
+target_include_directories(imgui PRIVATE ${IMGUI_DIR})
+
+set(SDL_GAMECONTROLLERDB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/SDL_GameControllerDB)
+set(SDL_GAMECONTROLLERDB_BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR}/SDL_GameControllerDB)
+set(SDL_GAMECONTROLLERDB_SOURCES_IN
+    ${SDL_GAMECONTROLLERDB_DIR}/gamecontrollerdb.txt
+)
+set(SDL_GAMECONTROLLERDB_SOURCES_OUT
+    ${SDL_GAMECONTROLLERDB_BUILD_DIR}/gamecontrollerdb.txt
+)
+ExternalProject_Add(SDL_GameControllerDB
+    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/SDL_GameControllerDB
+
+    CONFIGURE_COMMAND ${CMAKE_COMMAND} -E make_directory ${SDL_GAMECONTROLLERDB_BUILD_DIR}
+    BUILD_COMMAND ${CMAKE_COMMAND} -E copy ${SDL_GAMECONTROLLERDB_SOURCES_IN} ${SDL_GAMECONTROLLERDB_SOURCES_OUT}
+    INSTALL_COMMAND ""
+
+    BUILD_BYPRODUCTS ${SDL_GAMECONTROLLERDB_SOURCES_OUT}
+)
+
+# FBNeo (headless lib core) — built with Meson using frontend=lib, which yields a
+# static libfbneo_core.a that RMG-Core links PRIVATEly (so no extra runtime DLL
+# has to be shipped). Only dependency('threads') is external for this frontend,
+# so no pkg-config is needed.
+set(RMGK_FBNEO_DIR "E:/fbneo rmkg-k/FBNeo-master/FBNeo-master" CACHE PATH
+    "Path to the FBNeo source tree used to build the embedded 'lib' core")
+
+if (EXISTS "${RMGK_FBNEO_DIR}/meson.build")
+    find_program(MESON_EXECUTABLE NAMES meson meson.py)
+    if (NOT MESON_EXECUTABLE)
+        message(FATAL_ERROR
+            "FBNeo was found at '${RMGK_FBNEO_DIR}' but the 'meson' build tool "
+            "was not found on PATH. Install meson (e.g. 'pip install meson'), "
+            "then re-run CMake, or point RMGK_FBNEO_DIR elsewhere.")
+    endif()
+
+    set(FBNEO_DIR ${RMGK_FBNEO_DIR})
+    set(FBNEO_BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR}/FBNeo)
+    set(FBNEO_LIB ${FBNEO_BUILD_DIR}/libfbneo_core.a)
+
+    if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(FBNEO_BUILDTYPE debug)
+    elseif (CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+        set(FBNEO_BUILDTYPE debugoptimized)
+    else()
+        set(FBNEO_BUILDTYPE release)
+    endif()
+
+    # Meson needs an explicit native file so it reuses the exact same toolchain
+    # (and not whatever it auto-detects first on PATH).
+    set(FBNEO_NATIVE_FILE ${CMAKE_CURRENT_BINARY_DIR}/fbneo-native.ini)
+    string(REPLACE "\\" "/" FBNEO_C_BIN "${CMAKE_C_COMPILER}")
+    string(REPLACE "\\" "/" FBNEO_CXX_BIN "${CMAKE_CXX_COMPILER}")
+    string(REPLACE "\\" "/" FBNEO_AR_BIN "${CMAKE_AR}")
+    file(WRITE ${FBNEO_NATIVE_FILE}
+        "[binaries]\n"
+        "c = ['${FBNEO_C_BIN}']\n"
+        "cpp = ['${FBNEO_CXX_BIN}']\n"
+        "ar = ['${FBNEO_AR_BIN}']\n"
+    )
+
+    ExternalProject_Add(fbneo
+        SOURCE_DIR ${FBNEO_DIR}
+
+        CONFIGURE_COMMAND ${MESON_EXECUTABLE} setup
+            --native-file ${FBNEO_NATIVE_FILE}
+            --prefix ${CMAKE_CURRENT_BINARY_DIR}/fbneo-install
+            --buildtype ${FBNEO_BUILDTYPE}
+            -Dfrontend=lib
+            -Ddefault_library=static
+            ${FBNEO_BUILD_DIR}
+            ${FBNEO_DIR}
+        BUILD_COMMAND ${MESON_EXECUTABLE} compile -C ${FBNEO_BUILD_DIR}
+        INSTALL_COMMAND ""
+
+        BUILD_IN_SOURCE False
+        BUILD_ALWAYS True
+
+        BUILD_BYPRODUCTS ${FBNEO_LIB}
+    )
+
+    set(FBNEO_LIB ${FBNEO_LIB} PARENT_SCOPE)
+    set(FBNEO_DIR ${FBNEO_DIR} PARENT_SCOPE)
+    set(FBNEO_BUILD_DIR ${FBNEO_BUILD_DIR} PARENT_SCOPE)
+else()
+    message(STATUS
+        "FBNeo source not found at '${RMGK_FBNEO_DIR}'; the fbneo lib core "
+        "will not be built.")
+endif()
+
+ExternalProject_Get_property(mupen64plus-core BUILD_BYPRODUCTS)
+set(MUPEN64PLUSCORE_LIB ${BUILD_BYPRODUCTS} PARENT_SCOPE)
+set(MUPEN64PLUSCORE_INI ${M64P_CORE_DIR}/data/mupen64plus.ini PARENT_SCOPE)
+
+ExternalProject_Get_property(mupen64plus-rsp-cxd4 BUILD_BYPRODUCTS)
+set(MUPEN64PLUS_PLUGIN_RSP_CXD4 ${BUILD_BYPRODUCTS} PARENT_SCOPE)
+
+ExternalProject_Get_property(mupen64plus-rsp-hle BUILD_BYPRODUCTS)
+set(MUPEN64PLUS_PLUGIN_RSP_HLE ${BUILD_BYPRODUCTS} PARENT_SCOPE)
+
+ExternalProject_Get_property(mupen64plus-rsp-parallel BUILD_BYPRODUCTS)
+set(MUPEN64PLUS_PLUGIN_RSP_PARALLEL ${BUILD_BYPRODUCTS} PARENT_SCOPE)
+
+ExternalProject_Get_property(mupen64plus-input-raphnetraw BUILD_BYPRODUCTS)
+set(MUPEN64PLUS_PLUGIN_INPUT_RAPHNET ${BUILD_BYPRODUCTS} PARENT_SCOPE)
+
+if (USE_ANGRYLION)
+    ExternalProject_Get_property(mupen64plus-video-angrylion-plus BUILD_BYPRODUCTS)
+    set(MUPEN64PLUS_PLUGIN_GFX_ANGRYLION ${BUILD_BYPRODUCTS} PARENT_SCOPE)
+endif(USE_ANGRYLION)
+
+ExternalProject_Get_property(mupen64plus-video-GLideN64 BUILD_BYPRODUCTS)
+set(MUPEN64PLUS_PLUGIN_GFX_GLIDEN64 ${BUILD_BYPRODUCTS} PARENT_SCOPE)
+set(MUPEN64PLUS_PLUGIN_GFX_GLIDEN64_DATA ${GLIDEN64_CUSTOM_INI} PARENT_SCOPE)
+
+ExternalProject_Get_property(mupen64plus-video-parallel BUILD_BYPRODUCTS)
+set(MUPEN64PLUS_PLUGIN_GFX_PARALLEL ${BUILD_BYPRODUCTS} PARENT_SCOPE)
+
+set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/imgui PARENT_SCOPE)
+
+ExternalProject_Get_property(SDL_GameControllerDB BUILD_BYPRODUCTS)
+set(SDL_GAMECONTROLLERDB ${BUILD_BYPRODUCTS} PARENT_SCOPE)

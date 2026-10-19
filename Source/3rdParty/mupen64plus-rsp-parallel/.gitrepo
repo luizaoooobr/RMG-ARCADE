@@ -1,0 +1,12 @@
+; DO NOT EDIT (unless you know what you are doing)
+;
+; This subdirectory is a git "subrepo", and this file is maintained by the
+; git-subrepo command. See https://github.com/ingydotnet/git-subrepo#readme
+;
+[subrepo]
+	remote = git@github.com:/Rosalie241/parallel-rsp.git
+	branch = RMG
+	commit = c4648a228743ca3248d54d0d61c886cfeeeac8ac
+	parent = 85159348a12f71e5d19f46b1027b75c36e38bf21
+	method = merge
+	cmdver = 0.4.6

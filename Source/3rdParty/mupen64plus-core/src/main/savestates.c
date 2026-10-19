@@ -1,0 +1,2932 @@
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ *   Mupen64plus - savestates.c                                            *
+ *   Mupen64Plus homepage: https://mupen64plus.org/                        *
+ *   Copyright (C) 2012 CasualJames                                        *
+ *   Copyright (C) 2009 Olejl Tillin9                                      *
+ *   Copyright (C) 2008 Richard42 Tillin9                                  *
+ *   Copyright (C) 2002 Hacktarux                                          *
+ *                                                                         *
+ *   This program is free software; you can redistribute it and/or modify  *
+ *   it under the terms of the GNU General Public License as published by  *
+ *   the Free Software Foundation; either version 2 of the License, or     *
+ *   (at your option) any later version.                                   *
+ *                                                                         *
+ *   This program is distributed in the hope that it will be useful,       *
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of        *
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         *
+ *   GNU General Public License for more details.                          *
+ *                                                                         *
+ *   You should have received a copy of the GNU General Public License     *
+ *   along with this program; if not, write to the                         *
+ *   Free Software Foundation, Inc.,                                       *
+ *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.          *
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+#ifdef USE_SDL3
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_thread.h>
+#else
+#include <SDL.h>
+#include <SDL_thread.h>
+#endif
+#include <inttypes.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <zlib.h>
+#if defined(__has_include)
+#  if __has_include(<minizip/unzip.h>) && __has_include(<minizip/zip.h>)
+#    include <minizip/unzip.h>
+#    include <minizip/zip.h>
+#  else
+#    include <unzip.h>
+#    include <zip.h>
+#  endif
+#else
+#  include <unzip.h>
+#  include <zip.h>
+#endif
+
+#define M64P_CORE_PROTOTYPES 1
+#include "api/callbacks.h"
+#include "api/config.h"
+#include "api/m64p_config.h"
+#include "api/m64p_types.h"
+#include "backends/api/storage_backend.h"
+#include "device/device.h"
+#include "main/list.h"
+#include "main/main.h"
+#include "osal/files.h"
+#include "osal/preproc.h"
+#include "osd/osd.h"
+#include "plugin/plugin.h"
+#include "rom.h"
+#include "savestates.h"
+#include "util.h"
+#include "workqueue.h"
+
+enum { GB_CART_FINGERPRINT_SIZE = 0x1c };
+enum { GB_CART_FINGERPRINT_OFFSET = 0x134 };
+
+enum { DD_DISK_ID_OFFSET = 0x43670 };
+
+static const char* savestate_magic = "M64+SAVE";
+static const int savestate_latest_version = 0x00020000;  /* 2.0 */
+static const int rollback_state_header_magic = 'RLBK';
+static const int rollback_state_legacy_header_magic = ('G' << 24) | ('G' << 16) | ('P' << 8) | 'O';
+static const int rollback_state_header_size = 6 * sizeof(int);
+static const int rollback_state_flag_omit_tlb_lut = 1 << 0;
+static const int rollback_state_flag_has_sram = 1 << 1;
+static const int rollback_state_flag_has_ai_fifo_addresses = 1 << 2;
+static const size_t rollback_tlb_lut_size = 0x100000 * sizeof(uint32_t) * 2;
+static const unsigned char pj64_magic[4] = { 0xC8, 0xA6, 0xD8, 0x23 };
+
+static savestates_job job = savestates_job_nothing;
+static savestates_type type = savestates_type_unknown;
+static char *fname = NULL;
+
+static unsigned int slot = 0;
+static int autoinc_save_slot = 0;
+
+/* Counts completed rollback-buffer loads. The SI controller compares this across an
+ * update_pif_ram() call to detect a spectate keyframe load that happened *inside* the
+ * PIF sync callback (mid-SI-DMA), so it can skip the stale SI completion that would
+ * otherwise inject a phantom SI interrupt into the just-restored state. */
+static int rollback_load_counter = 0;
+
+enum { ROLLBACK_SAVE_STATES_COUNT = 120 };
+enum { ROLLBACK_LOAD_FRAMES_AGO = 30 };
+
+#ifdef USE_SDL3
+static SDL_Mutex *savestates_lock;
+#else
+static SDL_mutex *savestates_lock;
+#endif
+
+struct savestate_work {
+    char *filepath;
+    char *data;
+    size_t size;
+    struct work_struct work;
+};
+
+/* Memory buffer for rollback save states */
+static char *rollback_save_data[ROLLBACK_SAVE_STATES_COUNT] = { NULL };
+static size_t rollback_save_size[ROLLBACK_SAVE_STATES_COUNT] = { 0 };
+static unsigned int rollback_save_head = 0;
+static unsigned int rollback_save_count = 0;
+static int rollback_save_pending = 0;
+static unsigned char *rollback_load_buffer = NULL;
+static size_t rollback_load_buffer_size = 0;
+static unsigned char **rollback_save_buffer = NULL;
+static int *rollback_save_buffer_len = NULL;
+static int *rollback_save_buffer_checksum = NULL;
+static int rollback_save_buffer_frame = 0;
+static unsigned char *rollback_save_prealloc_data = NULL;
+static int rollback_save_prealloc_capacity = 0;
+/* When set, a rollback-buffer save produces a FULL normal-format state (TLB LUT included,
+ * buffer zeroed, omit flag cleared) instead of the stripped rollback variant. Set only for
+ * the spectate keyframe save via savestates_save_full_buffer; the host's per-frame rollback
+ * saves leave it 0, so their path is byte-for-byte unchanged. */
+static int rollback_save_full = 0;
+static int rollback_verbose_stats = 0;
+
+void savestates_set_rollback_verbose_stats(int enabled)
+{
+    rollback_verbose_stats = enabled != 0;
+}
+
+static uint64_t rollback_perf_us(uint64_t start, uint64_t end)
+{
+    uint64_t frequency = SDL_GetPerformanceFrequency();
+    return ((end - start) * 1000000) / frequency;
+}
+
+/* Returns the malloc'd full path of the currently selected savestate. */
+static char *savestates_generate_path(savestates_type type)
+{
+    if(fname != NULL) /* A specific path was given. */
+    {
+        return strdup(fname);
+    }
+    else /* Use the selected savestate slot */
+    {
+        char *filepath;
+        size_t size = 0;
+
+        switch (type)
+        {
+            case savestates_type_m64p:
+                /* check if old file path exists, if it does then use that */
+                filepath = formatstr("%s%s.st%d", get_savestatepath(), ROM_SETTINGS.goodname, slot);
+                if (get_file_size(filepath, &size) != file_ok || size == 0)
+                {
+                    /* else use new path */
+                    filepath = formatstr("%s%s.st%d", get_savestatepath(), get_savestatefilename(), slot);
+                }
+                break;
+            case savestates_type_pj64_zip:
+                filepath = formatstr("%s%s.pj%d.zip", get_savestatepath(), ROM_PARAMS.headername, slot);
+                break;
+            case savestates_type_pj64_unc:
+                filepath = formatstr("%s%s.pj%d", get_savestatepath(), ROM_PARAMS.headername, slot);
+                break;
+            default:
+                filepath = NULL;
+                break;
+        }
+
+        return filepath;
+    }
+}
+
+void savestates_select_slot(unsigned int s)
+{
+    if(s>9||s==slot)
+        return;
+    slot = s;
+    ConfigSetParameter(g_CoreConfig, "CurrentStateSlot", M64TYPE_INT, &s);
+    StateChanged(M64CORE_SAVESTATE_SLOT, slot);
+
+    main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Selected state slot: %d", slot);
+}
+
+/* Returns the currently selected save slot. */
+unsigned int savestates_get_slot(void)
+{
+    return slot;
+}
+
+/* Sets save state slot autoincrement on or off. */
+void savestates_set_autoinc_slot(int b)
+{
+    autoinc_save_slot = b;
+}
+
+void savestates_inc_slot(void)
+{
+    if(++slot>9)
+        slot = 0;
+    ConfigSetParameter(g_CoreConfig, "CurrentStateSlot", M64TYPE_INT, &slot);
+    StateChanged(M64CORE_SAVESTATE_SLOT, slot);
+}
+
+savestates_job savestates_get_job(void)
+{
+    return job;
+}
+
+int savestates_get_rollback_load_counter(void)
+{
+    return rollback_load_counter;
+}
+
+/* Spectate keyframe deferred load: the spectator stages a rollback-buffer load and it is
+ * performed at the next safe interrupt boundary (gen_interrupt), exactly like a normal
+ * savestate load, instead of synchronously mid-frame. Loading a full machine state mid-SI
+ * DMA / mid-dynarec-block lets the half-finished operation run on top of the restored
+ * state and desyncs the replay one frame later. The buffer must stay valid until drained
+ * (it does — it's the spectator's persistent keyframe buffer). */
+static unsigned char* pending_rollback_load_buffer = NULL;
+static int pending_rollback_load_len = 0;
+
+int savestates_has_pending_rollback_load(void)
+{
+    return pending_rollback_load_buffer != NULL;
+}
+
+void savestates_set_pending_rollback_load(unsigned char* buffer, int len)
+{
+    pending_rollback_load_buffer = buffer;
+    pending_rollback_load_len = len;
+}
+
+int savestates_run_pending_rollback_load(void)
+{
+    unsigned char* buffer = pending_rollback_load_buffer;
+    int len = pending_rollback_load_len;
+    pending_rollback_load_buffer = NULL;
+    pending_rollback_load_len = 0;
+    if (buffer != NULL && len > 0)
+        return savestates_load_rollback_buffer(buffer, len);
+    return 0;
+}
+
+void savestates_set_job(savestates_job j, savestates_type t, const char *fn)
+{
+    if (fname != NULL)
+    {
+        free(fname);
+        fname = NULL;
+    }
+
+    job = j;
+    type = t;
+    if (fn != NULL)
+        fname = strdup(fn);
+}
+
+void savestates_request_rollback_save(void)
+{
+    rollback_save_pending = 1;
+}
+
+static void savestates_clear_job(void)
+{
+    savestates_set_job(savestates_job_nothing, savestates_type_unknown, NULL);
+}
+
+#define GETARRAY(buff, type, count) \
+    (to_little_endian_buffer(buff, sizeof(type),count), \
+     buff += count*sizeof(type), \
+     (type *)(buff-count*sizeof(type)))
+#define COPYARRAY(dst, buff, type, count) \
+    memcpy(dst, GETARRAY(buff, type, count), sizeof(type)*count)
+#define GETDATA(buff, type) *GETARRAY(buff, type, 1)
+#define PUTARRAY(src, buff, type, count) \
+    memcpy(buff, src, sizeof(type)*count); \
+    to_little_endian_buffer(buff, sizeof(type), count); \
+    buff += count*sizeof(type);
+
+#define PUTDATA(buff, type, value) \
+    do { type x = value; PUTARRAY(&x, buff, type, 1); } while(0)
+
+#define ZERODATA(buff, count) \
+    do { memset(buff, 0, count); buff += count; } while(0)
+
+static int savestates_load_m64p(struct device* dev, char *filepath)
+{
+    unsigned char header[44];
+    gzFile f = NULL;
+    unsigned char *memory_data = NULL;
+    size_t memory_size = 0;
+    size_t memory_offset = 0;
+    unsigned int version;
+    int i;
+    uint32_t FCR31;
+    uint64_t rollback_load_start = 0;
+    uint64_t rollback_parse_start = 0;
+    uint64_t rollback_fixed_end = 0;
+    uint64_t rollback_rdram_start = 0;
+    uint64_t rollback_rdram_end = 0;
+    uint64_t rollback_sp_pif_end = 0;
+    uint64_t rollback_tlb_start = 0;
+    uint64_t rollback_tlb_end = 0;
+    uint64_t rollback_cpu_end = 0;
+    uint64_t rollback_extra_end = 0;
+    uint64_t rollback_finalize_end = 0;
+    int rollback_tlb_lut_skipped = 0;
+    int rollback_tlb_lut_omitted = 0;
+    int rollback_has_sram = 0;
+    int rollback_has_ai_fifo_addresses = 0;
+    unsigned char *rollback_lut_r_data = NULL;
+    unsigned char *rollback_lut_w_data = NULL;
+    const unsigned char *rollback_sram_data = NULL;
+    unsigned char *rollback_ai_fifo_data = NULL;
+    uint8_t *rollback_sram_storage = NULL;
+    struct tlb_entry rollback_old_tlb_entries[32];
+
+    size_t savestateSize;
+    size_t rollback_payload_size;
+    unsigned char *savestateData, *curr;
+    int free_savestate_data = 1;
+    char queue[1024];
+    unsigned char using_tlb_data[4];
+    unsigned char data_0001_0200[4096]; // 4k for extra state from v1.2
+
+    uint32_t* cp0_regs = r4300_cp0_regs(&dev->r4300.cp0);
+
+    SDL_LockMutex(savestates_lock);
+
+    // Check if this is a rollback buffer load.
+    if (strcmp(filepath, "ROLLBACK") == 0)
+    {
+        int *rollback_header;
+
+        if (rollback_load_buffer == NULL || rollback_load_buffer_size < (size_t)(rollback_state_header_size + 44))
+        {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Invalid rollback state buffer");
+            SDL_UnlockMutex(savestates_lock);
+            return 0;
+        }
+
+        rollback_header = (int *)rollback_load_buffer;
+        if (rollback_header[0] == rollback_state_header_magic || rollback_header[0] == rollback_state_legacy_header_magic)
+        {
+            int header_size = rollback_header[1];
+            if (header_size < rollback_state_header_size || (size_t)(header_size + 44) > rollback_load_buffer_size)
+            {
+                main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Invalid rollback state header");
+                SDL_UnlockMutex(savestates_lock);
+                return 0;
+            }
+
+            memory_data = rollback_load_buffer + header_size;
+            memory_size = rollback_load_buffer_size - header_size;
+            rollback_tlb_lut_omitted =
+                rollback_header[0] == rollback_state_header_magic &&
+                (rollback_header[4] & rollback_state_flag_omit_tlb_lut) != 0;
+            rollback_has_sram =
+                rollback_header[0] == rollback_state_header_magic &&
+                (rollback_header[4] & rollback_state_flag_has_sram) != 0;
+            rollback_has_ai_fifo_addresses =
+                rollback_header[0] == rollback_state_header_magic &&
+                (rollback_header[4] & rollback_state_flag_has_ai_fifo_addresses) != 0;
+        }
+        else
+        {
+            memory_data = rollback_load_buffer;
+            memory_size = rollback_load_buffer_size;
+        }
+
+        memcpy(header, memory_data, 44);
+        memory_offset = 44;
+        if (rollback_verbose_stats)
+            rollback_load_start = SDL_GetPerformanceCounter();
+        curr = header;
+    }
+    // Check if this is a memory load (for rollback debug ring)
+    else if (strcmp(filepath, "MEMORY") == 0)
+    {
+        unsigned int rollback_load_index;
+        if (rollback_save_count <= ROLLBACK_LOAD_FRAMES_AGO)
+        {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "No rollback state available 30 frames ago");
+            SDL_UnlockMutex(savestates_lock);
+            return 0;
+        }
+
+        rollback_load_index = (rollback_save_head + ROLLBACK_SAVE_STATES_COUNT - 1 - ROLLBACK_LOAD_FRAMES_AGO) % ROLLBACK_SAVE_STATES_COUNT;
+        memory_data = (unsigned char *)rollback_save_data[rollback_load_index];
+        memory_size = rollback_save_size[rollback_load_index];
+
+        if (memory_data == NULL || memory_size == 0)
+        {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Rollback state ring buffer is missing data");
+            SDL_UnlockMutex(savestates_lock);
+            return 0;
+        }
+
+        // Copy header from memory
+        if (memory_size < 44)
+        {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Invalid rollback state data");
+            SDL_UnlockMutex(savestates_lock);
+            return 0;
+        }
+        memcpy(header, memory_data, 44);
+        memory_offset = 44;
+        if (rollback_verbose_stats)
+            rollback_load_start = SDL_GetPerformanceCounter();
+        curr = header;
+    }
+    else
+    {
+        f = osal_gzopen(filepath, "rb");
+        if(f==NULL)
+        {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not open state file: %s", filepath);
+            SDL_UnlockMutex(savestates_lock);
+            return 0;
+        }
+
+        /* Read and check Mupen64Plus magic number. */
+        if (gzread(f, header, 44) != 44)
+        {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read header from state file %s", filepath);
+            gzclose(f);
+            SDL_UnlockMutex(savestates_lock);
+            return 0;
+        }
+        curr = header;
+    }
+
+    if(strncmp((char *)curr, savestate_magic, 8)!=0)
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State file: %s is not a valid Mupen64plus savestate.", filepath);
+        if (f != NULL)
+            gzclose(f);
+        SDL_UnlockMutex(savestates_lock);
+        return 0;
+    }
+    curr += 8;
+
+    version = *curr++;
+    version = (version << 8) | *curr++;
+    version = (version << 8) | *curr++;
+    version = (version << 8) | *curr++;
+    if((version >> 16) != (savestate_latest_version >> 16))
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State version (%08x) isn't compatible. Please update Mupen64Plus.", version);
+        if (f != NULL)
+            gzclose(f);
+        SDL_UnlockMutex(savestates_lock);
+        return 0;
+    }
+
+    if(memcmp((char *)curr, ROM_SETTINGS.MD5, 32))
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State ROM MD5 does not match current ROM.");
+        if (f != NULL)
+            gzclose(f);
+        SDL_UnlockMutex(savestates_lock);
+        return 0;
+    }
+    curr += 32;
+
+    if (rollback_has_sram)
+    {
+        if (dev->cart.sram.storage != NULL &&
+            dev->cart.sram.istorage != NULL &&
+            dev->cart.sram.istorage->data != NULL &&
+            dev->cart.sram.istorage->size != NULL &&
+            dev->cart.sram.istorage->size(dev->cart.sram.storage) >= SRAM_SIZE)
+        {
+            rollback_sram_storage = dev->cart.sram.istorage->data(dev->cart.sram.storage);
+        }
+
+        if (rollback_sram_storage == NULL)
+        {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Rollback SRAM storage is unavailable.");
+            SDL_UnlockMutex(savestates_lock);
+            return 0;
+        }
+    }
+
+    /* Read the rest of the savestate */
+    savestateSize = 16788244;
+    rollback_payload_size = savestateSize;
+    if (rollback_tlb_lut_omitted)
+        rollback_payload_size -= rollback_tlb_lut_size;
+    if (memory_data != NULL)
+    {
+        size_t required_size = rollback_payload_size;
+        if (version == 0x00010000)
+            required_size += sizeof(queue);
+        else if (version == 0x00010100)
+            required_size += sizeof(queue) + sizeof(using_tlb_data);
+        else
+            required_size += sizeof(queue) + sizeof(using_tlb_data) + sizeof(data_0001_0200);
+        if (rollback_has_sram)
+            required_size += SRAM_SIZE;
+        if (rollback_has_ai_fifo_addresses)
+            required_size += AI_DMA_FIFO_SIZE * sizeof(uint32_t);
+
+        if (memory_size - memory_offset < required_size)
+        {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Rollback state data is incomplete.");
+            SDL_UnlockMutex(savestates_lock);
+            return 0;
+        }
+
+#if defined(M64P_BIG_ENDIAN)
+        savestateData = curr = (unsigned char *)malloc(savestateSize);
+#else
+        savestateData = curr = memory_data + memory_offset;
+        free_savestate_data = 0;
+#endif
+    }
+    else
+    {
+        savestateData = curr = (unsigned char *)malloc(savestateSize);
+    }
+
+    if (savestateData == NULL)
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Insufficient memory to load state.");
+        if (f != NULL)
+            gzclose(f);
+        SDL_UnlockMutex(savestates_lock);
+        return 0;
+    }
+    if (memory_data != NULL)
+    {
+#if defined(M64P_BIG_ENDIAN)
+        memcpy(savestateData, memory_data + memory_offset, rollback_payload_size);
+#endif
+        memory_offset += rollback_payload_size;
+        memcpy(queue, memory_data + memory_offset, sizeof(queue));
+        memory_offset += sizeof(queue);
+        if (version >= 0x00010100)
+        {
+            memcpy(using_tlb_data, memory_data + memory_offset, sizeof(using_tlb_data));
+            memory_offset += sizeof(using_tlb_data);
+        }
+        if (version >= 0x00010200)
+        {
+            memcpy(data_0001_0200, memory_data + memory_offset, sizeof(data_0001_0200));
+            memory_offset += sizeof(data_0001_0200);
+        }
+        if (rollback_has_ai_fifo_addresses)
+        {
+            rollback_ai_fifo_data = memory_data + memory_offset;
+            memory_offset += AI_DMA_FIFO_SIZE * sizeof(uint32_t);
+        }
+        if (rollback_has_sram)
+        {
+            rollback_sram_data = memory_data + memory_offset;
+            memory_offset += SRAM_SIZE;
+        }
+    }
+    else if (version == 0x00010000) /* original savestate version */
+    {
+        if (gzread(f, savestateData, savestateSize) != (int)savestateSize ||
+            (gzread(f, queue, sizeof(queue)) % 4) != 0)
+        {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read Mupen64Plus savestate 1.0 data from %s", filepath);
+            free(savestateData);
+            gzclose(f);
+            SDL_UnlockMutex(savestates_lock);
+            return 0;
+        }
+    }
+    else if (version == 0x00010100) // saves entire eventqueue plus 4-byte using_tlb flags
+    {
+        if (gzread(f, savestateData, savestateSize) != (int)savestateSize ||
+            gzread(f, queue, sizeof(queue)) != sizeof(queue) ||
+            gzread(f, using_tlb_data, sizeof(using_tlb_data)) != sizeof(using_tlb_data))
+        {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read Mupen64Plus savestate 1.1 data from %s", filepath);
+            free(savestateData);
+            gzclose(f);
+            SDL_UnlockMutex(savestates_lock);
+            return 0;
+        }
+    }
+    else // version >= 0x00010200  saves entire eventqueue, 4-byte using_tlb flags and extra state
+    {
+        if (gzread(f, savestateData, savestateSize) != (int)savestateSize ||
+            gzread(f, queue, sizeof(queue)) != sizeof(queue) ||
+            gzread(f, using_tlb_data, sizeof(using_tlb_data)) != sizeof(using_tlb_data) ||
+            gzread(f, data_0001_0200, sizeof(data_0001_0200)) != sizeof(data_0001_0200))
+        {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read Mupen64Plus savestate 1.2+ data from %s", filepath);
+            free(savestateData);
+            gzclose(f);
+            SDL_UnlockMutex(savestates_lock);
+            return 0;
+        }
+    }
+
+    if (f != NULL)
+        gzclose(f);
+    SDL_UnlockMutex(savestates_lock);
+
+    // Parse savestate
+    if (memory_data != NULL && rollback_verbose_stats)
+        rollback_parse_start = SDL_GetPerformanceCounter();
+
+    dev->rdram.regs[0][RDRAM_CONFIG_REG]       = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_DEVICE_ID_REG]    = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_DELAY_REG]        = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_MODE_REG]         = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_REF_INTERVAL_REG] = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_REF_ROW_REG]      = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_RAS_INTERVAL_REG] = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_MIN_INTERVAL_REG] = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_ADDR_SELECT_REG]  = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_DEVICE_MANUF_REG] = GETDATA(curr, uint32_t);
+
+    curr += 4; /* Padding from old implementation */
+    dev->mi.regs[MI_INIT_MODE_REG] = GETDATA(curr, uint32_t);
+    curr += 4; // Duplicate MI init mode flags from old implementation
+    dev->mi.regs[MI_VERSION_REG]   = GETDATA(curr, uint32_t);
+    dev->mi.regs[MI_INTR_REG]      = GETDATA(curr, uint32_t);
+    dev->mi.regs[MI_INTR_MASK_REG] = GETDATA(curr, uint32_t);
+    curr += 4; /* Padding from old implementation */
+    curr += 8; // Duplicated MI intr flags and padding from old implementation
+
+    dev->pi.regs[PI_DRAM_ADDR_REG]    = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_CART_ADDR_REG]    = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_RD_LEN_REG]       = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_WR_LEN_REG]       = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_STATUS_REG]       = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_BSD_DOM1_LAT_REG] = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_BSD_DOM1_PWD_REG] = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_BSD_DOM1_PGS_REG] = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_BSD_DOM1_RLS_REG] = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_BSD_DOM2_LAT_REG] = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_BSD_DOM2_PWD_REG] = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_BSD_DOM2_PGS_REG] = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_BSD_DOM2_RLS_REG] = GETDATA(curr, uint32_t);
+
+    dev->sp.regs[SP_MEM_ADDR_REG]  = GETDATA(curr, uint32_t);
+    dev->sp.regs[SP_DRAM_ADDR_REG] = GETDATA(curr, uint32_t);
+    dev->sp.regs[SP_RD_LEN_REG]    = GETDATA(curr, uint32_t);
+    dev->sp.regs[SP_WR_LEN_REG]    = GETDATA(curr, uint32_t);
+    curr += 4; /* Padding from old implementation */
+    dev->sp.regs[SP_STATUS_REG]    = GETDATA(curr, uint32_t);
+    curr += 16; // Duplicated SP flags and padding from old implementation
+    dev->sp.regs[SP_DMA_FULL_REG]  = GETDATA(curr, uint32_t);
+    dev->sp.regs[SP_DMA_BUSY_REG]  = GETDATA(curr, uint32_t);
+    dev->sp.regs[SP_SEMAPHORE_REG] = GETDATA(curr, uint32_t);
+
+    dev->sp.regs2[SP_PC_REG]    = GETDATA(curr, uint32_t);
+    dev->sp.regs2[SP_IBIST_REG] = GETDATA(curr, uint32_t);
+
+    dev->si.regs[SI_DRAM_ADDR_REG]      = GETDATA(curr, uint32_t);
+    dev->si.regs[SI_PIF_ADDR_RD64B_REG] = GETDATA(curr, uint32_t);
+    dev->si.regs[SI_PIF_ADDR_WR64B_REG] = GETDATA(curr, uint32_t);
+    dev->si.regs[SI_STATUS_REG]         = GETDATA(curr, uint32_t);
+
+    dev->vi.regs[VI_STATUS_REG]  = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_ORIGIN_REG]  = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_WIDTH_REG]   = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_V_INTR_REG]  = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_CURRENT_REG] = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_BURST_REG]   = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_V_SYNC_REG]  = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_H_SYNC_REG]  = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_LEAP_REG]    = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_H_START_REG] = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_V_START_REG] = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_V_BURST_REG] = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_X_SCALE_REG] = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_Y_SCALE_REG] = GETDATA(curr, uint32_t);
+    dev->vi.delay = GETDATA(curr, uint32_t);
+    gfx.viStatusChanged();
+    gfx.viWidthChanged();
+
+    dev->ri.regs[RI_MODE_REG]         = GETDATA(curr, uint32_t);
+    dev->ri.regs[RI_CONFIG_REG]       = GETDATA(curr, uint32_t);
+    dev->ri.regs[RI_CURRENT_LOAD_REG] = GETDATA(curr, uint32_t);
+    dev->ri.regs[RI_SELECT_REG]       = GETDATA(curr, uint32_t);
+    dev->ri.regs[RI_REFRESH_REG]      = GETDATA(curr, uint32_t);
+    dev->ri.regs[RI_LATENCY_REG]      = GETDATA(curr, uint32_t);
+    dev->ri.regs[RI_ERROR_REG]        = GETDATA(curr, uint32_t);
+    dev->ri.regs[RI_WERROR_REG]       = GETDATA(curr, uint32_t);
+
+    dev->ai.regs[AI_DRAM_ADDR_REG] = GETDATA(curr, uint32_t);
+    dev->ai.regs[AI_LEN_REG]       = GETDATA(curr, uint32_t);
+    dev->ai.regs[AI_CONTROL_REG]   = GETDATA(curr, uint32_t);
+    dev->ai.regs[AI_STATUS_REG]    = GETDATA(curr, uint32_t);
+    dev->ai.regs[AI_DACRATE_REG]   = GETDATA(curr, uint32_t);
+    dev->ai.regs[AI_BITRATE_REG]   = GETDATA(curr, uint32_t);
+    dev->ai.fifo[1].duration  = GETDATA(curr, uint32_t);
+    dev->ai.fifo[1].length = GETDATA(curr, uint32_t);
+    dev->ai.fifo[0].duration  = GETDATA(curr, uint32_t);
+    dev->ai.fifo[0].length = GETDATA(curr, uint32_t);
+    if (rollback_ai_fifo_data != NULL)
+    {
+        unsigned char *ai_fifo_curr = rollback_ai_fifo_data;
+        dev->ai.fifo[0].address = GETDATA(ai_fifo_curr, uint32_t);
+        dev->ai.fifo[1].address = GETDATA(ai_fifo_curr, uint32_t);
+    }
+    else
+    {
+        /* Older and ordinary disk savestates do not contain these addresses. */
+        dev->ai.fifo[0].address = dev->ai.regs[AI_DRAM_ADDR_REG];
+        dev->ai.fifo[1].address = dev->ai.regs[AI_DRAM_ADDR_REG];
+    }
+    dev->ai.samples_format_changed = 1;
+
+    dev->dp.dpc_regs[DPC_START_REG]    = GETDATA(curr, uint32_t);
+    dev->dp.dpc_regs[DPC_END_REG]      = GETDATA(curr, uint32_t);
+    dev->dp.dpc_regs[DPC_CURRENT_REG]  = GETDATA(curr, uint32_t);
+    curr += 4; // Padding from old implementation
+    dev->dp.dpc_regs[DPC_STATUS_REG]   = GETDATA(curr, uint32_t);
+    curr += 12; // Duplicated DPC flags and padding from old implementation
+    dev->dp.dpc_regs[DPC_CLOCK_REG]    = GETDATA(curr, uint32_t);
+    dev->dp.dpc_regs[DPC_BUFBUSY_REG]  = GETDATA(curr, uint32_t);
+    dev->dp.dpc_regs[DPC_PIPEBUSY_REG] = GETDATA(curr, uint32_t);
+    dev->dp.dpc_regs[DPC_TMEM_REG]     = GETDATA(curr, uint32_t);
+
+    dev->dp.dps_regs[DPS_TBIST_REG]        = GETDATA(curr, uint32_t);
+    dev->dp.dps_regs[DPS_TEST_MODE_REG]    = GETDATA(curr, uint32_t);
+    dev->dp.dps_regs[DPS_BUFTEST_ADDR_REG] = GETDATA(curr, uint32_t);
+    dev->dp.dps_regs[DPS_BUFTEST_DATA_REG] = GETDATA(curr, uint32_t);
+
+    if (memory_data != NULL && rollback_verbose_stats)
+    {
+        rollback_fixed_end = SDL_GetPerformanceCounter();
+        rollback_rdram_start = rollback_fixed_end;
+    }
+    COPYARRAY(dev->rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4);
+    if (memory_data != NULL && rollback_verbose_stats)
+        rollback_rdram_end = SDL_GetPerformanceCounter();
+    COPYARRAY(dev->sp.mem, curr, uint32_t, SP_MEM_SIZE/4);
+    COPYARRAY(dev->pif.ram, curr, uint8_t, PIF_RAM_SIZE);
+    if (memory_data != NULL && rollback_verbose_stats)
+        rollback_sp_pif_end = SDL_GetPerformanceCounter();
+
+    dev->cart.use_flashram = GETDATA(curr, int32_t);
+    curr += 4+8+4+4; /* Here there used to be flashram state */
+    /* by default, reset flashram state here and load it later if available */
+    poweron_flashram(&dev->cart.flashram);
+
+#if defined(M64P_BIG_ENDIAN)
+    COPYARRAY(dev->r4300.cp0.tlb.LUT_r, curr, uint32_t, 0x100000);
+    COPYARRAY(dev->r4300.cp0.tlb.LUT_w, curr, uint32_t, 0x100000);
+    if (memory_data != NULL && rollback_verbose_stats)
+        rollback_tlb_end = SDL_GetPerformanceCounter();
+#else
+    if (memory_data != NULL)
+    {
+        memcpy(rollback_old_tlb_entries, dev->r4300.cp0.tlb.entries, sizeof(rollback_old_tlb_entries));
+        if (!rollback_tlb_lut_omitted)
+        {
+            rollback_lut_r_data = curr;
+            curr += 0x100000 * sizeof(uint32_t);
+            rollback_lut_w_data = curr;
+            curr += 0x100000 * sizeof(uint32_t);
+        }
+    }
+    else
+    {
+        COPYARRAY(dev->r4300.cp0.tlb.LUT_r, curr, uint32_t, 0x100000);
+        COPYARRAY(dev->r4300.cp0.tlb.LUT_w, curr, uint32_t, 0x100000);
+        if (memory_data != NULL && rollback_verbose_stats)
+            rollback_tlb_end = SDL_GetPerformanceCounter();
+    }
+#endif
+
+    *r4300_llbit(&dev->r4300) = GETDATA(curr, uint32_t);
+    COPYARRAY(r4300_regs(&dev->r4300), curr, int64_t, 32);
+    COPYARRAY(cp0_regs, curr, uint32_t, CP0_REGS_COUNT);
+    *r4300_mult_lo(&dev->r4300) = GETDATA(curr, int64_t);
+    *r4300_mult_hi(&dev->r4300) = GETDATA(curr, int64_t);
+    cp1_reg *cp1_regs = r4300_cp1_regs(&dev->r4300.cp1);
+    COPYARRAY(&cp1_regs->dword, curr, int64_t, 32);
+    *r4300_cp1_fcr0(&dev->r4300.cp1)  = GETDATA(curr, uint32_t);
+    FCR31 = GETDATA(curr, uint32_t);
+    *r4300_cp1_fcr31(&dev->r4300.cp1) = FCR31;
+    set_fpr_pointers(&dev->r4300.cp1, cp0_regs[CP0_STATUS_REG]);
+    update_x86_rounding_mode(&dev->r4300.cp1);
+
+    for (i = 0; i < 32; i++)
+    {
+        dev->r4300.cp0.tlb.entries[i].mask = GETDATA(curr, int16_t);
+        curr += 2;
+        dev->r4300.cp0.tlb.entries[i].vpn2 = GETDATA(curr, uint32_t);
+        dev->r4300.cp0.tlb.entries[i].g = GETDATA(curr, char);
+        dev->r4300.cp0.tlb.entries[i].asid = GETDATA(curr, unsigned char);
+        curr += 2;
+        dev->r4300.cp0.tlb.entries[i].pfn_even = GETDATA(curr, uint32_t);
+        dev->r4300.cp0.tlb.entries[i].c_even = GETDATA(curr, char);
+        dev->r4300.cp0.tlb.entries[i].d_even = GETDATA(curr, char);
+        dev->r4300.cp0.tlb.entries[i].v_even = GETDATA(curr, char);
+        curr++;
+        dev->r4300.cp0.tlb.entries[i].pfn_odd = GETDATA(curr, uint32_t);
+        dev->r4300.cp0.tlb.entries[i].c_odd = GETDATA(curr, char);
+        dev->r4300.cp0.tlb.entries[i].d_odd = GETDATA(curr, char);
+        dev->r4300.cp0.tlb.entries[i].v_odd = GETDATA(curr, char);
+        dev->r4300.cp0.tlb.entries[i].r = GETDATA(curr, char);
+
+        dev->r4300.cp0.tlb.entries[i].start_even = GETDATA(curr, uint32_t);
+        dev->r4300.cp0.tlb.entries[i].end_even = GETDATA(curr, uint32_t);
+        dev->r4300.cp0.tlb.entries[i].phys_even = GETDATA(curr, uint32_t);
+        dev->r4300.cp0.tlb.entries[i].start_odd = GETDATA(curr, uint32_t);
+        dev->r4300.cp0.tlb.entries[i].end_odd = GETDATA(curr, uint32_t);
+        dev->r4300.cp0.tlb.entries[i].phys_odd = GETDATA(curr, uint32_t);
+    }
+    if (memory_data != NULL)
+    {
+        if (rollback_verbose_stats)
+            rollback_tlb_start = SDL_GetPerformanceCounter();
+        /* The "entries unchanged -> keep existing LUT" shortcut is only valid for the OMITTED
+         * (stripped rollback) format, where there's no LUT in the buffer to install. A FULL
+         * buffer (omit flag clear) carries its own LUT — a cold spectator must always install
+         * it, so don't take the skip in that case. */
+        if (rollback_tlb_lut_omitted &&
+            memcmp(rollback_old_tlb_entries, dev->r4300.cp0.tlb.entries, sizeof(rollback_old_tlb_entries)) == 0)
+        {
+            rollback_tlb_lut_skipped = 1;
+        }
+        else if (rollback_tlb_lut_omitted)
+        {
+            memset(dev->r4300.cp0.tlb.LUT_r, 0, 0x100000 * sizeof(dev->r4300.cp0.tlb.LUT_r[0]));
+            memset(dev->r4300.cp0.tlb.LUT_w, 0, 0x100000 * sizeof(dev->r4300.cp0.tlb.LUT_w[0]));
+            for (i = 0; i < 32; i++)
+                tlb_map(&dev->r4300.cp0.tlb, i);
+        }
+        else
+        {
+            memcpy(dev->r4300.cp0.tlb.LUT_r, rollback_lut_r_data, 0x100000 * sizeof(uint32_t));
+            memcpy(dev->r4300.cp0.tlb.LUT_w, rollback_lut_w_data, 0x100000 * sizeof(uint32_t));
+        }
+        if (rollback_verbose_stats)
+            rollback_tlb_end = SDL_GetPerformanceCounter();
+    }
+
+    savestates_load_set_pc(&dev->r4300, GETDATA(curr, uint32_t), memory_data == NULL);
+
+    *r4300_cp0_next_interrupt(&dev->r4300.cp0) = GETDATA(curr, uint32_t);
+    curr += 4; /* here there used to be next_vi */
+    dev->vi.field = GETDATA(curr, uint32_t);
+    if (memory_data != NULL && rollback_verbose_stats)
+        rollback_cpu_end = SDL_GetPerformanceCounter();
+
+    // assert(savestateData+savestateSize == curr)
+
+    to_little_endian_buffer(queue, 4, 256);
+    load_eventqueue_infos(&dev->r4300.cp0, queue);
+
+#ifdef NEW_DYNAREC
+    // Default this to 1, it will be updated by the correct save state version later
+    stop_after_jal = 1;
+
+    if (version >= 0x00010100)
+    {
+        curr = using_tlb_data;
+        using_tlb = GETDATA(curr, uint32_t);
+    }
+#endif
+
+    if (version == 0x00010200)
+    {
+        union
+        {
+            uint8_t bytes[8];
+            uint64_t force_alignment;
+        } aligned;
+
+#define ALIGNED_GETDATA(buff, type) \
+    (COPYARRAY(aligned.bytes, buff, uint8_t, sizeof(type)), *(type*)aligned.bytes)
+
+        curr = data_0001_0200;
+
+        /* extra ai state */
+        dev->ai.last_read = GETDATA(curr, uint32_t);
+        dev->ai.delayed_carry = GETDATA(curr, uint32_t);
+
+        /* extra cart_rom state */
+        dev->cart.cart_rom.last_write = GETDATA(curr, uint32_t);
+        curr += 4; /* used to be cart_rom.rom_written */
+
+        /* extra sp state */
+        curr += 4; /* here there used to be rsp_task_locked */
+
+        /* extra af-rtc state */
+        dev->cart.af_rtc.control = GETDATA(curr, uint16_t);
+        dev->cart.af_rtc.now = (time_t)ALIGNED_GETDATA(curr, int64_t);
+        dev->cart.af_rtc.last_update_rtc = (time_t)ALIGNED_GETDATA(curr, int64_t);
+
+        /* extra controllers state */
+        for (i = 0; i < GAME_CONTROLLERS_COUNT; ++i) {
+            dev->controllers[i].status = GETDATA(curr, uint8_t);
+        }
+
+        /* extra rpak state */
+        for (i = 0; i < GAME_CONTROLLERS_COUNT; ++i) {
+            uint8_t rpk_state = GETDATA(curr, uint8_t);
+
+            /* init rumble pak state if enabled and not controlled by the input plugin */
+            if (ROM_SETTINGS.rumble && !Controls[i].RawData) {
+                set_rumble_reg(&dev->rumblepaks[i], rpk_state);
+            }
+        }
+
+        /* extra tpak state */
+        for (i = 0; i < GAME_CONTROLLERS_COUNT; ++i) {
+            char gb_fingerprint[GB_CART_FINGERPRINT_SIZE];
+            uint8_t rtc_regs[MBC3_RTC_REGS_COUNT];
+            uint8_t rtc_latched_regs[MBC3_RTC_REGS_COUNT];
+            uint8_t cam_regs[POCKET_CAM_REGS_COUNT];
+            unsigned int rom_bank = 0;
+            unsigned int ram_bank = 0;
+            unsigned int ram_enable = 0;
+            unsigned int mbc1_mode = 0;
+            unsigned int rtc_latch = 0;
+            time_t rtc_last_time = 0;
+
+            unsigned int enabled = ALIGNED_GETDATA(curr, uint32_t);
+            unsigned int bank = ALIGNED_GETDATA(curr, uint32_t);
+            unsigned int cart_enabled = ALIGNED_GETDATA(curr, uint32_t);
+            unsigned int reset_state = ALIGNED_GETDATA(curr, uint32_t);
+            COPYARRAY(gb_fingerprint, curr, uint8_t, GB_CART_FINGERPRINT_SIZE);
+            if (gb_fingerprint[0] != 0) {
+                rom_bank = ALIGNED_GETDATA(curr, uint32_t);
+                ram_bank = ALIGNED_GETDATA(curr, uint32_t);
+                ram_enable = ALIGNED_GETDATA(curr, uint32_t);
+                mbc1_mode = ALIGNED_GETDATA(curr, uint32_t);
+                COPYARRAY(rtc_regs, curr, uint8_t, MBC3_RTC_REGS_COUNT);
+                rtc_latch = ALIGNED_GETDATA(curr, uint32_t);
+                COPYARRAY(rtc_latched_regs, curr, uint8_t, MBC3_RTC_REGS_COUNT);
+                rtc_last_time = (time_t)ALIGNED_GETDATA(curr, int64_t);
+                COPYARRAY(cam_regs, curr, uint8_t, POCKET_CAM_REGS_COUNT);
+            }
+
+            if (ROM_SETTINGS.transferpak && !Controls[i].RawData && (Controls[i].Type == CONT_TYPE_STANDARD)) {
+
+                /* init transferpak state if enabled and not controlled by input plugin */
+                dev->transferpaks[i].enabled = enabled;
+                dev->transferpaks[i].bank = bank;
+                dev->transferpaks[i].cart_enabled = cart_enabled;
+                dev->transferpaks[i].reset_state = reset_state;
+
+                /* if it holds a valid cartridge init gbcart */
+                if (dev->transferpaks[i].gb_cart != NULL
+                 && dev->transferpaks[i].gb_cart->irom_storage != NULL) {
+                    const uint8_t* rom = dev->transferpaks[i].gb_cart->irom_storage->data
+                                        (dev->transferpaks[i].gb_cart->rom_storage);
+
+                    /* verify that gb cart saved in savestate is the same
+                     * as what is currently inserted in transferpak */
+                    if (gb_fingerprint[0] != 0
+                     && memcmp(gb_fingerprint,
+                               rom + GB_CART_FINGERPRINT_OFFSET,
+                               GB_CART_FINGERPRINT_SIZE) == 0) {
+
+                        /* init gbcart state */
+                        dev->transferpaks[i].gb_cart->rom_bank = rom_bank;
+                        dev->transferpaks[i].gb_cart->ram_bank = ram_bank;
+                        dev->transferpaks[i].gb_cart->ram_enable = ram_enable;
+                        dev->transferpaks[i].gb_cart->mbc1_mode = mbc1_mode;
+                        dev->transferpaks[i].gb_cart->rtc.latch = rtc_latch;
+                        dev->transferpaks[i].gb_cart->rtc.last_time = rtc_last_time;
+
+                        memcpy(dev->transferpaks[i].gb_cart->rtc.regs, rtc_regs, MBC3_RTC_REGS_COUNT);
+                        memcpy(dev->transferpaks[i].gb_cart->rtc.latched_regs, rtc_latched_regs, MBC3_RTC_REGS_COUNT);
+                        memcpy(dev->transferpaks[i].gb_cart->cam.regs, cam_regs, POCKET_CAM_REGS_COUNT);
+                    }
+                    else {
+                        DebugMessage(M64MSG_WARNING,
+                            "Savestate GB cart mismatch. Current GB cart: %s. Expected GB cart : %s",
+                            (rom[GB_CART_FINGERPRINT_OFFSET] == 0x00) ? "(none)" : (const char*)(rom + GB_CART_FINGERPRINT_OFFSET),
+                            (gb_fingerprint[0] == 0x00) ? "(none)" : gb_fingerprint);
+
+                        poweron_gb_cart(dev->transferpaks[i].gb_cart);
+                    }
+                }
+            }
+        }
+
+        /* extra pif channels state */
+        for (i = 0; i < PIF_CHANNELS_COUNT; ++i) {
+            int offset = GETDATA(curr, int8_t);
+            if (offset >= 0) {
+                setup_pif_channel(&dev->pif.channels[i], dev->pif.ram + offset);
+            }
+            else {
+                disable_pif_channel(&dev->pif.channels[i]);
+            }
+        }
+
+        /* extra vi state */
+        dev->vi.count_per_scanline = ALIGNED_GETDATA(curr, uint32_t);
+
+        /* extra si state */
+        dev->si.dma_dir = GETDATA(curr, uint8_t);
+
+        /* extra dp state */
+        dev->dp.do_on_unfreeze = GETDATA(curr, uint8_t);
+
+        /* extra RDRAM register state */
+        for (i = 1; i < RDRAM_MAX_MODULES_COUNT; ++i) {
+            dev->rdram.regs[i][RDRAM_CONFIG_REG]       = ALIGNED_GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_DEVICE_ID_REG]    = ALIGNED_GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_DELAY_REG]        = ALIGNED_GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_MODE_REG]         = ALIGNED_GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_REF_INTERVAL_REG] = ALIGNED_GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_REF_ROW_REG]      = ALIGNED_GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_RAS_INTERVAL_REG] = ALIGNED_GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_MIN_INTERVAL_REG] = ALIGNED_GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_ADDR_SELECT_REG]  = ALIGNED_GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_DEVICE_MANUF_REG] = ALIGNED_GETDATA(curr, uint32_t);
+        }
+    }
+    else if (version >= 0x00010300)
+    {
+        curr = data_0001_0200;
+
+        /* extra ai state */
+        dev->ai.last_read = GETDATA(curr, uint32_t);
+        dev->ai.delayed_carry = GETDATA(curr, uint32_t);
+
+        /* extra cart_rom state */
+        dev->cart.cart_rom.last_write = GETDATA(curr, uint32_t);
+        curr +=4; /* used to be cart_rom.rom_written */
+
+        /* extra sp state */
+        curr += 4; /* here there used to be rsp_task_locked */
+
+        /* extra af-rtc state */
+        dev->cart.af_rtc.control = GETDATA(curr, uint16_t);
+        curr += 2; /* padding to keep things 8-byte aligned */
+        dev->cart.af_rtc.now = (time_t)GETDATA(curr, int64_t);
+        dev->cart.af_rtc.last_update_rtc = (time_t)GETDATA(curr, int64_t);
+
+        /* extra controllers state */
+        for (i = 0; i < GAME_CONTROLLERS_COUNT; ++i) {
+            dev->controllers[i].status = GETDATA(curr, uint8_t);
+        }
+
+        /* extra rpak state */
+        for (i = 0; i < GAME_CONTROLLERS_COUNT; ++i) {
+            uint8_t rpk_state = GETDATA(curr, uint8_t);
+
+            /* init rumble pak state if enabled and not controlled by the input plugin */
+            if (ROM_SETTINGS.rumble && !Controls[i].RawData && (Controls[i].Type == CONT_TYPE_STANDARD)) {
+                set_rumble_reg(&dev->rumblepaks[i], rpk_state);
+            }
+        }
+
+        /* extra tpak state */
+        for (i = 0; i < GAME_CONTROLLERS_COUNT; ++i) {
+            char gb_fingerprint[GB_CART_FINGERPRINT_SIZE];
+            uint8_t rtc_regs[MBC3_RTC_REGS_COUNT];
+            uint8_t rtc_latched_regs[MBC3_RTC_REGS_COUNT];
+            uint8_t cam_regs[POCKET_CAM_REGS_COUNT];
+            unsigned int rom_bank = 0;
+            unsigned int ram_bank = 0;
+            unsigned int ram_enable = 0;
+            unsigned int mbc1_mode = 0;
+            unsigned int rtc_latch = 0;
+            time_t rtc_last_time = 0;
+
+            unsigned int enabled = GETDATA(curr, uint32_t);
+            unsigned int bank = GETDATA(curr, uint32_t);
+            unsigned int cart_enabled = GETDATA(curr, uint32_t);
+            unsigned int reset_state = GETDATA(curr, uint32_t);
+            COPYARRAY(gb_fingerprint, curr, uint8_t, GB_CART_FINGERPRINT_SIZE);
+            if (gb_fingerprint[0] != 0) {
+                rom_bank = GETDATA(curr, uint32_t);
+                ram_bank = GETDATA(curr, uint32_t);
+                ram_enable = GETDATA(curr, uint32_t);
+                mbc1_mode = GETDATA(curr, uint32_t);
+                rtc_latch = GETDATA(curr, uint32_t);
+                rtc_last_time = (time_t)GETDATA(curr, int64_t);
+                COPYARRAY(rtc_regs, curr, uint8_t, MBC3_RTC_REGS_COUNT);
+                COPYARRAY(rtc_latched_regs, curr, uint8_t, MBC3_RTC_REGS_COUNT);
+                COPYARRAY(cam_regs, curr, uint8_t, POCKET_CAM_REGS_COUNT);
+            }
+
+            if (ROM_SETTINGS.transferpak && !Controls[i].RawData && (Controls[i].Type == CONT_TYPE_STANDARD)) {
+
+                /* init transferpak state if enabled and not controlled by input plugin */
+                dev->transferpaks[i].enabled = enabled;
+                dev->transferpaks[i].bank = bank;
+                dev->transferpaks[i].cart_enabled = cart_enabled;
+                dev->transferpaks[i].reset_state = reset_state;
+
+                /* if it holds a valid cartridge init gbcart */
+                if (dev->transferpaks[i].gb_cart != NULL
+                 && dev->transferpaks[i].gb_cart->irom_storage != NULL) {
+                    const uint8_t* rom = dev->transferpaks[i].gb_cart->irom_storage->data
+                                        (dev->transferpaks[i].gb_cart->rom_storage);
+
+                    /* verify that gb cart saved in savestate is the same
+                     * as what is currently inserted in transferpak */
+                    if (gb_fingerprint[0] != 0
+                     && memcmp(gb_fingerprint,
+                               rom + GB_CART_FINGERPRINT_OFFSET,
+                               GB_CART_FINGERPRINT_SIZE) == 0) {
+
+                        /* init gbcart state */
+                        dev->transferpaks[i].gb_cart->rom_bank = rom_bank;
+                        dev->transferpaks[i].gb_cart->ram_bank = ram_bank;
+                        dev->transferpaks[i].gb_cart->ram_enable = ram_enable;
+                        dev->transferpaks[i].gb_cart->mbc1_mode = mbc1_mode;
+                        dev->transferpaks[i].gb_cart->rtc.latch = rtc_latch;
+                        dev->transferpaks[i].gb_cart->rtc.last_time = rtc_last_time;
+
+                        memcpy(dev->transferpaks[i].gb_cart->rtc.regs, rtc_regs, MBC3_RTC_REGS_COUNT);
+                        memcpy(dev->transferpaks[i].gb_cart->rtc.latched_regs, rtc_latched_regs, MBC3_RTC_REGS_COUNT);
+                        memcpy(dev->transferpaks[i].gb_cart->cam.regs, cam_regs, POCKET_CAM_REGS_COUNT);
+                    }
+                    else {
+                        DebugMessage(M64MSG_WARNING,
+                            "Savestate GB cart mismatch. Current GB cart: %s. Expected GB cart : %s",
+                            (rom[GB_CART_FINGERPRINT_OFFSET] == 0x00) ? "(none)" : (const char*)(rom + GB_CART_FINGERPRINT_OFFSET),
+                            (gb_fingerprint[0] == 0x00) ? "(none)" : gb_fingerprint);
+
+                        poweron_gb_cart(dev->transferpaks[i].gb_cart);
+                    }
+                }
+            }
+        }
+
+        /* extra pif channels state */
+        for (i = 0; i < PIF_CHANNELS_COUNT; ++i) {
+            int offset = GETDATA(curr, int8_t);
+            if (offset >= 0) {
+                setup_pif_channel(&dev->pif.channels[i], dev->pif.ram + offset);
+            }
+            else {
+                disable_pif_channel(&dev->pif.channels[i]);
+            }
+        }
+
+        /* extra si state */
+        dev->si.dma_dir = GETDATA(curr, uint8_t);
+
+        /* extra dp state */
+        dev->dp.do_on_unfreeze = GETDATA(curr, uint8_t);
+
+        /* extra vi state */
+        dev->vi.count_per_scanline = GETDATA(curr, uint32_t);
+
+        /* extra RDRAM register state */
+        for (i = 1; i < RDRAM_MAX_MODULES_COUNT; ++i) {
+            dev->rdram.regs[i][RDRAM_CONFIG_REG]       = GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_DEVICE_ID_REG]    = GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_DELAY_REG]        = GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_MODE_REG]         = GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_REF_INTERVAL_REG] = GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_REF_ROW_REG]      = GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_RAS_INTERVAL_REG] = GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_MIN_INTERVAL_REG] = GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_ADDR_SELECT_REG]  = GETDATA(curr, uint32_t);
+            dev->rdram.regs[i][RDRAM_DEVICE_MANUF_REG] = GETDATA(curr, uint32_t);
+        }
+
+        if (version >= 0x00010400) {
+            /* verify if DD data is present (and matches what's currently loaded) */
+            uint32_t disk_id = GETDATA(curr, uint32_t);
+
+            uint32_t* current_disk_id = ((dev->dd.rom_size > 0) && dev->dd.idisk != NULL)
+                ? (uint32_t*)(dev->dd.idisk->data(dev->dd.disk) + DD_DISK_ID_OFFSET)
+                : NULL;
+
+            if (current_disk_id != NULL && *current_disk_id == disk_id) {
+                dev->dd.regs[DD_ASIC_DATA] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_MISC_REG] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_CMD_STATUS] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_CUR_TK] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_BM_STATUS_CTL] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_ERR_SECTOR] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_SEQ_STATUS_CTL] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_CUR_SECTOR] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_HARD_RESET] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_C1_S0] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_HOST_SECBYTE] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_C1_S2] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_SEC_BYTE] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_C1_S4] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_C1_S6] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_CUR_ADDR] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_ID_REG] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_TEST_REG] = GETDATA(curr, uint32_t);
+                dev->dd.regs[DD_ASIC_TEST_PIN_SEL] = GETDATA(curr, uint32_t);
+
+                /* C2S buffer is expected to be always zero */
+                memset(dev->dd.c2s_buf, 0, 0x400);
+                COPYARRAY(dev->dd.ds_buf, curr, uint8_t, 0x100);
+                COPYARRAY(dev->dd.ms_ram, curr, uint8_t, 0x40);
+
+                dev->dd.rtc.now = (time_t)GETDATA(curr, int64_t);
+                dev->dd.rtc.last_update_rtc = (time_t)GETDATA(curr, int64_t);
+                dev->dd.bm_write = (unsigned char)GETDATA(curr, uint32_t);
+                dev->dd.bm_reset_held = (unsigned char)GETDATA(curr, uint32_t);
+                curr += sizeof(uint32_t); /* was bm_block */
+                dev->dd.bm_zone = GETDATA(curr, uint32_t);
+                curr += sizeof(uint32_t); /* was bm_track_offset */
+            }
+            else {
+                curr += (3+DD_ASIC_REGS_COUNT)*sizeof(uint32_t) + 0x100 + 0x40 + 2*sizeof(int64_t) + 2*sizeof(unsigned int);
+            }
+        }
+
+        if (version >= 0x00010500)
+        {
+#ifdef NEW_DYNAREC
+            stop_after_jal = GETDATA(curr, uint32_t);
+#else
+            curr += sizeof(uint32_t);
+#endif
+        }
+
+        if (version >= 0x00010700)
+        {
+            dev->sp.fifo[0].dir = GETDATA(curr, uint32_t);
+            dev->sp.fifo[0].length = GETDATA(curr, uint32_t);
+            dev->sp.fifo[0].memaddr = GETDATA(curr, uint32_t);
+            dev->sp.fifo[0].dramaddr = GETDATA(curr, uint32_t);
+            dev->sp.fifo[1].dir = GETDATA(curr, uint32_t);
+            dev->sp.fifo[1].length = GETDATA(curr, uint32_t);
+            dev->sp.fifo[1].memaddr = GETDATA(curr, uint32_t);
+            dev->sp.fifo[1].dramaddr = GETDATA(curr, uint32_t);
+        }
+        else {
+            memset(dev->sp.fifo, 0, SP_DMA_FIFO_SIZE*sizeof(struct sp_dma));
+        }
+
+        if (version >= 0x00010800)
+        {
+            /* extra flashram state */
+            COPYARRAY(dev->cart.flashram.page_buf, curr, uint8_t, 128);
+            COPYARRAY(dev->cart.flashram.silicon_id, curr, uint32_t, 2);
+            dev->cart.flashram.status = GETDATA(curr, uint32_t);
+            dev->cart.flashram.erase_page = GETDATA(curr, uint16_t);
+            dev->cart.flashram.mode = GETDATA(curr, uint16_t);
+        }
+
+        if (version >= 0x00010900)
+        {
+            /* extra cp0 and cp2 state */
+            *r4300_cp0_latch(&dev->r4300.cp0) = GETDATA(curr, uint64_t);
+            *r4300_cp2_latch(&dev->r4300.cp2) = GETDATA(curr, uint64_t);
+        }
+
+        if (version >= 0x00020000)
+        {
+            /* extra rsp state */
+            dev->sp.rsp_status = GETDATA(curr, uint32_t);
+            dev->sp.first_run = GETDATA(curr, uint32_t);
+            dev->sp.rsp_wait = GETDATA(curr, uint32_t);
+        }
+    }
+    else
+    {
+        /* extra ai state */
+        dev->ai.last_read = 0;
+        dev->ai.delayed_carry = 0;
+
+        /* extra cart_rom state */
+        dev->cart.cart_rom.last_write = 0;
+
+        /* extra af-rtc state */
+        dev->cart.af_rtc.control = 0x200;
+        dev->cart.af_rtc.now = 0;
+        dev->cart.af_rtc.last_update_rtc = 0;
+
+        /* extra controllers state */
+        for(i = 0; i < GAME_CONTROLLERS_COUNT; ++i) {
+            /* skip controllers handled by the input plugin */
+            if (Controls[i].RawData)
+                continue;
+
+            dev->controllers[i].flavor->reset(&dev->controllers[i]);
+
+            if (ROM_SETTINGS.rumble && (Controls[i].Type == CONT_TYPE_STANDARD)) {
+                poweron_rumblepak(&dev->rumblepaks[i]);
+            }
+            if (ROM_SETTINGS.transferpak && (Controls[i].Type == CONT_TYPE_STANDARD)) {
+                poweron_transferpak(&dev->transferpaks[i]);
+            }
+        }
+
+        /* extra pif channels state
+         * HACK: Assume PIF was in channel processing mode (and not in CIC challenge mode)
+         * Try to parse pif ram to setup pif channels
+         */
+        setup_channels_format(&dev->pif);
+
+        /* extra vi state */
+        dev->vi.count_per_scanline = (dev->vi.regs[VI_V_SYNC_REG] == 0)
+            ? 1500
+            : ((dev->vi.clock / dev->vi.expected_refresh_rate) / (dev->vi.regs[VI_V_SYNC_REG] + 1));
+
+        /* extra si state */
+        dev->si.dma_dir = SI_NO_DMA;
+
+        /* extra dp state */
+        dev->dp.do_on_unfreeze = 0;
+
+        /* extra rdram state
+         * Best effort, copy values from RDRAM module 0 except for DEVICE_ID
+         * which is set in accordance with the IPL3 procedure with 2M modules.
+         */
+        for (i = 0; i < RDRAM_MAX_MODULES_COUNT; ++i) {
+            memcpy(dev->rdram.regs[i], dev->rdram.regs[0], RDRAM_REGS_COUNT*sizeof(dev->rdram.regs[0][0]));
+            dev->rdram.regs[i][RDRAM_DEVICE_ID_REG] = ri_address_to_id_field(ri_address(i * 0x200000), 0) << 2;
+        }
+
+        /* dd state */
+        if (dev->dd.rom_size > 0 && dev->dd.idisk != NULL) {
+            poweron_dd(&dev->dd);
+        }
+    }
+    if (memory_data != NULL && rollback_verbose_stats)
+        rollback_extra_end = SDL_GetPerformanceCounter();
+
+    /* Rollback restores RDRAM registers by direct assignment, bypassing the
+     * register-write side effect which selects the normal or corrupt handler. */
+    if (memory_data != NULL)
+        rdram_sync_memory_map(&dev->rdram);
+
+    /* Zilmar-Spec plugin expect a call with control_id = -1 when RAM processing is done */
+    if (input.controllerCommand) {
+        input.controllerCommand(-1, NULL);
+    }
+
+    /* reset fb state */
+    poweron_fb(&dev->dp.fb);
+
+    dev->r4300.cp0.interrupt_unsafe_state = 0;
+
+    *r4300_cp0_last_addr(&dev->r4300.cp0) = *r4300_pc(&dev->r4300);
+
+    if (rollback_sram_data != NULL)
+    {
+        /* Restore only the in-memory image. In particular, do not call the storage backend's
+         * save callback: rollback must never persist a historical state to the user's .sra. */
+        memcpy(rollback_sram_storage, rollback_sram_data, SRAM_SIZE);
+    }
+    if (memory_data != NULL && rollback_verbose_stats)
+        rollback_finalize_end = SDL_GetPerformanceCounter();
+
+    if (free_savestate_data)
+        free(savestateData);
+    if (memory_data != NULL && rollback_verbose_stats)
+    {
+        uint64_t rollback_load_end = SDL_GetPerformanceCounter();
+        uint64_t rollback_total_us = rollback_perf_us(rollback_load_start, rollback_load_end);
+        uint64_t rollback_read_us = rollback_perf_us(rollback_load_start, rollback_parse_start);
+        uint64_t rollback_fixed_us = rollback_perf_us(rollback_parse_start, rollback_fixed_end);
+        uint64_t rollback_rdram_us = rollback_perf_us(rollback_rdram_start, rollback_rdram_end);
+        uint64_t rollback_sp_pif_us = rollback_perf_us(rollback_rdram_end, rollback_sp_pif_end);
+        uint64_t rollback_tlb_us = rollback_perf_us(rollback_tlb_start, rollback_tlb_end);
+        uint64_t rollback_cpu_us = rollback_perf_us(rollback_tlb_end, rollback_cpu_end);
+        uint64_t rollback_extra_us = rollback_perf_us(rollback_cpu_end, rollback_extra_end);
+        uint64_t rollback_finalize_us = rollback_perf_us(rollback_extra_end, rollback_finalize_end);
+        uint64_t rollback_free_us = rollback_perf_us(rollback_finalize_end, rollback_load_end);
+
+        DebugMessage(M64MSG_INFO,
+            "Rollback load timing: total=%" PRIu64 "us read=%" PRIu64 "us fixed=%" PRIu64 "us rdram=%" PRIu64 "us sp_pif=%" PRIu64 "us tlb=%" PRIu64 "us tlb_skipped=%d tlb_omitted=%d cpu=%" PRIu64 "us extra=%" PRIu64 "us finalize=%" PRIu64 "us free=%" PRIu64 "us",
+            rollback_total_us, rollback_read_us, rollback_fixed_us, rollback_rdram_us, rollback_sp_pif_us,
+            rollback_tlb_us, rollback_tlb_lut_skipped, rollback_tlb_lut_omitted, rollback_cpu_us, rollback_extra_us, rollback_finalize_us, rollback_free_us);
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT,
+            "Rollback load %" PRIu64 " us (RDRAM %" PRIu64 ", TLB %" PRIu64 "%s, extra %" PRIu64 ")",
+            rollback_total_us, rollback_rdram_us, rollback_tlb_us, rollback_tlb_lut_skipped ? " skip" : "", rollback_extra_us);
+    }
+    else if (memory_data == NULL)
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State loaded from: %s", namefrompath(filepath));
+    }
+    return 1;
+}
+
+static int savestates_load_pj64(struct device* dev,
+                                char *filepath, void *handle,
+                                int (*read_func)(void *, void *, size_t))
+{
+    char buffer[1024];
+    unsigned int vi_timer, SaveRDRAMSize;
+    size_t i;
+    uint32_t FCR31;
+
+    unsigned char header[8];
+    unsigned char RomHeader[0x40];
+
+    size_t savestateSize;
+    unsigned char *savestateData, *curr;
+
+    uint32_t* cp0_regs = r4300_cp0_regs(&dev->r4300.cp0);
+
+    /* Read and check Project64 magic number. */
+    if (!read_func(handle, header, 8))
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read header from Project64 savestate %s", filepath);
+        return 0;
+    }
+
+    curr = header;
+    if (memcmp(curr, pj64_magic, 4) != 0)
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State file: %s is not a valid Project64 savestate. Unrecognized file format.", filepath);
+        return 0;
+    }
+    curr += 4;
+
+    SaveRDRAMSize = GETDATA(curr, uint32_t);
+
+    /* Read the rest of the savestate into memory. */
+    savestateSize = SaveRDRAMSize + 0x2754;
+    savestateData = curr = (unsigned char *)malloc(savestateSize);
+    if (savestateData == NULL)
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Insufficient memory to load state.");
+        return 0;
+    }
+    if (!read_func(handle, savestateData, savestateSize))
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read savestate data from Project64 savestate %s", filepath);
+        free(savestateData);
+        return 0;
+    }
+
+    // check ROM header
+    COPYARRAY(RomHeader, curr, unsigned int, 0x40/4);
+    if(memcmp(RomHeader, dev->cart.cart_rom.rom, 0x40) != 0)
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State ROM header does not match current ROM.");
+        free(savestateData);
+        return 0;
+    }
+
+    // vi_timer
+    vi_timer = GETDATA(curr, uint32_t);
+
+    // Program Counter
+    *r4300_cp0_last_addr(&dev->r4300.cp0) = GETDATA(curr, uint32_t);
+
+    // GPR
+    COPYARRAY(r4300_regs(&dev->r4300), curr, int64_t, 32);
+
+    // FPR
+    cp1_reg *cp1_regs = r4300_cp1_regs(&dev->r4300.cp1);
+    COPYARRAY(&cp1_regs->dword, curr, int64_t, 32);
+
+    // CP0
+    COPYARRAY(cp0_regs, curr, uint32_t, CP0_REGS_COUNT);
+
+    set_fpr_pointers(&dev->r4300.cp1, cp0_regs[CP0_STATUS_REG]);
+
+    // Initialze the interrupts
+    vi_timer += cp0_regs[CP0_COUNT_REG];
+    *r4300_cp0_next_interrupt(&dev->r4300.cp0) = (cp0_regs[CP0_COMPARE_REG] < vi_timer)
+                  ? cp0_regs[CP0_COMPARE_REG]
+                  : vi_timer;
+
+    dev->vi.field = 0;
+    *((unsigned int*)&buffer[0]) = VI_INT;
+    *((unsigned int*)&buffer[4]) = vi_timer;
+    *((unsigned int*)&buffer[8]) = COMPARE_INT;
+    *((unsigned int*)&buffer[12]) = cp0_regs[CP0_COMPARE_REG];
+    *((unsigned int*)&buffer[16]) = 0xFFFFFFFF;
+
+    load_eventqueue_infos(&dev->r4300.cp0, buffer);
+
+    // FPCR
+    *r4300_cp1_fcr0(&dev->r4300.cp1) = GETDATA(curr, uint32_t);
+    curr += 30 * 4; // FCR1...FCR30 not supported
+    FCR31 = GETDATA(curr, uint32_t);
+    *r4300_cp1_fcr31(&dev->r4300.cp1) = FCR31;
+    update_x86_rounding_mode(&dev->r4300.cp1);
+
+    // hi / lo
+    *r4300_mult_hi(&dev->r4300) = GETDATA(curr, int64_t);
+    *r4300_mult_lo(&dev->r4300) = GETDATA(curr, int64_t);
+
+    // rdram register
+    dev->rdram.regs[0][RDRAM_CONFIG_REG]       = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_DEVICE_ID_REG]    = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_DELAY_REG]        = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_MODE_REG]         = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_REF_INTERVAL_REG] = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_REF_ROW_REG]      = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_RAS_INTERVAL_REG] = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_MIN_INTERVAL_REG] = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_ADDR_SELECT_REG]  = GETDATA(curr, uint32_t);
+    dev->rdram.regs[0][RDRAM_DEVICE_MANUF_REG] = GETDATA(curr, uint32_t);
+
+    // sp_register
+    dev->sp.regs[SP_MEM_ADDR_REG]  = GETDATA(curr, uint32_t);
+    dev->sp.regs[SP_DRAM_ADDR_REG] = GETDATA(curr, uint32_t);
+    dev->sp.regs[SP_RD_LEN_REG]    = GETDATA(curr, uint32_t);
+    dev->sp.regs[SP_WR_LEN_REG]    = GETDATA(curr, uint32_t);
+    dev->sp.regs[SP_STATUS_REG]    = GETDATA(curr, uint32_t);
+    dev->sp.regs[SP_DMA_FULL_REG]  = GETDATA(curr, uint32_t);
+    dev->sp.regs[SP_DMA_BUSY_REG]  = GETDATA(curr, uint32_t);
+    dev->sp.regs[SP_SEMAPHORE_REG] = GETDATA(curr, uint32_t);
+    dev->sp.regs2[SP_PC_REG]    = GETDATA(curr, uint32_t);
+    dev->sp.regs2[SP_IBIST_REG] = GETDATA(curr, uint32_t);
+
+    // dpc_register
+    dev->dp.dpc_regs[DPC_START_REG]    = GETDATA(curr, uint32_t);
+    dev->dp.dpc_regs[DPC_END_REG]      = GETDATA(curr, uint32_t);
+    dev->dp.dpc_regs[DPC_CURRENT_REG]  = GETDATA(curr, uint32_t);
+    dev->dp.dpc_regs[DPC_STATUS_REG]   = GETDATA(curr, uint32_t);
+    dev->dp.dpc_regs[DPC_CLOCK_REG]    = GETDATA(curr, uint32_t);
+    dev->dp.dpc_regs[DPC_BUFBUSY_REG]  = GETDATA(curr, uint32_t);
+    dev->dp.dpc_regs[DPC_PIPEBUSY_REG] = GETDATA(curr, uint32_t);
+    dev->dp.dpc_regs[DPC_TMEM_REG]     = GETDATA(curr, uint32_t);
+    (void)GETDATA(curr, uint32_t); // Dummy read
+    (void)GETDATA(curr, uint32_t); // Dummy read
+
+    // mi_register
+    dev->mi.regs[MI_INIT_MODE_REG] = GETDATA(curr, uint32_t);
+    dev->mi.regs[MI_VERSION_REG]   = GETDATA(curr, uint32_t);
+    dev->mi.regs[MI_INTR_REG]      = GETDATA(curr, uint32_t);
+    dev->mi.regs[MI_INTR_MASK_REG] = GETDATA(curr, uint32_t);
+
+    // vi_register
+    dev->vi.regs[VI_STATUS_REG]  = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_ORIGIN_REG]  = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_WIDTH_REG]   = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_V_INTR_REG]  = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_CURRENT_REG] = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_BURST_REG]   = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_V_SYNC_REG]  = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_H_SYNC_REG]  = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_LEAP_REG]    = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_H_START_REG] = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_V_START_REG] = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_V_BURST_REG] = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_X_SCALE_REG] = GETDATA(curr, uint32_t);
+    dev->vi.regs[VI_Y_SCALE_REG] = GETDATA(curr, uint32_t);
+    // TODO vi delay?
+    gfx.viStatusChanged();
+    gfx.viWidthChanged();
+
+    dev->vi.count_per_scanline = (dev->vi.regs[VI_V_SYNC_REG] == 0)
+        ? 1500
+        : ((dev->vi.clock / dev->vi.expected_refresh_rate) / (dev->vi.regs[VI_V_SYNC_REG] + 1));
+
+    /* extra si state */
+    dev->si.dma_dir = SI_NO_DMA;
+
+    /* extra dp state */
+    dev->dp.do_on_unfreeze = 0;
+
+    // ai_register
+    dev->ai.regs[AI_DRAM_ADDR_REG] = GETDATA(curr, uint32_t);
+    dev->ai.regs[AI_LEN_REG]       = GETDATA(curr, uint32_t);
+    dev->ai.regs[AI_CONTROL_REG]   = GETDATA(curr, uint32_t);
+    dev->ai.regs[AI_STATUS_REG]    = GETDATA(curr, uint32_t);
+    dev->ai.regs[AI_DACRATE_REG]   = GETDATA(curr, uint32_t);
+    dev->ai.regs[AI_BITRATE_REG]   = GETDATA(curr, uint32_t);
+    dev->ai.samples_format_changed = 1;
+
+    /* extra ai state */
+    dev->ai.last_read = 0;
+    dev->ai.delayed_carry = 0;
+
+    // pi_register
+    dev->pi.regs[PI_DRAM_ADDR_REG]    = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_CART_ADDR_REG]    = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_RD_LEN_REG]       = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_WR_LEN_REG]       = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_STATUS_REG]       = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_BSD_DOM1_LAT_REG] = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_BSD_DOM1_PWD_REG] = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_BSD_DOM1_PGS_REG] = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_BSD_DOM1_RLS_REG] = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_BSD_DOM2_LAT_REG] = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_BSD_DOM2_PWD_REG] = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_BSD_DOM2_PGS_REG] = GETDATA(curr, uint32_t);
+    dev->pi.regs[PI_BSD_DOM2_RLS_REG] = GETDATA(curr, uint32_t);
+    read_func(handle, dev->pi.regs, PI_REGS_COUNT*sizeof(dev->pi.regs[0]));
+
+    /* extra cart_rom state */
+    dev->cart.cart_rom.last_write = 0;
+
+    // ri_register
+    dev->ri.regs[RI_MODE_REG]         = GETDATA(curr, uint32_t);
+    dev->ri.regs[RI_CONFIG_REG]       = GETDATA(curr, uint32_t);
+    dev->ri.regs[RI_CURRENT_LOAD_REG] = GETDATA(curr, uint32_t);
+    dev->ri.regs[RI_SELECT_REG]       = GETDATA(curr, uint32_t);
+    dev->ri.regs[RI_REFRESH_REG]      = GETDATA(curr, uint32_t);
+    dev->ri.regs[RI_LATENCY_REG]      = GETDATA(curr, uint32_t);
+    dev->ri.regs[RI_ERROR_REG]        = GETDATA(curr, uint32_t);
+    dev->ri.regs[RI_WERROR_REG]       = GETDATA(curr, uint32_t);
+
+    // si_register
+    dev->si.regs[SI_DRAM_ADDR_REG]      = GETDATA(curr, uint32_t);
+    dev->si.regs[SI_PIF_ADDR_RD64B_REG] = GETDATA(curr, uint32_t);
+    dev->si.regs[SI_PIF_ADDR_WR64B_REG] = GETDATA(curr, uint32_t);
+    dev->si.regs[SI_STATUS_REG]         = GETDATA(curr, uint32_t);
+
+    // tlb
+    memset(dev->r4300.cp0.tlb.LUT_r, 0, 0x400000);
+    memset(dev->r4300.cp0.tlb.LUT_w, 0, 0x400000);
+    for (i=0; i < 32; i++)
+    {
+        unsigned int MyPageMask, MyEntryHi, MyEntryLo0, MyEntryLo1;
+
+        (void)GETDATA(curr, uint32_t); // Dummy read - EntryDefined
+        MyPageMask = GETDATA(curr, uint32_t);
+        MyEntryHi = GETDATA(curr, uint32_t);
+        MyEntryLo0 = GETDATA(curr, uint32_t);
+        MyEntryLo1 = GETDATA(curr, uint32_t);
+
+        // This is copied from TLBWI instruction
+        dev->r4300.cp0.tlb.entries[i].g = (MyEntryLo0 & MyEntryLo1 & 1);
+        dev->r4300.cp0.tlb.entries[i].pfn_even = (MyEntryLo0 & 0x3FFFFFC0) >> 6;
+        dev->r4300.cp0.tlb.entries[i].pfn_odd = (MyEntryLo1 & 0x3FFFFFC0) >> 6;
+        dev->r4300.cp0.tlb.entries[i].c_even = (MyEntryLo0 & 0x38) >> 3;
+        dev->r4300.cp0.tlb.entries[i].c_odd = (MyEntryLo1 & 0x38) >> 3;
+        dev->r4300.cp0.tlb.entries[i].d_even = (MyEntryLo0 & 0x4) >> 2;
+        dev->r4300.cp0.tlb.entries[i].d_odd = (MyEntryLo1 & 0x4) >> 2;
+        dev->r4300.cp0.tlb.entries[i].v_even = (MyEntryLo0 & 0x2) >> 1;
+        dev->r4300.cp0.tlb.entries[i].v_odd = (MyEntryLo1 & 0x2) >> 1;
+        dev->r4300.cp0.tlb.entries[i].asid = (MyEntryHi & 0xFF);
+        dev->r4300.cp0.tlb.entries[i].vpn2 = (MyEntryHi & 0xFFFFE000) >> 13;
+        //dev->r4300.cp0.tlb.entries[i].r = (MyEntryHi & 0xC000000000000000LL) >> 62;
+        dev->r4300.cp0.tlb.entries[i].mask = (MyPageMask & 0x1FFE000) >> 13;
+
+        dev->r4300.cp0.tlb.entries[i].start_even = dev->r4300.cp0.tlb.entries[i].vpn2 << 13;
+        dev->r4300.cp0.tlb.entries[i].end_even = dev->r4300.cp0.tlb.entries[i].start_even+
+          (dev->r4300.cp0.tlb.entries[i].mask << 12) + 0xFFF;
+        dev->r4300.cp0.tlb.entries[i].phys_even = dev->r4300.cp0.tlb.entries[i].pfn_even << 12;
+
+        dev->r4300.cp0.tlb.entries[i].start_odd = dev->r4300.cp0.tlb.entries[i].end_even+1;
+        dev->r4300.cp0.tlb.entries[i].end_odd = dev->r4300.cp0.tlb.entries[i].start_odd+
+          (dev->r4300.cp0.tlb.entries[i].mask << 12) + 0xFFF;
+        dev->r4300.cp0.tlb.entries[i].phys_odd = dev->r4300.cp0.tlb.entries[i].pfn_odd << 12;
+
+        tlb_map(&dev->r4300.cp0.tlb, i);
+    }
+
+    // pif ram
+    COPYARRAY(dev->pif.ram, curr, uint8_t, PIF_RAM_SIZE);
+
+    /* extra pif channels state
+     * HACK: Assume PIF was in channel processing mode (and not in CIC challenge mode)
+     * Try to parse pif ram to setup pif channels
+     */
+    setup_channels_format(&dev->pif);
+
+    /* Zilmar-Spec plugin expect a call with control_id = -1 when RAM processing is done */
+    if (input.controllerCommand) {
+        input.controllerCommand(-1, NULL);
+    }
+
+    // RDRAM
+    memset(dev->rdram.dram, 0, RDRAM_MAX_SIZE);
+    COPYARRAY(dev->rdram.dram, curr, uint32_t, SaveRDRAMSize/4);
+
+    // DMEM + IMEM
+    COPYARRAY(dev->sp.mem, curr, uint32_t, SP_MEM_SIZE/4);
+
+    // The following values should not matter because we don't have any AI interrupt
+    // dev->ai.fifo[1].delay = 0; dev->ai.fifo[1].length = 0;
+    // dev->ai.fifo[0].delay = 0; dev->ai.fifo[0].length = 0;
+
+    // The following is not available in PJ64 savestate. Keep the values as is.
+    // dev->dp.dps_regs[DPS_TBIST_REG] = 0; dev->dp.dps_regs[DPS_TEST_MODE_REG] = 0;
+    // dev->dp.dps_regs[DPS_BUFTEST_ADDR_REG] = 0; dev->dp.dps_regs[DPS_BUFTEST_DATA_REG] = 0; *r4300_llbit(&dev->r4300) = 0;
+
+    // No flashram info in pj64 savestate.
+    poweron_flashram(&dev->cart.flashram);
+
+    dev->r4300.cp0.interrupt_unsafe_state = 0;
+
+    /* extra fb state */
+    poweron_fb(&dev->dp.fb);
+
+    /* extra af-rtc state */
+    dev->cart.af_rtc.control = 0x200;
+    dev->cart.af_rtc.now = 0;
+    dev->cart.af_rtc.last_update_rtc = 0;
+
+    /* extra controllers state */
+    for(i = 0; i < GAME_CONTROLLERS_COUNT; ++i) {
+        /* skip controllers handled by the input plugin */
+        if (Controls[i].RawData)
+            continue;
+
+        dev->controllers[i].flavor->reset(&dev->controllers[i]);
+
+        if (ROM_SETTINGS.rumble && (Controls[i].Type == CONT_TYPE_STANDARD)) {
+            poweron_rumblepak(&dev->rumblepaks[i]);
+        }
+        if (ROM_SETTINGS.transferpak && (Controls[i].Type == CONT_TYPE_STANDARD)) {
+            poweron_transferpak(&dev->transferpaks[i]);
+        }
+    }
+
+    /* extra rdram state
+     * Best effort, copy values from RDRAM module 0 except for DEVICE_ID
+     * which is set in accordance with the IPL3 procedure with 2M modules.
+     */
+    for (i = 0; i < (SaveRDRAMSize / 0x200000); ++i) {
+        memcpy(dev->rdram.regs[i], dev->rdram.regs[0], RDRAM_REGS_COUNT*sizeof(dev->rdram.regs[0][0]));
+        dev->rdram.regs[i][RDRAM_DEVICE_ID_REG] = ri_address_to_id_field(ri_address(i * 0x200000), 0) << 2;
+    }
+
+    /* dd state */
+    if (dev->dd.rom_size > 0 && dev->dd.idisk != NULL) {
+        poweron_dd(&dev->dd);
+    }
+
+    savestates_load_set_pc(&dev->r4300, *r4300_cp0_last_addr(&dev->r4300.cp0), 1);
+
+    // assert(savestateData+savestateSize == curr)
+
+    free(savestateData);
+    return 1;
+}
+
+static int read_data_from_zip(void *zip, void *buffer, size_t length)
+{
+    int err = unzReadCurrentFile((unzFile)zip, buffer, (unsigned)length);
+    return (err >= 0) && ((size_t)err == length);
+}
+
+static int savestates_load_pj64_zip(struct device* dev, char *filepath)
+{
+    char szFileName[256], szExtraField[256], szComment[256];
+    unzFile zipstatefile = NULL;
+    unz_file_info fileinfo;
+    int ret = 0;
+
+    /* Open the .zip file. */
+    zipstatefile = unzOpen(filepath);
+    if (zipstatefile == NULL ||
+        unzGoToFirstFile(zipstatefile) != UNZ_OK ||
+        unzGetCurrentFileInfo(zipstatefile, &fileinfo, szFileName, 255, szExtraField, 255, szComment, 255) != UNZ_OK ||
+        unzOpenCurrentFile(zipstatefile) != UNZ_OK)
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Zip error. Could not open state file: %s", filepath);
+        goto clean_and_exit;
+    }
+
+    if (!savestates_load_pj64(dev, filepath, zipstatefile, read_data_from_zip))
+        goto clean_and_exit;
+
+    main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State loaded from: %s", namefrompath(filepath));
+    ret = 1;
+
+    clean_and_exit:
+        if (zipstatefile != NULL)
+            unzClose(zipstatefile);
+        return ret;
+}
+
+static int read_data_from_file(void *file, void *buffer, size_t length)
+{
+    return fread(buffer, 1, length, file) == length;
+}
+
+static int savestates_load_pj64_unc(struct device* dev, char *filepath)
+{
+    FILE *f;
+
+    /* Open the file. */
+    f = osal_file_open(filepath, "rb");
+    if (f == NULL)
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not open state file: %s", filepath);
+        return 0;
+    }
+
+    if (!savestates_load_pj64(dev, filepath, f, read_data_from_file))
+    {
+        fclose(f);
+        return 0;
+    }
+
+    main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State loaded from: %s", namefrompath(filepath));
+    fclose(f);
+    return 1;
+}
+
+static savestates_type savestates_detect_type(char *filepath)
+{
+    unsigned char magic[4];
+    FILE *f = osal_file_open(filepath, "rb");
+    if (f == NULL)
+    {
+        DebugMessage(M64MSG_STATUS, "Could not open state file %s\n", filepath);
+        return savestates_type_unknown;
+    }
+
+    if (fread(magic, 1, 4, f) != 4)
+    {
+        fclose(f);
+        DebugMessage(M64MSG_STATUS, "Could not read from state file %s\n", filepath);
+        return savestates_type_unknown;
+    }
+
+    fclose(f);
+
+    if (magic[0] == 0x1f && magic[1] == 0x8b) // GZIP header
+        return savestates_type_m64p;
+    else if (memcmp(magic, "PK\x03\x04", 4) == 0) // ZIP header
+        return savestates_type_pj64_zip;
+    else if (memcmp(magic, pj64_magic, 4) == 0) // PJ64 header
+        return savestates_type_pj64_unc;
+    else
+    {
+        DebugMessage(M64MSG_STATUS, "Unknown state file type %s\n", filepath);
+        return savestates_type_unknown;
+    }
+}
+
+int savestates_load(void)
+{
+    FILE *fPtr = NULL;
+    char *filepath = NULL;
+    int ret = 0;
+
+    /* Spectate keyframe: a rollback buffer was staged via savestates_set_job(load,
+     * savestates_type_rollback_buffer). Load it from memory here — at the same safe
+     * interrupt boundary the normal file load uses — and skip all file handling. */
+    if (type == savestates_type_rollback_buffer)
+    {
+        ret = savestates_run_pending_rollback_load();
+        DebugMessage(M64MSG_INFO, "RMGK-DEFER: rollback-buffer job loaded (ret=%d)", ret);
+        StateChanged(M64CORE_STATE_LOADCOMPLETE, ret);
+        savestates_clear_job();
+        return ret;
+    }
+
+    if (fname != NULL && strcmp(fname, "MEMORY") == 0)
+    {
+        type = savestates_type_m64p;
+        filepath = strdup(fname);
+    }
+    else if (fname == NULL) // For slots, autodetect the savestate type
+    {
+        // try M64P type first
+        type = savestates_type_m64p;
+        filepath = savestates_generate_path(type);
+        fPtr = osal_file_open(filepath, "rb"); // can I open this?
+        if (fPtr == NULL)
+        {
+            free(filepath);
+            // try PJ64 zipped type second
+            type = savestates_type_pj64_zip;
+            filepath = savestates_generate_path(type);
+            fPtr = osal_file_open(filepath, "rb"); // can I open this?
+            if (fPtr == NULL)
+            {
+                free(filepath);
+                // finally, try PJ64 uncompressed
+                type = savestates_type_pj64_unc;
+                filepath = savestates_generate_path(type);
+                fPtr = osal_file_open(filepath, "rb"); // can I open this?
+                if (fPtr == NULL)
+                {
+                    free(filepath);
+                    filepath = NULL;
+                    main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "No Mupen64Plus/PJ64 state file found for slot %i", slot);
+                    type = savestates_type_unknown;
+                }
+            }
+        }
+    }
+    else // filename of state file to load was set explicitly in 'fname'
+    {
+        // detect type if unknown
+        if (type == savestates_type_unknown)
+        {
+            type = savestates_detect_type(fname);
+        }
+        filepath = savestates_generate_path(type);
+        if (filepath != NULL)
+            fPtr = osal_file_open(filepath, "rb"); // can I open this?
+        if (fPtr == NULL)
+        {
+            if (filepath != NULL)
+                main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Failed to open savestate file %s", filepath);
+            if (filepath != NULL)
+                free(filepath);
+            filepath = NULL;
+        }
+    }
+    if (fPtr != NULL)
+        fclose(fPtr);
+
+    if (filepath != NULL)
+    {
+        struct device* dev = &g_dev;
+
+        switch (type)
+        {
+            case savestates_type_m64p: ret = savestates_load_m64p(dev, filepath); break;
+            case savestates_type_pj64_zip: ret = savestates_load_pj64_zip(dev, filepath); break;
+            case savestates_type_pj64_unc: ret = savestates_load_pj64_unc(dev, filepath); break;
+            default: ret = 0; break;
+        }
+        free(filepath);
+        filepath = NULL;
+    }
+
+    // deliver callback to indicate completion of state loading operation
+    StateChanged(M64CORE_STATE_LOADCOMPLETE, ret);
+
+    savestates_clear_job();
+
+    return ret;
+}
+
+static void savestates_save_m64p_work(struct work_struct *work)
+{
+    gzFile f;
+    int gzres;
+    struct savestate_work *save = container_of(work, struct savestate_work, work);
+
+    SDL_LockMutex(savestates_lock);
+
+    // Write the state to a GZIP file
+    f = osal_gzopen(save->filepath, "wb");
+
+    if (f==NULL)
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not open state file: %s", save->filepath);
+        free(save->data);
+        StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
+        SDL_UnlockMutex(savestates_lock);
+        return;
+    }
+
+    gzres = gzwrite(f, save->data, save->size);
+    if ((gzres < 0) || ((size_t)gzres != save->size))
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not write data to state file: %s", save->filepath);
+        gzclose(f);
+        free(save->data);
+        StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
+        SDL_UnlockMutex(savestates_lock);
+        return;
+    }
+
+    gzclose(f);
+    main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Saved state to: %s", namefrompath(save->filepath));
+    free(save->data);
+    free(save->filepath);
+    free(save);
+
+    SDL_UnlockMutex(savestates_lock);
+    StateChanged(M64CORE_STATE_SAVECOMPLETE, 1);
+}
+
+static int savestates_save_m64p(const struct device* dev, char *filepath)
+{
+    unsigned char outbuf[4];
+    int i;
+    int memory_save;
+    int rollback_buffer_save;
+    const uint8_t *rollback_sram_data = NULL;
+    uint64_t rollback_save_start = 0;
+    uint64_t rollback_save_fixed_end = 0;
+    uint64_t rollback_save_rdram_start = 0;
+    uint64_t rollback_save_rdram_end = 0;
+    uint64_t rollback_save_sp_pif_end = 0;
+    uint64_t rollback_save_tlb_start = 0;
+    uint64_t rollback_save_tlb_end = 0;
+    uint64_t rollback_save_cpu_end = 0;
+    uint64_t rollback_save_extra_end = 0;
+    uint64_t rollback_save_finalize_end = 0;
+    uint64_t rollback_save_end = 0;
+
+    char queue[1024];
+
+    struct savestate_work *save;
+    char *curr;
+    size_t allocation_size;
+
+    /* OK to cast away const qualifier */
+    const uint32_t* cp0_regs = r4300_cp0_regs((struct cp0*)&dev->r4300.cp0);
+
+    save = malloc(sizeof(*save));
+    if (!save) {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Insufficient memory to save state.");
+        StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
+        return 0;
+    }
+
+    save->filepath = strdup(filepath);
+    memory_save = strcmp(filepath, "MEMORY") == 0;
+    rollback_buffer_save = strcmp(filepath, "ROLLBACK") == 0;
+    if (rollback_buffer_save &&
+        dev->cart.sram.storage != NULL &&
+        dev->cart.sram.istorage != NULL &&
+        dev->cart.sram.istorage->data != NULL &&
+        dev->cart.sram.istorage->size != NULL &&
+        dev->cart.sram.istorage->size(dev->cart.sram.storage) >= SRAM_SIZE)
+    {
+        rollback_sram_data = dev->cart.sram.istorage->data(dev->cart.sram.storage);
+    }
+    if (rollback_buffer_save && rollback_verbose_stats)
+        rollback_save_start = SDL_GetPerformanceCounter();
+
+    if(autoinc_save_slot)
+        savestates_inc_slot();
+
+    memset(queue, 0, sizeof(queue));
+    save_eventqueue_infos(&dev->r4300.cp0, queue);
+
+    // Allocate memory for the save state data
+    save->size = 16788288 + sizeof(queue) + 4 + 4096;
+    if (rollback_buffer_save && !rollback_save_full)
+        save->size -= rollback_tlb_lut_size;
+    if (rollback_sram_data != NULL)
+        save->size += SRAM_SIZE;
+    if (rollback_buffer_save)
+        save->size += AI_DMA_FIFO_SIZE * sizeof(uint32_t);
+    allocation_size = save->size;
+    if (rollback_buffer_save)
+    {
+        allocation_size += rollback_state_header_size;
+        if (rollback_save_prealloc_data != NULL)
+        {
+            if (rollback_save_prealloc_capacity < (int)allocation_size)
+            {
+                free(save->filepath);
+                free(save);
+                main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Insufficient rollback state buffer.");
+                StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
+                return 0;
+            }
+            save->data = (char *)rollback_save_prealloc_data;
+        }
+        else
+        {
+            save->data = malloc(allocation_size);
+        }
+        curr = save->data + rollback_state_header_size;
+    }
+    else if (memory_save)
+    {
+        if (rollback_save_data[rollback_save_head] == NULL)
+        {
+            rollback_save_data[rollback_save_head] = malloc(save->size);
+        }
+        save->data = curr = rollback_save_data[rollback_save_head];
+    }
+    else
+    {
+        save->data = curr = malloc(save->size);
+    }
+    if (save->data == NULL)
+    {
+        free(save->filepath);
+        free(save);
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Insufficient memory to save state.");
+        StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
+        return 0;
+    }
+
+    if (!rollback_buffer_save || rollback_save_full)
+        memset(save->data, 0, allocation_size);
+
+    // Write the save state data to memory
+    PUTARRAY(savestate_magic, curr, unsigned char, 8);
+
+    outbuf[0] = (savestate_latest_version >> 24) & 0xff;
+    outbuf[1] = (savestate_latest_version >> 16) & 0xff;
+    outbuf[2] = (savestate_latest_version >>  8) & 0xff;
+    outbuf[3] = (savestate_latest_version >>  0) & 0xff;
+    PUTARRAY(outbuf, curr, unsigned char, 4);
+
+    PUTARRAY(ROM_SETTINGS.MD5, curr, char, 32);
+
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_CONFIG_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_DEVICE_ID_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_DELAY_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_MODE_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_REF_INTERVAL_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_REF_ROW_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_RAS_INTERVAL_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_MIN_INTERVAL_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_ADDR_SELECT_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_DEVICE_MANUF_REG]);
+
+    PUTDATA(curr, uint32_t, 0); // Padding from old implementation
+    PUTDATA(curr, uint32_t, dev->mi.regs[MI_INIT_MODE_REG]);
+    PUTDATA(curr, uint8_t,  dev->mi.regs[MI_INIT_MODE_REG] & 0x7F);
+    PUTDATA(curr, uint8_t, (dev->mi.regs[MI_INIT_MODE_REG] & 0x80) != 0);
+    PUTDATA(curr, uint8_t, (dev->mi.regs[MI_INIT_MODE_REG] & 0x100) != 0);
+    PUTDATA(curr, uint8_t, (dev->mi.regs[MI_INIT_MODE_REG] & 0x200) != 0);
+    PUTDATA(curr, uint32_t, dev->mi.regs[MI_VERSION_REG]);
+    PUTDATA(curr, uint32_t, dev->mi.regs[MI_INTR_REG]);
+    PUTDATA(curr, uint32_t, dev->mi.regs[MI_INTR_MASK_REG]);
+    PUTDATA(curr, uint32_t, 0); //Padding from old implementation
+    PUTDATA(curr, uint8_t, (dev->mi.regs[MI_INTR_MASK_REG] & 0x1) != 0);
+    PUTDATA(curr, uint8_t, (dev->mi.regs[MI_INTR_MASK_REG] & 0x2) != 0);
+    PUTDATA(curr, uint8_t, (dev->mi.regs[MI_INTR_MASK_REG] & 0x4) != 0);
+    PUTDATA(curr, uint8_t, (dev->mi.regs[MI_INTR_MASK_REG] & 0x8) != 0);
+    PUTDATA(curr, uint8_t, (dev->mi.regs[MI_INTR_MASK_REG] & 0x10) != 0);
+    PUTDATA(curr, uint8_t, (dev->mi.regs[MI_INTR_MASK_REG] & 0x20) != 0);
+    PUTDATA(curr, uint16_t, 0); // Padding from old implementation
+
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_DRAM_ADDR_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_CART_ADDR_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_RD_LEN_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_WR_LEN_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_STATUS_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_BSD_DOM1_LAT_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_BSD_DOM1_PWD_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_BSD_DOM1_PGS_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_BSD_DOM1_RLS_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_BSD_DOM2_LAT_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_BSD_DOM2_PWD_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_BSD_DOM2_PGS_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_BSD_DOM2_RLS_REG]);
+
+    PUTDATA(curr, uint32_t, dev->sp.regs[SP_MEM_ADDR_REG]);
+    PUTDATA(curr, uint32_t, dev->sp.regs[SP_DRAM_ADDR_REG]);
+    PUTDATA(curr, uint32_t, dev->sp.regs[SP_RD_LEN_REG]);
+    PUTDATA(curr, uint32_t, dev->sp.regs[SP_WR_LEN_REG]);
+    PUTDATA(curr, uint32_t, 0); /* Padding from old implementation */
+    PUTDATA(curr, uint32_t, dev->sp.regs[SP_STATUS_REG]);
+    PUTDATA(curr, uint8_t, (dev->sp.regs[SP_STATUS_REG] & 0x1) != 0);
+    PUTDATA(curr, uint8_t, (dev->sp.regs[SP_STATUS_REG] & 0x2) != 0);
+    PUTDATA(curr, uint8_t, (dev->sp.regs[SP_STATUS_REG] & 0x4) != 0);
+    PUTDATA(curr, uint8_t, (dev->sp.regs[SP_STATUS_REG] & 0x8) != 0);
+    PUTDATA(curr, uint8_t, (dev->sp.regs[SP_STATUS_REG] & 0x10) != 0);
+    PUTDATA(curr, uint8_t, (dev->sp.regs[SP_STATUS_REG] & 0x20) != 0);
+    PUTDATA(curr, uint8_t, (dev->sp.regs[SP_STATUS_REG] & 0x40) != 0);
+    PUTDATA(curr, uint8_t, (dev->sp.regs[SP_STATUS_REG] & 0x80) != 0);
+    PUTDATA(curr, uint8_t, (dev->sp.regs[SP_STATUS_REG] & 0x100) != 0);
+    PUTDATA(curr, uint8_t, (dev->sp.regs[SP_STATUS_REG] & 0x200) != 0);
+    PUTDATA(curr, uint8_t, (dev->sp.regs[SP_STATUS_REG] & 0x400) != 0);
+    PUTDATA(curr, uint8_t, (dev->sp.regs[SP_STATUS_REG] & 0x800) != 0);
+    PUTDATA(curr, uint8_t, (dev->sp.regs[SP_STATUS_REG] & 0x1000) != 0);
+    PUTDATA(curr, uint8_t, (dev->sp.regs[SP_STATUS_REG] & 0x2000) != 0);
+    PUTDATA(curr, uint8_t, (dev->sp.regs[SP_STATUS_REG] & 0x4000) != 0);
+    PUTDATA(curr, uint8_t, 0);
+    PUTDATA(curr, uint32_t, dev->sp.regs[SP_DMA_FULL_REG]);
+    PUTDATA(curr, uint32_t, dev->sp.regs[SP_DMA_BUSY_REG]);
+    PUTDATA(curr, uint32_t, dev->sp.regs[SP_SEMAPHORE_REG]);
+
+    PUTDATA(curr, uint32_t, dev->sp.regs2[SP_PC_REG]);
+    PUTDATA(curr, uint32_t, dev->sp.regs2[SP_IBIST_REG]);
+
+    PUTDATA(curr, uint32_t, dev->si.regs[SI_DRAM_ADDR_REG]);
+    PUTDATA(curr, uint32_t, dev->si.regs[SI_PIF_ADDR_RD64B_REG]);
+    PUTDATA(curr, uint32_t, dev->si.regs[SI_PIF_ADDR_WR64B_REG]);
+    PUTDATA(curr, uint32_t, dev->si.regs[SI_STATUS_REG]);
+
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_STATUS_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_ORIGIN_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_WIDTH_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_V_INTR_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_CURRENT_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_BURST_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_V_SYNC_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_H_SYNC_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_LEAP_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_H_START_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_V_START_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_V_BURST_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_X_SCALE_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_Y_SCALE_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.delay);
+
+    PUTDATA(curr, uint32_t, dev->ri.regs[RI_MODE_REG]);
+    PUTDATA(curr, uint32_t, dev->ri.regs[RI_CONFIG_REG]);
+    PUTDATA(curr, uint32_t, dev->ri.regs[RI_CURRENT_LOAD_REG]);
+    PUTDATA(curr, uint32_t, dev->ri.regs[RI_SELECT_REG]);
+    PUTDATA(curr, uint32_t, dev->ri.regs[RI_REFRESH_REG]);
+    PUTDATA(curr, uint32_t, dev->ri.regs[RI_LATENCY_REG]);
+    PUTDATA(curr, uint32_t, dev->ri.regs[RI_ERROR_REG]);
+    PUTDATA(curr, uint32_t, dev->ri.regs[RI_WERROR_REG]);
+
+    PUTDATA(curr, uint32_t, dev->ai.regs[AI_DRAM_ADDR_REG]);
+    PUTDATA(curr, uint32_t, dev->ai.regs[AI_LEN_REG]);
+    PUTDATA(curr, uint32_t, dev->ai.regs[AI_CONTROL_REG]);
+    PUTDATA(curr, uint32_t, dev->ai.regs[AI_STATUS_REG]);
+    PUTDATA(curr, uint32_t, dev->ai.regs[AI_DACRATE_REG]);
+    PUTDATA(curr, uint32_t, dev->ai.regs[AI_BITRATE_REG]);
+    PUTDATA(curr, uint32_t, dev->ai.fifo[1].duration);
+    PUTDATA(curr, uint32_t    , dev->ai.fifo[1].length);
+    PUTDATA(curr, uint32_t, dev->ai.fifo[0].duration);
+    PUTDATA(curr, uint32_t    , dev->ai.fifo[0].length);
+
+    PUTDATA(curr, uint32_t, dev->dp.dpc_regs[DPC_START_REG]);
+    PUTDATA(curr, uint32_t, dev->dp.dpc_regs[DPC_END_REG]);
+    PUTDATA(curr, uint32_t, dev->dp.dpc_regs[DPC_CURRENT_REG]);
+    PUTDATA(curr, uint32_t, 0); /* Padding from old implementation */
+    PUTDATA(curr, uint32_t, dev->dp.dpc_regs[DPC_STATUS_REG]);
+    PUTDATA(curr, uint8_t, (dev->dp.dpc_regs[DPC_STATUS_REG] & 0x1) != 0);
+    PUTDATA(curr, uint8_t, (dev->dp.dpc_regs[DPC_STATUS_REG] & 0x2) != 0);
+    PUTDATA(curr, uint8_t, (dev->dp.dpc_regs[DPC_STATUS_REG] & 0x4) != 0);
+    PUTDATA(curr, uint8_t, (dev->dp.dpc_regs[DPC_STATUS_REG] & 0x8) != 0);
+    PUTDATA(curr, uint8_t, (dev->dp.dpc_regs[DPC_STATUS_REG] & 0x10) != 0);
+    PUTDATA(curr, uint8_t, (dev->dp.dpc_regs[DPC_STATUS_REG] & 0x20) != 0);
+    PUTDATA(curr, uint8_t, (dev->dp.dpc_regs[DPC_STATUS_REG] & 0x40) != 0);
+    PUTDATA(curr, uint8_t, (dev->dp.dpc_regs[DPC_STATUS_REG] & 0x80) != 0);
+    PUTDATA(curr, uint8_t, (dev->dp.dpc_regs[DPC_STATUS_REG] & 0x100) != 0);
+    PUTDATA(curr, uint8_t, (dev->dp.dpc_regs[DPC_STATUS_REG] & 0x200) != 0);
+    PUTDATA(curr, uint8_t, (dev->dp.dpc_regs[DPC_STATUS_REG] & 0x400) != 0);
+    PUTDATA(curr, uint8_t, 0);
+    PUTDATA(curr, uint32_t, dev->dp.dpc_regs[DPC_CLOCK_REG]);
+    PUTDATA(curr, uint32_t, dev->dp.dpc_regs[DPC_BUFBUSY_REG]);
+    PUTDATA(curr, uint32_t, dev->dp.dpc_regs[DPC_PIPEBUSY_REG]);
+    PUTDATA(curr, uint32_t, dev->dp.dpc_regs[DPC_TMEM_REG]);
+
+    PUTDATA(curr, uint32_t, dev->dp.dps_regs[DPS_TBIST_REG]);
+    PUTDATA(curr, uint32_t, dev->dp.dps_regs[DPS_TEST_MODE_REG]);
+    PUTDATA(curr, uint32_t, dev->dp.dps_regs[DPS_BUFTEST_ADDR_REG]);
+    PUTDATA(curr, uint32_t, dev->dp.dps_regs[DPS_BUFTEST_DATA_REG]);
+
+    if (rollback_buffer_save && rollback_verbose_stats)
+    {
+        rollback_save_fixed_end = SDL_GetPerformanceCounter();
+        rollback_save_rdram_start = rollback_save_fixed_end;
+    }
+    PUTARRAY(dev->rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4);
+    if (rollback_buffer_save && rollback_verbose_stats)
+        rollback_save_rdram_end = SDL_GetPerformanceCounter();
+    PUTARRAY(dev->sp.mem, curr, uint32_t, SP_MEM_SIZE/4);
+    PUTARRAY(dev->pif.ram, curr, uint8_t, PIF_RAM_SIZE);
+    if (rollback_buffer_save && rollback_verbose_stats)
+        rollback_save_sp_pif_end = SDL_GetPerformanceCounter();
+
+    PUTDATA(curr, int32_t, dev->cart.use_flashram);
+    ZERODATA(curr, 4+8+4+4); // Here used to be flashram state
+
+    if (rollback_buffer_save && rollback_verbose_stats)
+        rollback_save_tlb_start = SDL_GetPerformanceCounter();
+    if (!rollback_buffer_save || rollback_save_full)
+    {
+        PUTARRAY(dev->r4300.cp0.tlb.LUT_r, curr, uint32_t, 0x100000);
+        PUTARRAY(dev->r4300.cp0.tlb.LUT_w, curr, uint32_t, 0x100000);
+    }
+    if (rollback_buffer_save && rollback_verbose_stats)
+        rollback_save_tlb_end = SDL_GetPerformanceCounter();
+
+    /* OK to cast away const qualifier */
+    PUTDATA(curr, uint32_t, *r4300_llbit((struct r4300_core*)&dev->r4300));
+    PUTARRAY(r4300_regs((struct r4300_core*)&dev->r4300), curr, int64_t, 32);
+    PUTARRAY(cp0_regs, curr, uint32_t, CP0_REGS_COUNT);
+    PUTDATA(curr, int64_t, *r4300_mult_lo((struct r4300_core*)&dev->r4300));
+    PUTDATA(curr, int64_t, *r4300_mult_hi((struct r4300_core*)&dev->r4300));
+
+    const cp1_reg *cp1_regs = r4300_cp1_regs((struct cp1*)&dev->r4300.cp1);
+    PUTARRAY(&cp1_regs->dword, curr, int64_t, 32);
+
+    PUTDATA(curr, uint32_t, *r4300_cp1_fcr0((struct cp1*)&dev->r4300.cp1));
+    PUTDATA(curr, uint32_t, *r4300_cp1_fcr31((struct cp1*)&dev->r4300.cp1));
+    for (i = 0; i < 32; i++)
+    {
+        PUTDATA(curr, int16_t, dev->r4300.cp0.tlb.entries[i].mask);
+        PUTDATA(curr, int16_t, 0);
+        PUTDATA(curr, uint32_t, dev->r4300.cp0.tlb.entries[i].vpn2);
+        PUTDATA(curr, char, dev->r4300.cp0.tlb.entries[i].g);
+        PUTDATA(curr, unsigned char, dev->r4300.cp0.tlb.entries[i].asid);
+        PUTDATA(curr, int16_t, 0);
+        PUTDATA(curr, uint32_t, dev->r4300.cp0.tlb.entries[i].pfn_even);
+        PUTDATA(curr, char, dev->r4300.cp0.tlb.entries[i].c_even);
+        PUTDATA(curr, char, dev->r4300.cp0.tlb.entries[i].d_even);
+        PUTDATA(curr, char, dev->r4300.cp0.tlb.entries[i].v_even);
+        PUTDATA(curr, char, 0);
+        PUTDATA(curr, uint32_t, dev->r4300.cp0.tlb.entries[i].pfn_odd);
+        PUTDATA(curr, char, dev->r4300.cp0.tlb.entries[i].c_odd);
+        PUTDATA(curr, char, dev->r4300.cp0.tlb.entries[i].d_odd);
+        PUTDATA(curr, char, dev->r4300.cp0.tlb.entries[i].v_odd);
+        PUTDATA(curr, char, dev->r4300.cp0.tlb.entries[i].r);
+
+        PUTDATA(curr, uint32_t, dev->r4300.cp0.tlb.entries[i].start_even);
+        PUTDATA(curr, uint32_t, dev->r4300.cp0.tlb.entries[i].end_even);
+        PUTDATA(curr, uint32_t, dev->r4300.cp0.tlb.entries[i].phys_even);
+        PUTDATA(curr, uint32_t, dev->r4300.cp0.tlb.entries[i].start_odd);
+        PUTDATA(curr, uint32_t, dev->r4300.cp0.tlb.entries[i].end_odd);
+        PUTDATA(curr, uint32_t, dev->r4300.cp0.tlb.entries[i].phys_odd);
+    }
+    PUTDATA(curr, uint32_t, *r4300_pc((struct r4300_core*)&dev->r4300));
+
+    PUTDATA(curr, uint32_t, *r4300_cp0_next_interrupt((struct cp0*)&dev->r4300.cp0));
+    PUTDATA(curr, uint32_t, 0); /* here there used to be next_vi */
+    PUTDATA(curr, uint32_t, dev->vi.field);
+    if (rollback_buffer_save && rollback_verbose_stats)
+        rollback_save_cpu_end = SDL_GetPerformanceCounter();
+
+    to_little_endian_buffer(queue, 4, sizeof(queue)/4);
+    PUTARRAY(queue, curr, char, sizeof(queue));
+
+#ifdef NEW_DYNAREC
+    PUTDATA(curr, uint32_t, using_tlb);
+#else
+    PUTDATA(curr, uint32_t, 0);
+#endif
+
+    PUTDATA(curr, uint32_t, dev->ai.last_read);
+    PUTDATA(curr, uint32_t, dev->ai.delayed_carry);
+
+    PUTDATA(curr, uint32_t, dev->cart.cart_rom.last_write);
+    PUTDATA(curr, uint32_t, 0); /* used to be cart_rom.rom_written */
+
+    PUTDATA(curr, uint32_t, 0); /* here there used to be rsp_task_locked */
+
+    PUTDATA(curr, uint16_t, dev->cart.af_rtc.control);
+    PUTDATA(curr, uint16_t, 0); /* padding to keep things aligned */
+    PUTDATA(curr, int64_t, dev->cart.af_rtc.now);
+    PUTDATA(curr, int64_t, dev->cart.af_rtc.last_update_rtc);
+
+    for (i = 0; i < GAME_CONTROLLERS_COUNT; ++i) {
+        PUTDATA(curr, uint8_t, dev->controllers[i].status);
+    }
+
+    for (i = 0; i < GAME_CONTROLLERS_COUNT; ++i) {
+        PUTDATA(curr, uint8_t, dev->rumblepaks[i].state);
+    }
+
+    for (i = 0; i < GAME_CONTROLLERS_COUNT; ++i) {
+        PUTDATA(curr, uint32_t, dev->transferpaks[i].enabled);
+        PUTDATA(curr, uint32_t, dev->transferpaks[i].bank);
+        PUTDATA(curr, uint32_t, dev->transferpaks[i].cart_enabled);
+        PUTDATA(curr, uint32_t, dev->transferpaks[i].reset_state);
+
+        if (dev->transferpaks[i].gb_cart == NULL) {
+            uint8_t gb_fingerprint[GB_CART_FINGERPRINT_SIZE];
+            memset(gb_fingerprint, 0, GB_CART_FINGERPRINT_SIZE);
+            PUTARRAY(gb_fingerprint, curr, uint8_t, GB_CART_FINGERPRINT_SIZE);
+        }
+        else {
+            uint8_t* rom = dev->transferpaks[i].gb_cart->irom_storage->data(dev->transferpaks[i].gb_cart->rom_storage);
+            PUTARRAY(rom + GB_CART_FINGERPRINT_OFFSET, curr, uint8_t, GB_CART_FINGERPRINT_SIZE);
+
+            PUTDATA(curr, uint32_t, dev->transferpaks[i].gb_cart->rom_bank);
+            PUTDATA(curr, uint32_t, dev->transferpaks[i].gb_cart->ram_bank);
+            PUTDATA(curr, uint32_t, dev->transferpaks[i].gb_cart->ram_enable);
+            PUTDATA(curr, uint32_t, dev->transferpaks[i].gb_cart->mbc1_mode);
+            PUTDATA(curr, uint32_t, dev->transferpaks[i].gb_cart->rtc.latch);
+            PUTDATA(curr, int64_t, dev->transferpaks[i].gb_cart->rtc.last_time);
+
+            PUTARRAY(dev->transferpaks[i].gb_cart->rtc.regs, curr, uint8_t, MBC3_RTC_REGS_COUNT);
+            PUTARRAY(dev->transferpaks[i].gb_cart->rtc.latched_regs, curr, uint8_t, MBC3_RTC_REGS_COUNT);
+
+            PUTARRAY(dev->transferpaks[i].gb_cart->cam.regs, curr, uint8_t, POCKET_CAM_REGS_COUNT);
+        }
+    }
+
+    for (i = 0; i < PIF_CHANNELS_COUNT; ++i) {
+       PUTDATA(curr, int8_t, (dev->pif.channels[i].tx == NULL)
+               ? (int8_t)-1
+               : (int8_t)(dev->pif.channels[i].tx - dev->pif.ram));
+    }
+
+    PUTDATA(curr, uint8_t, dev->si.dma_dir);
+
+    PUTDATA(curr, uint8_t, dev->dp.do_on_unfreeze);
+
+    PUTDATA(curr, uint32_t, dev->vi.count_per_scanline);
+
+    for (i = 1; i < RDRAM_MAX_MODULES_COUNT; ++i) {
+        PUTDATA(curr, uint32_t, dev->rdram.regs[i][RDRAM_CONFIG_REG]);
+        PUTDATA(curr, uint32_t, dev->rdram.regs[i][RDRAM_DEVICE_ID_REG]);
+        PUTDATA(curr, uint32_t, dev->rdram.regs[i][RDRAM_DELAY_REG]);
+        PUTDATA(curr, uint32_t, dev->rdram.regs[i][RDRAM_MODE_REG]);
+        PUTDATA(curr, uint32_t, dev->rdram.regs[i][RDRAM_REF_INTERVAL_REG]);
+        PUTDATA(curr, uint32_t, dev->rdram.regs[i][RDRAM_REF_ROW_REG]);
+        PUTDATA(curr, uint32_t, dev->rdram.regs[i][RDRAM_RAS_INTERVAL_REG]);
+        PUTDATA(curr, uint32_t, dev->rdram.regs[i][RDRAM_MIN_INTERVAL_REG]);
+        PUTDATA(curr, uint32_t, dev->rdram.regs[i][RDRAM_ADDR_SELECT_REG]);
+        PUTDATA(curr, uint32_t, dev->rdram.regs[i][RDRAM_DEVICE_MANUF_REG]);
+    }
+
+    uint32_t* disk_id = ((dev->dd.rom_size > 0) && dev->dd.idisk != NULL)
+        ? (uint32_t*)(dev->dd.idisk->data(dev->dd.disk) + DD_DISK_ID_OFFSET)
+        : NULL;
+
+    if (disk_id == NULL) {
+        PUTDATA(curr, uint32_t, 0);
+        ZERODATA(curr, (3+DD_ASIC_REGS_COUNT)*sizeof(uint32_t) + 0x100 + 0x40 + 2*sizeof(int64_t) + 2*sizeof(uint32_t));
+    }
+    else {
+        PUTDATA(curr, uint32_t, *disk_id);
+
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_DATA]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_MISC_REG]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_CMD_STATUS]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_CUR_TK]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_BM_STATUS_CTL]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_ERR_SECTOR]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_SEQ_STATUS_CTL]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_CUR_SECTOR]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_HARD_RESET]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_C1_S0]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_HOST_SECBYTE]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_C1_S2]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_SEC_BYTE]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_C1_S4]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_C1_S6]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_CUR_ADDR]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_ID_REG]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_TEST_REG]);
+        PUTDATA(curr, uint32_t, dev->dd.regs[DD_ASIC_TEST_PIN_SEL]);
+
+        PUTARRAY(dev->dd.ds_buf, curr, uint8_t, 0x100);
+        PUTARRAY(dev->dd.ms_ram, curr, uint8_t, 0x40);
+
+        PUTDATA(curr, int64_t, (int64_t)dev->dd.rtc.now);
+        PUTDATA(curr, int64_t, (int64_t)dev->dd.rtc.last_update_rtc);
+        PUTDATA(curr, uint32_t, dev->dd.bm_write);
+        PUTDATA(curr, uint32_t, dev->dd.bm_reset_held);
+        PUTDATA(curr, uint32_t, 0); /* was bm_track_block */
+        PUTDATA(curr, uint32_t, dev->dd.bm_zone);
+        PUTDATA(curr, uint32_t, 0); /* was bm_track_offset */
+    }
+
+#ifdef NEW_DYNAREC
+    PUTDATA(curr, uint32_t, stop_after_jal);
+#else
+    PUTDATA(curr, uint32_t, 0);
+#endif
+    PUTDATA(curr, uint32_t, dev->sp.fifo[0].dir);
+    PUTDATA(curr, uint32_t, dev->sp.fifo[0].length);
+    PUTDATA(curr, uint32_t, dev->sp.fifo[0].memaddr);
+    PUTDATA(curr, uint32_t, dev->sp.fifo[0].dramaddr);
+    PUTDATA(curr, uint32_t, dev->sp.fifo[1].dir);
+    PUTDATA(curr, uint32_t, dev->sp.fifo[1].length);
+    PUTDATA(curr, uint32_t, dev->sp.fifo[1].memaddr);
+    PUTDATA(curr, uint32_t, dev->sp.fifo[1].dramaddr);
+
+    /* extra flashram state (since 1.8) */
+    PUTARRAY(dev->cart.flashram.page_buf, curr, uint8_t, 128);
+    PUTARRAY(dev->cart.flashram.silicon_id, curr, uint32_t, 2);
+    PUTDATA(curr, uint32_t, dev->cart.flashram.status);
+    PUTDATA(curr, uint16_t, dev->cart.flashram.erase_page);
+    PUTDATA(curr, uint16_t, dev->cart.flashram.mode);
+
+    /* cp0 and cp2 latch (since 1.9) */
+    PUTDATA(curr, uint64_t, *r4300_cp0_latch((struct cp0*)&dev->r4300.cp0));
+    PUTDATA(curr, uint64_t, *r4300_cp2_latch((struct cp2*)&dev->r4300.cp2));
+
+    /* rsp state (since 2.0) */
+    PUTDATA(curr, uint32_t, dev->sp.rsp_status);
+    PUTDATA(curr, uint32_t, dev->sp.first_run);
+    PUTDATA(curr, uint32_t, dev->sp.rsp_wait);
+    if (rollback_buffer_save)
+    {
+        PUTDATA(curr, uint32_t, dev->ai.fifo[0].address);
+        PUTDATA(curr, uint32_t, dev->ai.fifo[1].address);
+    }
+    if (rollback_sram_data != NULL)
+    {
+        PUTARRAY(rollback_sram_data, curr, uint8_t, SRAM_SIZE);
+    }
+    if (rollback_buffer_save && rollback_verbose_stats)
+        rollback_save_extra_end = SDL_GetPerformanceCounter();
+
+    if (rollback_buffer_save)
+    {
+        int *rollback_header = (int *)save->data;
+        size_t rollback_buffer_len = save->size + (size_t)rollback_state_header_size;
+
+        rollback_header[0] = rollback_state_header_magic;
+        rollback_header[1] = rollback_state_header_size;
+        rollback_header[2] = savestate_latest_version;
+        rollback_header[3] = rollback_save_buffer_frame;
+        rollback_header[4] = rollback_save_full ? 0 : rollback_state_flag_omit_tlb_lut;
+        rollback_header[4] |= rollback_state_flag_has_ai_fifo_addresses;
+        if (rollback_sram_data != NULL)
+            rollback_header[4] |= rollback_state_flag_has_sram;
+        rollback_header[5] = 0;
+
+        if (rollback_save_buffer_checksum != NULL)
+            *rollback_save_buffer_checksum = 0;
+        if (rollback_save_buffer_len != NULL)
+            *rollback_save_buffer_len = (int)rollback_buffer_len;
+        if (rollback_save_buffer != NULL)
+            *rollback_save_buffer = (unsigned char *)save->data;
+        if (rollback_verbose_stats)
+            rollback_save_finalize_end = SDL_GetPerformanceCounter();
+
+        free(save->filepath);
+        free(save);
+        if (rollback_verbose_stats)
+            rollback_save_end = SDL_GetPerformanceCounter();
+        if (rollback_verbose_stats)
+        {
+            DebugMessage(M64MSG_INFO,
+                "Rollback save timing: total=%" PRIu64 "us fixed=%" PRIu64 "us rdram=%" PRIu64 "us sp_pif=%" PRIu64 "us tlb=%" PRIu64 "us cpu=%" PRIu64 "us extra=%" PRIu64 "us finalize=%" PRIu64 "us free=%" PRIu64 "us",
+                rollback_perf_us(rollback_save_start, rollback_save_end),
+                rollback_perf_us(rollback_save_start, rollback_save_fixed_end),
+                rollback_perf_us(rollback_save_rdram_start, rollback_save_rdram_end),
+                rollback_perf_us(rollback_save_rdram_end, rollback_save_sp_pif_end),
+                rollback_perf_us(rollback_save_tlb_start, rollback_save_tlb_end),
+                rollback_perf_us(rollback_save_tlb_end, rollback_save_cpu_end),
+                rollback_perf_us(rollback_save_cpu_end, rollback_save_extra_end),
+                rollback_perf_us(rollback_save_extra_end, rollback_save_finalize_end),
+                rollback_perf_us(rollback_save_finalize_end, rollback_save_end));
+        }
+        return 1;
+    }
+
+    if (memory_save)
+    {
+        SDL_LockMutex(savestates_lock);
+        rollback_save_size[rollback_save_head] = save->size;
+        rollback_save_head = (rollback_save_head + 1) % ROLLBACK_SAVE_STATES_COUNT;
+        if (rollback_save_count < ROLLBACK_SAVE_STATES_COUNT)
+            rollback_save_count++;
+        SDL_UnlockMutex(savestates_lock);
+
+        free(save->filepath);
+        free(save);
+        return 1;
+    }
+
+    init_work(&save->work, savestates_save_m64p_work);
+    queue_work(&save->work);
+
+    return 1;
+}
+
+static int savestates_save_pj64(const struct device* dev,
+                                char *filepath, void *handle,
+                                int (*write_func)(void *, const void *, size_t))
+{
+    unsigned int i;
+    unsigned int SaveRDRAMSize = RDRAM_MAX_SIZE;
+
+    size_t savestateSize;
+    unsigned char *savestateData, *curr;
+
+    const uint32_t* cp0_regs = r4300_cp0_regs((struct cp0*)&dev->r4300.cp0);
+
+    // Allocate memory for the save state data
+    savestateSize = 8 + SaveRDRAMSize + 0x2754;
+    savestateData = curr = (unsigned char *)malloc(savestateSize);
+    if (savestateData == NULL)
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Insufficient memory to save state.");
+        return 0;
+    }
+
+    // Write the save state data in memory
+    PUTARRAY(pj64_magic, curr, unsigned char, 4);
+    PUTDATA(curr, unsigned int, SaveRDRAMSize);
+    PUTARRAY(dev->cart.cart_rom.rom, curr, unsigned int, 0x40/4);
+    uint32_t* next_vi = get_event(&dev->r4300.cp0.q, VI_INT);
+    if (next_vi != NULL)
+        PUTDATA(curr, uint32_t, *next_vi - cp0_regs[CP0_COUNT_REG]); // vi_timer
+    else
+        PUTDATA(curr, uint32_t, 0 - cp0_regs[CP0_COUNT_REG]);
+    PUTDATA(curr, uint32_t, *r4300_pc((struct r4300_core*)&dev->r4300));
+    PUTARRAY(r4300_regs((struct r4300_core*)&dev->r4300), curr, int64_t, 32);
+    const cp1_reg* cp1_regs = r4300_cp1_regs((struct cp1*)&dev->r4300.cp1);
+    PUTARRAY(&cp1_regs->dword, curr, int64_t, 32);
+    PUTARRAY(cp0_regs, curr, uint32_t, CP0_REGS_COUNT);
+    PUTDATA(curr, uint32_t, *r4300_cp1_fcr0((struct cp1*)&dev->r4300.cp1));
+    for (i = 0; i < 30; i++)
+        PUTDATA(curr, int, 0); // FCR1-30 not implemented
+    PUTDATA(curr, uint32_t, *r4300_cp1_fcr31((struct cp1*)&dev->r4300.cp1));
+    PUTDATA(curr, int64_t, *r4300_mult_hi((struct r4300_core*)&dev->r4300));
+    PUTDATA(curr, int64_t, *r4300_mult_lo((struct r4300_core*)&dev->r4300));
+
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_CONFIG_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_DEVICE_ID_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_DELAY_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_MODE_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_REF_INTERVAL_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_REF_ROW_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_RAS_INTERVAL_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_MIN_INTERVAL_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_ADDR_SELECT_REG]);
+    PUTDATA(curr, uint32_t, dev->rdram.regs[0][RDRAM_DEVICE_MANUF_REG]);
+
+    PUTDATA(curr, uint32_t, dev->sp.regs[SP_MEM_ADDR_REG]);
+    PUTDATA(curr, uint32_t, dev->sp.regs[SP_DRAM_ADDR_REG]);
+    PUTDATA(curr, uint32_t, dev->sp.regs[SP_RD_LEN_REG]);
+    PUTDATA(curr, uint32_t, dev->sp.regs[SP_WR_LEN_REG]);
+    PUTDATA(curr, uint32_t, dev->sp.regs[SP_STATUS_REG]);
+    PUTDATA(curr, uint32_t, dev->sp.regs[SP_DMA_FULL_REG]);
+    PUTDATA(curr, uint32_t, dev->sp.regs[SP_DMA_BUSY_REG]);
+    PUTDATA(curr, uint32_t, dev->sp.regs[SP_SEMAPHORE_REG]);
+
+    PUTDATA(curr, uint32_t, dev->sp.regs2[SP_PC_REG]);
+    PUTDATA(curr, uint32_t, dev->sp.regs2[SP_IBIST_REG]);
+
+    PUTDATA(curr, uint32_t, dev->dp.dpc_regs[DPC_START_REG]);
+    PUTDATA(curr, uint32_t, dev->dp.dpc_regs[DPC_END_REG]);
+    PUTDATA(curr, uint32_t, dev->dp.dpc_regs[DPC_CURRENT_REG]);
+    PUTDATA(curr, uint32_t, dev->dp.dpc_regs[DPC_STATUS_REG]);
+    PUTDATA(curr, uint32_t, dev->dp.dpc_regs[DPC_CLOCK_REG]);
+    PUTDATA(curr, uint32_t, dev->dp.dpc_regs[DPC_BUFBUSY_REG]);
+    PUTDATA(curr, uint32_t, dev->dp.dpc_regs[DPC_PIPEBUSY_REG]);
+    PUTDATA(curr, uint32_t, dev->dp.dpc_regs[DPC_TMEM_REG]);
+    PUTDATA(curr, uint32_t, 0); // ?
+    PUTDATA(curr, uint32_t, 0); // ?
+
+    PUTDATA(curr, uint32_t, dev->mi.regs[MI_INIT_MODE_REG]); //TODO Secial handling in pj64
+    PUTDATA(curr, uint32_t, dev->mi.regs[MI_VERSION_REG]);
+    PUTDATA(curr, uint32_t, dev->mi.regs[MI_INTR_REG]);
+    PUTDATA(curr, uint32_t, dev->mi.regs[MI_INTR_MASK_REG]);
+
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_STATUS_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_ORIGIN_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_WIDTH_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_V_INTR_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_CURRENT_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_BURST_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_V_SYNC_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_H_SYNC_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_LEAP_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_H_START_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_V_START_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_V_BURST_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_X_SCALE_REG]);
+    PUTDATA(curr, uint32_t, dev->vi.regs[VI_Y_SCALE_REG]);
+
+    PUTDATA(curr, uint32_t, dev->ai.regs[AI_DRAM_ADDR_REG]);
+    PUTDATA(curr, uint32_t, dev->ai.regs[AI_LEN_REG]);
+    PUTDATA(curr, uint32_t, dev->ai.regs[AI_CONTROL_REG]);
+    PUTDATA(curr, uint32_t, dev->ai.regs[AI_STATUS_REG]);
+    PUTDATA(curr, uint32_t, dev->ai.regs[AI_DACRATE_REG]);
+    PUTDATA(curr, uint32_t, dev->ai.regs[AI_BITRATE_REG]);
+
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_DRAM_ADDR_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_CART_ADDR_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_RD_LEN_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_WR_LEN_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_STATUS_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_BSD_DOM1_LAT_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_BSD_DOM1_PWD_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_BSD_DOM1_PGS_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_BSD_DOM1_RLS_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_BSD_DOM2_LAT_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_BSD_DOM2_PWD_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_BSD_DOM2_PGS_REG]);
+    PUTDATA(curr, uint32_t, dev->pi.regs[PI_BSD_DOM2_RLS_REG]);
+
+    PUTDATA(curr, uint32_t, dev->ri.regs[RI_MODE_REG]);
+    PUTDATA(curr, uint32_t, dev->ri.regs[RI_CONFIG_REG]);
+    PUTDATA(curr, uint32_t, dev->ri.regs[RI_CURRENT_LOAD_REG]);
+    PUTDATA(curr, uint32_t, dev->ri.regs[RI_SELECT_REG]);
+    PUTDATA(curr, uint32_t, dev->ri.regs[RI_REFRESH_REG]);
+    PUTDATA(curr, uint32_t, dev->ri.regs[RI_LATENCY_REG]);
+    PUTDATA(curr, uint32_t, dev->ri.regs[RI_ERROR_REG]);
+    PUTDATA(curr, uint32_t, dev->ri.regs[RI_WERROR_REG]);
+
+    PUTDATA(curr, uint32_t, dev->si.regs[SI_DRAM_ADDR_REG]);
+    PUTDATA(curr, uint32_t, dev->si.regs[SI_PIF_ADDR_RD64B_REG]);
+    PUTDATA(curr, uint32_t, dev->si.regs[SI_PIF_ADDR_WR64B_REG]);
+    PUTDATA(curr, uint32_t, dev->si.regs[SI_STATUS_REG]);
+
+    for (i=0; i < 32;i++)
+    {
+        // From TLBR
+        unsigned int EntryDefined, MyPageMask, MyEntryHi, MyEntryLo0, MyEntryLo1;
+        EntryDefined = dev->r4300.cp0.tlb.entries[i].v_even || dev->r4300.cp0.tlb.entries[i].v_odd;
+        MyPageMask = dev->r4300.cp0.tlb.entries[i].mask << 13;
+        MyEntryHi = ((dev->r4300.cp0.tlb.entries[i].vpn2 << 13) | dev->r4300.cp0.tlb.entries[i].asid);
+        MyEntryLo0 = (dev->r4300.cp0.tlb.entries[i].pfn_even << 6) | (dev->r4300.cp0.tlb.entries[i].c_even << 3)
+         | (dev->r4300.cp0.tlb.entries[i].d_even << 2) | (dev->r4300.cp0.tlb.entries[i].v_even << 1)
+           | dev->r4300.cp0.tlb.entries[i].g;
+        MyEntryLo1 = (dev->r4300.cp0.tlb.entries[i].pfn_odd << 6) | (dev->r4300.cp0.tlb.entries[i].c_odd << 3)
+         | (dev->r4300.cp0.tlb.entries[i].d_odd << 2) | (dev->r4300.cp0.tlb.entries[i].v_odd << 1)
+           | dev->r4300.cp0.tlb.entries[i].g;
+
+        PUTDATA(curr, uint32_t, EntryDefined);
+        PUTDATA(curr, uint32_t, MyPageMask);
+        PUTDATA(curr, uint32_t, MyEntryHi);
+        PUTDATA(curr, uint32_t, MyEntryLo0);
+        PUTDATA(curr, uint32_t, MyEntryLo1);
+    }
+
+    PUTARRAY(dev->pif.ram, curr, uint8_t, PIF_RAM_SIZE);
+
+    PUTARRAY(dev->rdram.dram, curr, uint32_t, SaveRDRAMSize/4);
+    PUTARRAY(dev->sp.mem, curr, uint32_t, SP_MEM_SIZE/4);
+
+    // Write the save state data to the output
+    if (!write_func(handle, savestateData, savestateSize))
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Couldn't write data to Project64 state file %s.", filepath);
+        free(savestateData);
+        return 0;
+    }
+
+    // assert(savestateData+savestateSize == curr)
+    free(savestateData);
+    return 1;
+}
+
+static int write_data_to_zip(void *zip, const void *buffer, size_t length)
+{
+    return zipWriteInFileInZip((zipFile)zip, buffer, (unsigned)length) == ZIP_OK;
+}
+
+static int savestates_save_pj64_zip(const struct device* dev, char *filepath)
+{
+    int retval;
+    zipFile zipfile = NULL;
+
+    zipfile = zipOpen(filepath, APPEND_STATUS_CREATE);
+    if(zipfile == NULL)
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not create PJ64 state file: %s", filepath);
+        goto clean_and_exit;
+    }
+
+    retval = zipOpenNewFileInZip(zipfile, namefrompath(filepath), NULL, NULL, 0, NULL, 0, NULL, Z_DEFLATED, Z_DEFAULT_COMPRESSION);
+    if(retval != ZIP_OK)
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Zip error. Could not create state file: %s", filepath);
+        goto clean_and_exit;
+    }
+
+    if (!savestates_save_pj64(dev, filepath, zipfile, write_data_to_zip))
+        goto clean_and_exit;
+
+    main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Saved state to: %s", namefrompath(filepath));
+
+    clean_and_exit:
+        if (zipfile != NULL)
+        {
+            zipCloseFileInZip(zipfile); // This may fail, but we don't care
+            zipClose(zipfile, "");
+        }
+        StateChanged(M64CORE_STATE_SAVECOMPLETE, 1);
+        return 1;
+}
+
+static int write_data_to_file(void *file, const void *buffer, size_t length)
+{
+    return fwrite(buffer, 1, length, (FILE *)file) == length;
+}
+
+static int savestates_save_pj64_unc(const struct device* dev, char *filepath)
+{
+    FILE *f;
+
+    f = osal_file_open(filepath, "wb");
+    if (f == NULL)
+    {
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not create PJ64 state file: %s", filepath);
+        StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
+        return 0;
+    }
+
+    if (!savestates_save_pj64(dev, filepath, f, write_data_to_file))
+    {
+        fclose(f);
+        StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
+        return 0;
+    }
+
+    main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Saved state to: %s", namefrompath(filepath));
+    fclose(f);
+    StateChanged(M64CORE_STATE_SAVECOMPLETE, 1);
+    return 1;
+}
+
+int savestates_save(void)
+{
+    char *filepath;
+    int ret = 0;
+    const struct device* dev = &g_dev;
+
+    /* Can only save PJ64 savestates on VI / COMPARE interrupt.
+       Otherwise try again in a little while. */
+    if ((type == savestates_type_pj64_zip ||
+         type == savestates_type_pj64_unc) &&
+        get_next_event_type(&dev->r4300.cp0.q) > COMPARE_INT)
+        return 0;
+
+    if (fname != NULL && type == savestates_type_unknown)
+        type = savestates_type_m64p;
+    else if (fname == NULL) // Always save slots in M64P format
+        type = savestates_type_m64p;
+
+    filepath = savestates_generate_path(type);
+    if (filepath != NULL)
+    {
+        switch (type)
+        {
+            case savestates_type_m64p: ret = savestates_save_m64p(dev, filepath); break;
+            case savestates_type_pj64_zip: ret = savestates_save_pj64_zip(dev, filepath); break;
+            case savestates_type_pj64_unc: ret = savestates_save_pj64_unc(dev, filepath); break;
+            default: ret = 0; StateChanged(M64CORE_STATE_SAVECOMPLETE, ret); break;
+        }
+        free(filepath);
+    }
+    else
+    {
+        StateChanged(M64CORE_STATE_SAVECOMPLETE, ret);
+    }
+
+    savestates_clear_job();
+    return ret;
+}
+
+int savestates_save_rollback(void)
+{
+    const struct device* dev = &g_dev;
+
+    if (!rollback_save_pending)
+        return 0;
+
+    rollback_save_pending = 0;
+    return savestates_save_m64p(dev, "MEMORY");
+}
+
+int savestates_save_rollback_buffer(unsigned char **buffer, int *len, int *checksum, int frame)
+{
+    const struct device* dev = &g_dev;
+    int result;
+    unsigned char *prealloc_data;
+    int prealloc_capacity;
+
+    if (buffer == NULL || len == NULL)
+        return 0;
+
+    prealloc_data = *buffer;
+    prealloc_capacity = *len;
+    if (prealloc_data == NULL || prealloc_capacity <= 0)
+    {
+        *buffer = NULL;
+        *len = 0;
+        prealloc_data = NULL;
+        prealloc_capacity = 0;
+    }
+    if (checksum != NULL)
+        *checksum = 0;
+
+    rollback_save_buffer = buffer;
+    rollback_save_buffer_len = len;
+    rollback_save_buffer_checksum = checksum;
+    rollback_save_buffer_frame = frame;
+    rollback_save_prealloc_data = prealloc_data;
+    rollback_save_prealloc_capacity = prealloc_capacity;
+
+    result = savestates_save_m64p(dev, "ROLLBACK");
+
+    rollback_save_buffer = NULL;
+    rollback_save_buffer_len = NULL;
+    rollback_save_buffer_checksum = NULL;
+    rollback_save_buffer_frame = 0;
+    rollback_save_prealloc_data = NULL;
+    rollback_save_prealloc_capacity = 0;
+
+    return result;
+}
+
+/* Spectate keyframe: a FULL normal-format savestate into a caller buffer (same memory-buffer
+ * plumbing as savestates_save_rollback_buffer, but the rollback_save_full flag makes the save
+ * include the TLB LUT and zero the buffer, and clears the omit flag in the header). The host's
+ * per-frame rollback saves never set the flag, so their fast stripped path is unchanged. The
+ * resulting buffer carries the rollback header (so the existing buffer-load path reads it) but
+ * is otherwise a complete savestate a cold spectator can load. */
+int savestates_save_full_buffer(unsigned char **buffer, int *len, int *checksum, int frame)
+{
+    int result;
+    rollback_save_full = 1;
+    result = savestates_save_rollback_buffer(buffer, len, checksum, frame);
+    rollback_save_full = 0;
+    return result;
+}
+
+int savestates_load_rollback_buffer(unsigned char *buffer, int len)
+{
+    int result;
+
+    if (buffer == NULL || len <= 0)
+        return 0;
+
+    rollback_load_buffer = buffer;
+    rollback_load_buffer_size = (size_t)len;
+    main_rollback_capture_load_before_probe();
+    result = savestates_load_m64p(&g_dev, "ROLLBACK");
+    if (result)
+    {
+        main_rollback_capture_load_probe();
+        ++rollback_load_counter;
+    }
+    rollback_load_buffer = NULL;
+    rollback_load_buffer_size = 0;
+
+    return result;
+}
+
+void savestates_free_rollback_buffer(void *buffer)
+{
+    free(buffer);
+}
+
+void savestates_init(void)
+{
+    savestates_lock = SDL_CreateMutex();
+    if (!savestates_lock) {
+        DebugMessage(M64MSG_ERROR, "Could not create savestates list lock");
+        return;
+    }
+}
+
+void savestates_deinit(void)
+{
+    unsigned int i;
+    for (i = 0; i < ROLLBACK_SAVE_STATES_COUNT; i++)
+    {
+        free(rollback_save_data[i]);
+        rollback_save_data[i] = NULL;
+        rollback_save_size[i] = 0;
+    }
+    rollback_save_head = 0;
+    rollback_save_count = 0;
+    rollback_save_pending = 0;
+
+    SDL_DestroyMutex(savestates_lock);
+    savestates_clear_job();
+}

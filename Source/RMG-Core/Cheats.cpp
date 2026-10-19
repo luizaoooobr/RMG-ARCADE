@@ -1,0 +1,1391 @@
+/*
+ * Rosalie's Mupen GUI - https://github.com/Rosalie241/RMG
+ *  Copyright (C) 2020-2025 Rosalie Wanders <rosalie@mailbox.org>
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License version 3.
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+#define CORE_INTERNAL
+#include "CachedRomHeaderAndSettings.hpp"
+#include "Directories.hpp"
+#include "RomSettings.hpp"
+#include "RomHeader.hpp"
+#include "Settings.hpp"
+#include "Library.hpp"
+#include "Cheats.hpp"
+#include "Error.hpp"
+#include "Emulation.hpp"
+
+#include "m64p/Api.hpp"
+
+#include <filesystem>
+#include <algorithm>
+#include <fstream>
+#include <sstream>
+#include <format>
+#include <cstring>
+
+//
+// Local Structs
+//
+
+struct l_LoadedCheat
+{
+    CoreCheat cheat;
+    CoreCheatOption cheatOption;
+};
+
+//
+// Local Variables
+//
+
+static CoreCheatFile l_SharedCheatFile;
+static CoreCheatFile l_UserCheatFile;
+static std::vector<l_LoadedCheat> l_LoadedCheats;
+static std::vector<CoreCheat> l_NetplayCheats;
+
+static void append_u32(std::string& data, uint32_t value)
+{
+    for (int i = 0; i < 4; i++)
+    {
+        data.push_back(static_cast<char>((value >> (i * 8)) & 0xff));
+    }
+}
+
+static void append_i32(std::string& data, int32_t value)
+{
+    append_u32(data, static_cast<uint32_t>(value));
+}
+
+static void append_bool(std::string& data, bool value)
+{
+    data.push_back(value ? 1 : 0);
+}
+
+static void append_string(std::string& data, const std::string& value)
+{
+    append_u32(data, static_cast<uint32_t>(value.size()));
+    data.append(value);
+}
+
+static bool read_u32(const std::string& data, size_t& offset, uint32_t& value)
+{
+    if (offset + 4 > data.size())
+    {
+        return false;
+    }
+
+    value = 0;
+    for (int i = 0; i < 4; i++)
+    {
+        value |= static_cast<uint32_t>(static_cast<unsigned char>(data[offset++])) << (i * 8);
+    }
+    return true;
+}
+
+static bool read_i32(const std::string& data, size_t& offset, int32_t& value)
+{
+    uint32_t raw;
+    if (!read_u32(data, offset, raw))
+    {
+        return false;
+    }
+    value = static_cast<int32_t>(raw);
+    return true;
+}
+
+static bool read_bool(const std::string& data, size_t& offset, bool& value)
+{
+    if (offset + 1 > data.size())
+    {
+        return false;
+    }
+    value = data[offset++] != 0;
+    return true;
+}
+
+static bool read_string(const std::string& data, size_t& offset, std::string& value)
+{
+    uint32_t length;
+    if (!read_u32(data, offset, length) || offset + length > data.size())
+    {
+        return false;
+    }
+
+    value.assign(data.data() + offset, data.data() + offset + length);
+    offset += length;
+    return true;
+}
+
+//
+// Local Functions
+//
+
+static bool read_file_lines(const std::filesystem::path& file, std::vector<std::string>& lines)
+{
+    std::string error;
+    std::ifstream inputStream(file);
+    std::string line;
+
+    if (!inputStream.is_open())
+    {
+        error = "read_file_lines Failed:";
+        error += "failed to open \"";
+        error += file.string();
+        error += "\"";
+        CoreSetError(error);
+        return false;
+    }
+
+    // read file line by line
+    while (std::getline(inputStream, line))
+    {
+        // strip '\r' to support CRLF (for windows users)
+        if (line.ends_with("\r"))
+        {
+            line.erase((line.size() - 1), 1);
+        }
+        lines.push_back(line);
+    }
+
+    inputStream.close();
+    return true;
+}
+
+static std::filesystem::path get_cheat_file_name(const CoreRomHeader& romHeader, const CoreRomSettings& romSettings)
+{
+    std::filesystem::path cheatFileName;
+
+    // fallback to using MD5 as file name when CRC1 & CRC2 & CountryCode are 0
+    if (romHeader.CRC1 == 0 && romHeader.CRC2 == 0 && romHeader.CountryCode == 0)
+    {
+        // ensure MD5 is a valid length
+        if (romSettings.MD5.size() != 32)
+        { // if it's invalid, return an empty path
+            return std::filesystem::path();
+        }
+
+        cheatFileName = std::format("{}.cht", romSettings.MD5);
+    }
+    else
+    { // else use CRC1 & CRC2 & CountryCode
+        cheatFileName = std::format("{:08X}-{:08X}-{:02X}.cht", romHeader.CRC1, romHeader.CRC2, romHeader.CountryCode);
+    }
+
+    return cheatFileName;
+}
+
+static std::filesystem::path get_shared_cheat_file_path(const CoreRomHeader& romHeader, const CoreRomSettings& romSettings)
+{
+    std::filesystem::path cheatFilePath;
+
+    cheatFilePath = CoreGetSharedDataDirectory();
+    cheatFilePath += CORE_DIR_SEPERATOR_STR;
+    cheatFilePath += "Cheats";
+    cheatFilePath += CORE_DIR_SEPERATOR_STR;
+    cheatFilePath += get_cheat_file_name(romHeader, romSettings);
+
+   return cheatFilePath;
+}
+
+static std::filesystem::path get_user_cheat_file_path(const CoreRomHeader& romHeader, const CoreRomSettings& romSettings)
+{
+    std::filesystem::path oldCheatFilePath;
+    std::filesystem::path cheatFilePath;
+    std::error_code errorCode;
+
+    oldCheatFilePath = CoreGetUserDataDirectory();
+    oldCheatFilePath += CORE_DIR_SEPERATOR_STR;
+    oldCheatFilePath += "Cheats-User";
+    oldCheatFilePath += CORE_DIR_SEPERATOR_STR;
+    oldCheatFilePath += get_cheat_file_name(romHeader, romSettings);
+
+    cheatFilePath = CoreGetUserConfigDirectory();
+    cheatFilePath += CORE_DIR_SEPERATOR_STR;
+    cheatFilePath += "Cheats-User";
+    cheatFilePath += CORE_DIR_SEPERATOR_STR;
+    cheatFilePath += get_cheat_file_name(romHeader, romSettings);
+
+    // try to make the user cheats directory
+    // if it doesn't exist yet
+    if (!std::filesystem::is_directory(cheatFilePath.parent_path(), errorCode))
+    {
+        std::filesystem::create_directory(cheatFilePath.parent_path(), errorCode);
+    }
+
+    // keep compatability with <v0.4.1
+    if (std::filesystem::is_regular_file(oldCheatFilePath))
+    {
+        return oldCheatFilePath;
+    }
+
+    return cheatFilePath;
+}
+
+static std::vector<std::string> split_string(std::string str, char delim)
+{
+    std::vector<std::string> splitString;
+    std::stringstream stringStream(str);
+    std::string element;
+
+    while (std::getline(stringStream, element, delim))
+    {
+        splitString.push_back(element);
+    }
+
+    return splitString;
+}
+
+static std::string join_split_string(const std::vector<std::string>& splitStr, char seperator, int skip = 0)
+{
+    std::string joinedString;
+    std::string element;
+    int skippedElements = 0;
+    for (size_t i = 0; i < splitStr.size(); i++)
+    {
+        // allow for skipping elements
+        if (skippedElements++ < skip)
+        {
+            continue;
+        }
+
+        element = splitStr[i];
+
+        joinedString += element;
+        // when not at the last element,
+        // insert seperator
+        if (i != (splitStr.size() - 1))
+        {
+            joinedString += seperator;
+        }
+    }
+
+    return joinedString;
+}
+
+static bool parse_cheat(const std::vector<std::string>& lines, int startIndex, CoreCheat& cheat, int& endIndex)
+{
+    std::string error;
+    std::string line;
+    for (size_t i = startIndex; i < lines.size(); i++)
+    {
+        line = lines[i];
+
+        // Parse metadata
+        // $Cheat Name
+        // Author=Cheat Author
+        // Note=Cheat Note
+        if (line.starts_with("$"))
+        {
+            line.erase(0, 1);
+            cheat.Name = line;
+            continue;
+        }
+        else if (line.starts_with("Author="))
+        {
+            line.erase(0, 7);
+            cheat.Author = line;
+            continue;
+        }
+        else if (line.starts_with("Note="))
+        {
+            line.erase(0, 5);
+            cheat.Note = line;
+            continue;
+        }
+
+        // newline = new cheat
+        if (line.empty())
+        {
+            endIndex = i;
+            break;
+        }
+
+        const std::vector<std::string> splitLine = split_string(line, ' ');
+
+        // skip invalid lines
+        if (splitLine.size() < 2)
+        {
+            error = "parse_cheat Failed: ";
+            error += "invalid line: \"";
+            error += line;
+            error += "\"";
+            CoreSetError(error);
+            return false;
+        }
+
+        std::string address = splitLine[0];
+        std::string value   = splitLine[1];
+
+        if (splitLine.size() == 2 && address.size() == 8 && (value.size() == 4 || value.size() == 9))
+        { // cheat code
+            CoreCheatCode cheatCode;
+            cheatCode.Address = std::strtoll(address.c_str(), nullptr, 16);
+
+            // we don't support 'value:old value',
+            // so strip the old value
+            if (value.size() == 9)
+            {
+                if (value[4] == ':')
+                {
+                    value.erase(4, 5);
+                }
+                else
+                { // invalid line
+                    error = "parse_cheat Failed: ";
+                    error += "invalid line: \"";
+                    error += line;
+                    error += "\"";
+                    CoreSetError(error);
+                    return false;
+                }
+            }
+
+            if (value.find("?") != std::string::npos)
+            { // value uses options
+                cheatCode.UseOptions  = true;
+                cheatCode.OptionIndex = value.find('?');
+                cheatCode.OptionSize  = std::count(value.begin(), value.end(), '?');
+                std::replace(value.begin(), value.end(), '?', '0');
+                if (value.empty())
+                {
+                    cheatCode.Value = 0;
+                }
+                else
+                {
+                    cheatCode.Value = std::strtoll(value.c_str(), nullptr, 16);
+                }
+            }
+            else
+            { // value doesn't use options
+                cheatCode.UseOptions = false;
+                cheatCode.Value      = std::strtoll(value.c_str(), nullptr, 16);
+            }
+
+            // add code to cheat
+            cheat.CheatCodes.push_back(cheatCode);
+        }
+        else if (address.size() <= 4 && value.size() > 0)
+        { // cheat option
+            CoreCheatOption option;
+
+            option.Name  = join_split_string(splitLine, ' ', 1);
+            option.Value = std::strtoll(address.c_str(), nullptr, 16);
+            option.Size  = address.size();
+
+            // add option to cheat
+            cheat.HasOptions = true;
+            cheat.CheatOptions.push_back(option);
+        }
+        else
+        { // invalid line?
+            error = "parse_cheat Failed: ";
+            error += "invalid line: \"";
+            error += line;
+            error += "\"";
+            CoreSetError(error);
+            return false;
+        }
+
+        // eof = stop reading
+        if (i == (lines.size() - 1))
+        {
+            endIndex = i;
+            break;
+        }
+    }
+
+    return !cheat.Name.empty() && !cheat.CheatCodes.empty();
+}
+
+static bool parse_cheat_file(const std::vector<std::string>& lines, CoreCheatFile& cheatFile)
+{
+    int endIndex = -1;
+    std::string line;
+    std::string error;
+    bool readHeader = false;
+    bool readHeaderName = false;
+
+    for (size_t index = 0; index < lines.size(); index++)
+    {
+        line = lines[index];
+
+        if (!readHeader && line.starts_with("[") && line.ends_with("]"))
+        {
+            line.erase(0, 1);                 // strip '['
+            line.erase((line.size() - 1), 1); // strip ']'
+
+            if (line.size() == 32)
+            { // MD5
+                cheatFile.CRC1 = 0;
+                cheatFile.CRC2 = 0;
+                cheatFile.CountryCode = 0;
+                cheatFile.MD5 = line;
+            }
+            else
+            { // CRC1 & CRC2 & CountryCode
+                // validate header
+                if (line.size() != 22 || line[8] != '-' || line[17] != '-' || line[18] != 'C' || line[19] != ':')
+                {
+                    error = "parse_cheat_file Failed: ";
+                    error += "invalid header: \"";
+                    error += line;
+                    error += "\"";
+                    CoreSetError(error);
+                    return false;
+                }
+
+                const std::vector<std::string> splitCrcString = split_string(line, '-');
+                const std::string crc1 = splitCrcString[0];
+                const std::string crc2 = splitCrcString[1];
+                const std::string countryCode = split_string(line, ':')[1];
+
+                cheatFile.CRC1 = std::strtoll(crc1.c_str(), nullptr, 16);
+                cheatFile.CRC2 = std::strtoll(crc2.c_str(), nullptr, 16);
+                cheatFile.CountryCode = std::strtoll(countryCode.c_str(), nullptr, 16);
+            }
+            readHeader = true;
+        }
+        else if (readHeader && !readHeaderName && line.starts_with("Name="))
+        {
+            line.erase(0, 5);
+            cheatFile.Name = line;
+            readHeaderName = true;
+        }
+        else if (readHeader && readHeaderName && line.starts_with('$'))
+        {
+            CoreCheat cheat;
+            endIndex = 0;
+
+            if (!parse_cheat(lines, index, cheat, endIndex))
+            {
+                return false;
+            }
+
+            cheatFile.Cheats.push_back(cheat);
+            index = endIndex;
+        }
+        else if (!line.empty())
+        {
+            error = "parse_cheat_file Failed: ";
+            error += "unknown line: \"";
+            error += line;
+            error += "\"";
+            CoreSetError(error);
+            return false;
+        }
+    }
+
+    if (!readHeader)
+    {
+        error = "parse_cheat_file Failed: ";
+        error += "no header found!";
+        CoreSetError(error);
+        return false;
+    }
+
+    if (!readHeaderName)
+    {
+        error = "parse_cheat_file Failed: ";
+        error += "no header name found!";
+        CoreSetError(error);
+        return false;
+    }
+
+    return true;
+}
+
+static bool write_cheat_file(const CoreCheatFile& cheatFile, const std::filesystem::path& path)
+{
+    std::string lines;
+    std::ofstream outputStream(path);
+    std::string error;
+
+    if (!outputStream.is_open())
+    {
+        error = "write_cheat_file Failed: ";
+        error += "Failed to open \"";
+        error += path.string();
+        error += "\'";
+        CoreSetError(error);
+        return false;
+    }
+
+    // fallback to using MD5 when CRC1 & CRC2 & CountryCode are 0
+    if (cheatFile.CRC1 == 0 && cheatFile.CRC2 == 0 && cheatFile.CountryCode == 0)
+    {
+        lines += std::format("[{}]\n", cheatFile.MD5);
+    }
+    else
+    { // else use CRC1 & CRC2 & CountryCode
+        lines += std::format("[{:08X}-{:08X}-C:{:02X}]\n", cheatFile.CRC1, cheatFile.CRC2, cheatFile.CountryCode);
+    }
+
+    lines += std::format("Name={}\n\n", cheatFile.Name);
+
+    for (const CoreCheat& cheat : cheatFile.Cheats)
+    {
+        lines += std::format("${}\n", cheat.Name);
+
+        if (!cheat.Author.empty())
+        {
+            lines += std::format("Author={}\n", cheat.Author);
+        }
+
+        if (!cheat.Note.empty())
+        {
+            lines += std::format("Note={}\n", cheat.Note);
+        }
+
+        for (const CoreCheatCode& code : cheat.CheatCodes)
+        {
+            if (code.UseOptions)
+            {
+                std::string value = std::format("{:04X}", code.Value);
+
+                // insert question mark string
+                value.replace(code.OptionIndex, code.OptionSize, code.OptionSize, '?');
+
+                lines += std::format("{:04X} {}\n", code.Address, value);
+            }
+            else
+            {
+                lines += std::format("{:08X} {:04X}\n", code.Address, code.Value);
+            }
+        }
+
+        if (cheat.HasOptions)
+        {
+            for (const CoreCheatOption& option : cheat.CheatOptions)
+            {
+                lines += std::format("{:0{}X} {}\n", option.Value, option.Size, option.Name);
+            }
+        }
+
+        // extra newline
+        lines += "\n";
+    }
+
+    outputStream << lines;
+    outputStream.close();
+    return true;
+}
+
+bool combine_cheat_code_and_option(const CoreCheatCode& code, const CoreCheatOption& option, int32_t& combinedValue)
+{
+    std::string codeValueString;
+    std::string optionValueString;
+
+    // make sure the code needs an option
+    if (!code.UseOptions)
+    {
+        return false;
+    }
+
+    // make sure the size is the same
+    if (code.OptionSize != option.Size)
+    {
+        return false;
+    }
+
+    codeValueString   = std::format("{:04X}", code.Value);
+    optionValueString = std::format("{:0{}X}", option.Value, option.Size);
+
+    // insert option
+    codeValueString.replace(code.OptionIndex, code.OptionSize, optionValueString);
+
+    // convert to int32_t
+    combinedValue = std::strtoll(codeValueString.c_str(), nullptr, 16);
+    return true;
+}
+
+static std::vector<CoreCheat>::iterator find_user_cheat_using_name(std::string name)
+{
+    auto predicate = [name](const CoreCheat& other)
+    {
+        return name == other.Name;
+    };
+
+    return std::find_if(l_UserCheatFile.Cheats.begin(), l_UserCheatFile.Cheats.end(), predicate);
+}
+
+static bool get_romheader_and_romsettings(const std::filesystem::path& file, CoreRomHeader& romHeader, CoreRomSettings& romSettings)
+{
+    if (file.empty())
+    {
+        if (!CoreGetCurrentRomHeader(romHeader) ||
+            !CoreGetCurrentRomSettings(romSettings))
+        {
+            return false;
+        }
+    }
+    else
+    {
+        return CoreGetCachedRomHeaderAndSettings(file, nullptr, &romHeader, nullptr, &romSettings);
+    }
+
+    return true;
+}
+
+//
+// Exported Functions
+//
+
+CORE_EXPORT bool CoreGetCurrentCheats(std::filesystem::path file, std::vector<CoreCheat>& cheats)
+{
+    CoreRomHeader romHeader;
+    CoreRomSettings romSettings;
+    CoreCheatFile sharedCheatFile;
+    CoreCheatFile userCheatFile;
+    std::filesystem::path sharedCheatFilePath;
+    std::filesystem::path userCheatFilePath;
+    bool hasSharedCheatFile = false;
+    bool hasUserCheatFile   = false;
+    std::vector<std::string> sharedCheatFilelines;
+    std::vector<std::string> userCheatFileLines;
+
+    // Arcade (FBNeo) romsets carry no N64 header and have no N64 cheat files in
+    // this flow. Report "no cheats" instead of failing through CoreOpenRom, which
+    // rejects arcade archives and would otherwise abort netplay's pre-match
+    // cheat manifest sync.
+    if (!file.empty())
+    {
+        std::string fbneoShortName;
+        std::string fbneoFullName;
+        std::string fbneoRomId;
+        if (CoreGetFbneoRomInfo(file, fbneoShortName, fbneoFullName, fbneoRomId))
+        {
+            cheats.clear();
+            return true;
+        }
+    }
+
+    if (!get_romheader_and_romsettings(file, romHeader, romSettings))
+    {
+        return false;
+    }
+
+    sharedCheatFilePath = get_shared_cheat_file_path(romHeader, romSettings);
+    userCheatFilePath   = get_user_cheat_file_path(romHeader, romSettings);
+
+    // do nothing if neither the shared or user cheat file exists
+    hasSharedCheatFile = std::filesystem::is_regular_file(sharedCheatFilePath);
+    hasUserCheatFile   = std::filesystem::is_regular_file(userCheatFilePath);
+    if (!hasSharedCheatFile && !hasUserCheatFile)
+    {
+        return true;
+    }
+
+    // fail when we fail to the shared or user cheat file
+    if ((hasSharedCheatFile && !read_file_lines(sharedCheatFilePath, sharedCheatFilelines)) ||
+        (hasUserCheatFile   && !read_file_lines(userCheatFilePath, userCheatFileLines)))
+    {
+        return false;
+    }
+
+    // fail when we fail to parse the shared or user cheat file
+    if ((hasSharedCheatFile && !parse_cheat_file(sharedCheatFilelines, sharedCheatFile)) ||
+        (hasUserCheatFile   && !parse_cheat_file(userCheatFileLines, userCheatFile)))
+    {
+        return false;
+    }
+
+    l_SharedCheatFile = sharedCheatFile;
+    l_UserCheatFile   = userCheatFile;
+
+    // add shared & user cheats
+    // add user cheats first
+    for (const CoreCheat& cheat : userCheatFile.Cheats)
+    {
+        cheats.push_back(cheat);
+    }
+    // add shared cheats
+    // and check if any cheats with the same name
+    // already exist, if it does, then just skip them
+    for (const CoreCheat& cheat : sharedCheatFile.Cheats)
+    {
+        auto iter = find_user_cheat_using_name(cheat.Name);
+
+        // skip cheat with the same name
+        if (iter != l_UserCheatFile.Cheats.end())
+        {
+            continue;
+        }
+
+        cheats.push_back(cheat);
+    }
+
+    return true;
+}
+
+CORE_EXPORT bool CoreParseCheat(const std::vector<std::string>& lines, CoreCheat& cheat)
+{
+    int endIndex = 0;
+    return parse_cheat(lines, 0, cheat, endIndex);
+}
+
+CORE_EXPORT bool CoreGetCheatLines(CoreCheat cheat, std::vector<std::string>& codeLines, std::vector<std::string>& optionLines)
+{
+    for (const CoreCheatCode& code : cheat.CheatCodes)
+    {
+        if (code.UseOptions)
+        {
+            std::string value = std::format("{:04X}", code.Value);
+
+            // insert question mark string
+            value.replace(code.OptionIndex, code.OptionSize, code.OptionSize, '?');
+
+            codeLines.push_back(std::format("{:04X} {}", code.Address, value));
+        }
+        else
+        {
+            codeLines.push_back(std::format("{:08X} {:04X}", code.Address, code.Value));
+        }
+    }
+
+    if (cheat.HasOptions)
+    {
+        for (const CoreCheatOption& option : cheat.CheatOptions)
+        {
+            optionLines.push_back(std::format("{:0{}X} {}", option.Value, option.Size, option.Name));
+        }
+    }
+
+    return true;
+}
+
+CORE_EXPORT bool CoreAddCheat(std::filesystem::path file, CoreCheat cheat)
+{
+    std::string error;
+    CoreRomHeader romHeader;
+    CoreRomSettings romSettings;
+    std::filesystem::path cheatFilePath;
+
+    if (!get_romheader_and_romsettings(file, romHeader, romSettings))
+    {
+        return false;
+    }
+
+    cheatFilePath = get_user_cheat_file_path(romHeader, romSettings);
+
+    // try to find another cheat with the same name,
+    // if it exists, fail because we don't allow that
+    auto iter = find_user_cheat_using_name(cheat.Name);
+    if (iter != l_UserCheatFile.Cheats.end())
+    {
+        error = "CoreAddCheat Failed: ";
+        error += "cheat with name already exists!";
+        CoreSetError(error);
+        return false;
+    }
+
+    // copy info to cheat file
+    l_UserCheatFile.CRC1 = romHeader.CRC1;
+    l_UserCheatFile.CRC2 = romHeader.CRC2;
+    l_UserCheatFile.CountryCode = romHeader.CountryCode;
+    l_UserCheatFile.MD5  = romSettings.MD5;
+    l_UserCheatFile.Name = romSettings.GoodName;
+    l_UserCheatFile.Cheats.push_back(cheat);
+
+    return write_cheat_file(l_UserCheatFile, cheatFilePath);
+}
+
+CORE_EXPORT bool CoreUpdateCheat(std::filesystem::path file, CoreCheat oldCheat, CoreCheat newCheat)
+{
+    CoreRomHeader romHeader;
+    CoreRomSettings romSettings;
+    std::filesystem::path cheatFilePath;
+    CoreCheatOption cheatOption;
+
+    if (!get_romheader_and_romsettings(file, romHeader, romSettings))
+    {
+        return false;
+    }
+
+    cheatFilePath = get_user_cheat_file_path(romHeader, romSettings);
+
+    // copy over cheat settings when name has changed
+    if (oldCheat.Name != newCheat.Name)
+    {
+        CoreEnableCheat(file, newCheat, CoreIsCheatEnabled(file, oldCheat));
+
+        // only set option to new cheat when 
+        // retrieving from old one succeeds
+        if (CoreGetCheatOption(file, oldCheat, cheatOption))
+        {
+            CoreSetCheatOption(file, newCheat, cheatOption);
+        }
+
+        // reset old cheat settings
+        CoreEnableCheat(file, oldCheat, false);
+        CoreResetCheatOption(file, oldCheat);
+    }
+
+    // try to find old cheat in user cheats,
+    // when it isnt found, it's most likely a system cheat
+    auto iter = find_user_cheat_using_name(oldCheat.Name);
+    if (iter != l_UserCheatFile.Cheats.end())
+    { // when found, erase it
+        l_UserCheatFile.Cheats.erase(iter);
+    }
+
+    // copy info to cheat file & add cheat
+    l_UserCheatFile.CRC1 = romHeader.CRC1;
+    l_UserCheatFile.CRC2 = romHeader.CRC2;
+    l_UserCheatFile.CountryCode = romHeader.CountryCode;
+    l_UserCheatFile.MD5  = romSettings.MD5;
+    l_UserCheatFile.Name = romSettings.GoodName;
+    l_UserCheatFile.Cheats.push_back(newCheat);
+    return write_cheat_file(l_UserCheatFile, cheatFilePath);
+}
+
+CORE_EXPORT bool CoreCanRemoveCheat(CoreCheat cheat)
+{
+    return std::find(l_UserCheatFile.Cheats.begin(), l_UserCheatFile.Cheats.end(), cheat) != l_UserCheatFile.Cheats.end();
+}
+
+CORE_EXPORT bool CoreRemoveCheat(std::filesystem::path file, CoreCheat cheat)
+{
+    CoreRomHeader romHeader;
+    CoreRomSettings romSettings;
+    std::filesystem::path cheatFilePath;
+
+    if (!CoreCanRemoveCheat(cheat))
+    {
+        return false;
+    }
+
+    if (!get_romheader_and_romsettings(file, romHeader, romSettings))
+    {
+        return false;
+    }
+
+    cheatFilePath = get_user_cheat_file_path(romHeader, romSettings);
+
+    // try to find the cheat
+    auto iter = std::find(l_UserCheatFile.Cheats.begin(), l_UserCheatFile.Cheats.end(), cheat);
+    if (iter != l_UserCheatFile.Cheats.end())
+    { 
+        l_UserCheatFile.Cheats.erase(iter);
+    }
+
+    return write_cheat_file(l_UserCheatFile, cheatFilePath);
+}
+
+CORE_EXPORT bool CoreEnableCheat(std::filesystem::path file, CoreCheat cheat, bool enabled)
+{
+    CoreRomHeader   romHeader;
+    CoreRomSettings romSettings;
+    std::string settingSection;
+    std::string settingKey;
+
+    if (!get_romheader_and_romsettings(file, romHeader, romSettings))
+    {
+        return false;
+    }
+
+    settingSection = romSettings.MD5 + " Cheats";
+    settingKey = "Cheat \"" + cheat.Name + "\" Enabled";
+
+    // Always save explicit choices, including disabling a default-enabled cheat.
+    return CoreSettingsSetValue(settingSection, settingKey, enabled);
+}
+
+CORE_EXPORT bool CoreIsCheatEnabled(std::filesystem::path file, CoreCheat cheat)
+{
+    CoreRomHeader romHeader;
+    CoreRomSettings romSettings;
+    std::string settingSection;
+    std::string settingKey;
+
+    if (!get_romheader_and_romsettings(file, romHeader, romSettings))
+    {
+        return false;
+    }
+
+    settingSection = romSettings.MD5 + " Cheats";
+    settingKey = "Cheat \"" + cheat.Name + "\" Enabled";
+
+    // Default to the two unlock cheats bundled for Super Smash Bros. (U) and (J).
+    // Saved choices take precedence over these defaults.
+    const bool isSmashUS = romHeader.CRC1 == 0x916B8B5B &&
+                          romHeader.CRC2 == 0x780B85A4 &&
+                          romHeader.CountryCode == 0x45;
+    const bool isSmashJP = romHeader.CRC1 == 0x67D20729 &&
+                          romHeader.CRC2 == 0xF696774C &&
+                          romHeader.CountryCode == 0x4A;
+    const bool defaultEnabled = (isSmashUS || isSmashJP) &&
+                                (cheat.Name == "Have All Characters" ||
+                                 cheat.Name == "VS. Mode\\Have Mushroom Kindom");
+
+    return CoreSettingsGetBoolValue(settingSection, settingKey, defaultEnabled);
+}
+
+CORE_EXPORT bool CoreHasCheatOptionSet(std::filesystem::path file, CoreCheat cheat)
+{
+    CoreRomHeader romHeader;
+    CoreRomSettings romSettings;
+    std::string settingSection;
+    std::string settingKey;
+
+    if (!get_romheader_and_romsettings(file, romHeader, romSettings))
+    {
+        return false;
+    }
+
+    settingSection = romSettings.MD5 + " Cheats";
+    settingKey = "Cheat \"" + cheat.Name + "\" Option";
+
+    return CoreSettingsGetIntValue(settingSection, settingKey, -1) != -1;
+}
+
+CORE_EXPORT bool CoreSetCheatOption(std::filesystem::path file, CoreCheat cheat, CoreCheatOption option)
+{
+    CoreRomHeader romHeader;
+    CoreRomSettings romSettings;
+    std::string settingSection;
+    std::string settingKey;
+
+    if (!get_romheader_and_romsettings(file, romHeader, romSettings))
+    {
+        return false;
+    }
+
+    settingSection = romSettings.MD5 + " Cheats";
+    settingKey = "Cheat \"" + cheat.Name + "\" Option";
+
+    return CoreSettingsSetValue(settingSection, settingKey, static_cast<int>(option.Value));
+}
+
+CORE_EXPORT bool CoreGetCheatOption(std::filesystem::path file, CoreCheat cheat, CoreCheatOption& option)
+{
+    CoreRomHeader romHeader;
+    CoreRomSettings romSettings;
+    std::string settingSection;
+    std::string settingKey;
+    int value = 0;
+
+    if (!cheat.HasOptions)
+    {
+        return false;
+    }
+
+    if (!get_romheader_and_romsettings(file, romHeader, romSettings))
+    {
+        return false;
+    }
+
+    settingSection = romSettings.MD5 + " Cheats";
+    settingKey = "Cheat \"" + cheat.Name + "\" Option";
+
+    value = CoreSettingsGetIntValue(settingSection, settingKey, -1);
+    if (value == -1)
+    {
+        return false;
+    }
+
+    for (const CoreCheatOption& cheatOption : cheat.CheatOptions)
+    {
+        if (cheatOption.Value == (uint32_t)value)
+        {
+            option = cheatOption;
+            return true;
+        }
+    }
+
+    // when nothing was found, reset option
+    CoreSettingsSetValue(settingSection, settingKey, -1);
+    return false;
+}
+
+CORE_EXPORT bool CoreResetCheatOption(std::filesystem::path file, CoreCheat cheat)
+{
+    CoreRomHeader romHeader;
+    CoreRomSettings romSettings;
+    std::string settingSection;
+    std::string settingKey;
+
+    if (!cheat.HasOptions)
+    {
+        return false;
+    }
+
+    if (!get_romheader_and_romsettings(file, romHeader, romSettings))
+    {
+        return false;
+    }
+
+    settingSection = romSettings.MD5 + " Cheats";
+    settingKey = "Cheat \"" + cheat.Name + "\" Option";
+
+    CoreSettingsSetValue(settingSection, settingKey, -1);
+    return true;
+}
+
+CORE_EXPORT bool CoreApplyCheats(void)
+{
+    std::string error;
+    m64p_error ret;
+    std::vector<m64p_cheat_code> m64p_cheatCodes;
+    std::vector<CoreCheat> cheats;
+    CoreCheatOption cheatOption;
+    bool skipCheat = false;
+    int32_t combinedValue;
+
+    if (!m64p::Core.IsHooked())
+    {
+        return false;
+    }
+
+    // fail when parsing cheats fails
+    if (!CoreGetCurrentCheats("", cheats))
+    {
+        return false;
+    }
+
+    // fail when clearing cheats fails
+    if (!CoreClearCheats())
+    {
+        return false;
+    }
+
+    for (const CoreCheat& cheat : cheats)
+    {
+        m64p_cheatCodes.clear();
+        skipCheat = false;
+
+        if (!CoreIsCheatEnabled("", cheat))
+        {
+            continue;
+        }
+
+        for (const CoreCheatCode& code : cheat.CheatCodes)
+        {
+            if (code.UseOptions)
+            {
+                // make sure an option has been set
+                if (!CoreHasCheatOptionSet("", cheat))
+                {
+                    skipCheat = true;
+                    break;
+                }
+
+                // make sure retrieving it succeeds
+                if (!CoreGetCheatOption("", cheat, cheatOption))
+                {
+                    skipCheat = true;
+                    break;
+                }
+
+                // make sure combining the cheat code & option succeeds
+                if (!combine_cheat_code_and_option(code, cheatOption, combinedValue))
+                {
+                    skipCheat = true;
+                    break;
+                }
+
+                m64p_cheatCodes.push_back({code.Address, combinedValue});
+            }
+            else
+            {
+                m64p_cheatCodes.push_back({code.Address, code.Value});
+            }
+        }
+
+        if (skipCheat)
+        {
+            continue;
+        }
+
+        ret = m64p::Core.AddCheat(cheat.Name.c_str(), m64p_cheatCodes.data(), m64p_cheatCodes.size());
+        if (ret != M64ERR_SUCCESS)
+        {
+            error = "CoreApplyCheats m64p::Core.AddCheat(";
+            error += cheat.Name.c_str();
+            error += ") Failed:";
+            error += m64p::Core.ErrorMessage(ret);
+            CoreSetError(error);
+            return false;
+        }
+
+        // add cheat to loaded cheats
+        l_LoadedCheats.push_back({cheat, cheatOption});
+    }
+
+    return true;
+}
+
+CORE_EXPORT bool CoreClearCheats(void)
+{
+    std::string error;
+    m64p_error ret;
+
+    if (!m64p::Core.IsHooked())
+    {
+        return false;
+    }
+
+    for (const l_LoadedCheat& loadedCheat : l_LoadedCheats)
+    {
+        ret = m64p::Core.CheatEnabled(loadedCheat.cheat.Name.c_str(), 0);
+        if (ret != M64ERR_SUCCESS)
+        {
+            error = "CoreClearCheats m64p::Core.CheatEnabled(";
+            error += loadedCheat.cheat.Name.c_str();
+            error += ") Failed:";
+            error += m64p::Core.ErrorMessage(ret);
+            CoreSetError(error);
+            return false;
+        }
+    }
+
+    l_SharedCheatFile = {};
+    l_UserCheatFile = {};
+    l_LoadedCheats.clear();
+    l_NetplayCheats.clear();
+    return true;
+}
+
+CORE_EXPORT bool CoreSetNetplayCheats(const std::vector<CoreCheat>& cheats)
+{
+    l_NetplayCheats = cheats;
+    return true;
+}
+
+CORE_EXPORT bool CoreGetEnabledNetplayCheats(std::filesystem::path file, std::vector<CoreCheat>& enabledCheats)
+{
+    std::vector<CoreCheat> cheats;
+    CoreCheatOption cheatOption;
+
+    enabledCheats.clear();
+    if (!CoreGetCurrentCheats(file, cheats))
+    {
+        return false;
+    }
+
+    for (CoreCheat cheat : cheats)
+    {
+        if (!CoreIsCheatEnabled(file, cheat))
+        {
+            continue;
+        }
+
+        if (cheat.HasOptions)
+        {
+            if (!CoreGetCheatOption(file, cheat, cheatOption))
+            {
+                continue;
+            }
+            cheat.CheatOptions.clear();
+            cheat.CheatOptions.push_back(cheatOption);
+        }
+
+        enabledCheats.push_back(cheat);
+    }
+
+    return true;
+}
+
+CORE_EXPORT bool CoreSerializeNetplayCheats(const std::vector<CoreCheat>& cheats, std::string& data)
+{
+    data.clear();
+    data.append("RMGKCHT1", 8);
+    append_u32(data, static_cast<uint32_t>(cheats.size()));
+
+    for (const CoreCheat& cheat : cheats)
+    {
+        append_string(data, cheat.Name);
+        append_string(data, cheat.Author);
+        append_string(data, cheat.Note);
+        append_bool(data, cheat.HasOptions);
+        append_u32(data, static_cast<uint32_t>(cheat.CheatOptions.size()));
+        for (const CoreCheatOption& option : cheat.CheatOptions)
+        {
+            append_string(data, option.Name);
+            append_u32(data, option.Value);
+            append_i32(data, option.Size);
+        }
+        append_u32(data, static_cast<uint32_t>(cheat.CheatCodes.size()));
+        for (const CoreCheatCode& code : cheat.CheatCodes)
+        {
+            append_u32(data, code.Address);
+            append_i32(data, code.Value);
+            append_bool(data, code.UseOptions);
+            append_i32(data, code.OptionIndex);
+            append_i32(data, code.OptionSize);
+        }
+    }
+
+    return true;
+}
+
+CORE_EXPORT bool CoreDeserializeNetplayCheats(const std::string& data, std::vector<CoreCheat>& cheats)
+{
+    size_t offset = 8;
+    uint32_t cheatCount;
+
+    cheats.clear();
+    if (data.size() < 8 || std::memcmp(data.data(), "RMGKCHT1", 8) != 0 || !read_u32(data, offset, cheatCount))
+    {
+        CoreSetError("CoreDeserializeNetplayCheats: invalid cheat manifest");
+        return false;
+    }
+
+    for (uint32_t i = 0; i < cheatCount; i++)
+    {
+        CoreCheat cheat;
+        uint32_t optionCount;
+        uint32_t codeCount;
+
+        if (!read_string(data, offset, cheat.Name) ||
+            !read_string(data, offset, cheat.Author) ||
+            !read_string(data, offset, cheat.Note) ||
+            !read_bool(data, offset, cheat.HasOptions) ||
+            !read_u32(data, offset, optionCount))
+        {
+            CoreSetError("CoreDeserializeNetplayCheats: truncated cheat manifest");
+            return false;
+        }
+
+        for (uint32_t j = 0; j < optionCount; j++)
+        {
+            CoreCheatOption option;
+            if (!read_string(data, offset, option.Name) ||
+                !read_u32(data, offset, option.Value) ||
+                !read_i32(data, offset, option.Size))
+            {
+                CoreSetError("CoreDeserializeNetplayCheats: truncated cheat option");
+                return false;
+            }
+            cheat.CheatOptions.push_back(option);
+        }
+
+        if (!read_u32(data, offset, codeCount))
+        {
+            CoreSetError("CoreDeserializeNetplayCheats: truncated cheat code count");
+            return false;
+        }
+
+        for (uint32_t j = 0; j < codeCount; j++)
+        {
+            CoreCheatCode code;
+            if (!read_u32(data, offset, code.Address) ||
+                !read_i32(data, offset, code.Value) ||
+                !read_bool(data, offset, code.UseOptions) ||
+                !read_i32(data, offset, code.OptionIndex) ||
+                !read_i32(data, offset, code.OptionSize))
+            {
+                CoreSetError("CoreDeserializeNetplayCheats: truncated cheat code");
+                return false;
+            }
+            cheat.CheatCodes.push_back(code);
+        }
+
+        cheats.push_back(cheat);
+    }
+
+    if (offset != data.size())
+    {
+        CoreSetError("CoreDeserializeNetplayCheats: trailing cheat manifest data");
+        return false;
+    }
+
+    return true;
+}
+
+CORE_EXPORT bool CoreApplyNetplayCheats(void)
+{
+    std::string error;
+    m64p_error ret;
+    std::vector<m64p_cheat_code> m64p_cheatCodes;
+    std::vector<CoreCheat> cheats;
+    CoreCheatOption cheatOption;
+    bool skipCheat = false;
+    int32_t combinedValue;
+
+    if (!m64p::Core.IsHooked())
+    {
+        return false;
+    }
+
+    for (const CoreCheat& cheat : l_NetplayCheats)
+    {
+        m64p_cheatCodes.clear();
+        skipCheat = false;
+
+        for (const CoreCheatCode& code : cheat.CheatCodes)
+        {
+            if (code.UseOptions)
+            {
+                // make sure an option has been set and is valid
+                if (cheat.CheatOptions.size() != 1)
+                {
+                    skipCheat = true;
+                    break;
+                }
+
+                // make sure retrieving it succeeds
+                cheatOption = cheat.CheatOptions[0];
+
+                // make sure combining the cheat code & option succeeds
+                if (!combine_cheat_code_and_option(code, cheatOption, combinedValue))
+                {
+                    skipCheat = true;
+                    break;
+                }
+
+                m64p_cheatCodes.push_back({code.Address, combinedValue});
+            }
+            else
+            {
+                m64p_cheatCodes.push_back({code.Address, code.Value});
+            }
+        }
+
+        if (skipCheat)
+        {
+            continue;
+        }
+
+        ret = m64p::Core.AddCheat(cheat.Name.c_str(), m64p_cheatCodes.data(), m64p_cheatCodes.size());
+        if (ret != M64ERR_SUCCESS)
+        {
+            error = "CoreApplyNetplayCheats m64p::Core.AddCheat(";
+            error += cheat.Name.c_str();
+            error += ") Failed:";
+            error += m64p::Core.ErrorMessage(ret);
+            CoreSetError(error);
+            return false;
+        }
+
+        // add cheat to loaded cheats
+        l_LoadedCheats.push_back({cheat, cheatOption});
+    }
+
+    return true;
+}
+
+CORE_EXPORT bool CorePressGamesharkButton(bool enabled)
+{
+    std::string error;
+    m64p_error ret;
+    int tmpValue = enabled ? 1 : 0;
+
+    if (!m64p::Core.IsHooked())
+    {
+        return false;
+    }
+
+    ret = m64p::Core.DoCommand(M64CMD_CORE_STATE_SET, M64CORE_INPUT_GAMESHARK, &tmpValue);
+    if (ret != M64ERR_SUCCESS)
+    {
+        error = "CorePressGamesharkButton m64p::Core.DoCommand(M64CMD_CORE_STATE_SET) Failed: ";
+        error += m64p::Core.ErrorMessage(ret);
+        CoreSetError(error);
+        return false;
+    }
+
+    return true;
+}
