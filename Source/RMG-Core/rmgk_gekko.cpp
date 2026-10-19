@@ -25,6 +25,7 @@
 
 #include "Directories.hpp"
 #include "Error.hpp"
+#include "Kaillera.hpp"
 #include "Library.hpp"
 #include "Settings.hpp"
 #ifdef NETPLAY
@@ -1485,7 +1486,24 @@ bool submit_local_input()
     const bool localOnlySession = g_GekkoRemoteHandle < 0 && g_GekkoLocalHandles.size() > 1;
     const int samplePlayers = localOnlySession ? g_GekkoPlayers : 1;
     std::vector<uint32_t> physicalInputs(static_cast<size_t>(std::max(samplePlayers, 1)), 0);
-    if (!CoreRollbackSampleInput(physicalInputs.data(), g_GekkoInputSize, samplePlayers))
+
+    // Replay/spectate: every seat's input comes from the .krec through n02's
+    // playback module (the same call the N64 PIF sync path uses). Physical
+    // devices must not be sampled here, otherwise the viewer's own controls
+    // would override the recorded match.
+    if (CoreIsKailleraPlaybackMode())
+    {
+        std::vector<uint32_t> playbackInputs(
+            static_cast<size_t>(std::max(g_GekkoPlayers, 4)), 0);
+        if (CoreModifyKailleraPlayValues(playbackInputs.data(), sizeof(uint32_t)) >= 0)
+        {
+            for (int i = 0; i < samplePlayers; i++)
+            {
+                physicalInputs[static_cast<size_t>(i)] = playbackInputs[static_cast<size_t>(i)];
+            }
+        }
+    }
+    else if (!CoreRollbackSampleInput(physicalInputs.data(), g_GekkoInputSize, samplePlayers))
     {
         write_gekko_log("add_local_input sample=fail");
         return false;
