@@ -2,7 +2,7 @@
 
 Rosalie's Mupen GUI is a free and open-source mupen64plus front-end written in C++.
 
-This fork is focused around netplay with the Kaillera protocol, supporting both traditional Kaillera servers and direct peer-to-peer connections. Available on Windows and Linux.
+This fork is focused around netplay with the Kaillera protocol, supporting both traditional Kaillera servers and direct peer-to-peer connections, and adds an embedded **FBNeo arcade core** so arcade sets can be played alongside N64 games. Available on Windows and Linux.
 
 
 
@@ -77,6 +77,32 @@ RMG-Input uses independent per-axis scaling similar to the Ownasaurus [USBtoN64v
 - Per-axis deadzone handling instead of circular deadzone
 
 <img width="919" height="793" alt="image" src="https://github.com/user-attachments/assets/6192636d-4bcb-4104-b08a-696dcb416e7d" />
+
+
+## Arcade (FBNeo)
+
+RMG-K embeds a headless [FBNeo](https://github.com/finalburnneo/FBNeo) core, so arcade sets run alongside your N64 games. Arcade ROM sets (zipped) appear in the ROM browser like any other game and launch through the FBNeo core, while `.n64`/`.z64`/`.v64` files still run on mupen64plus.
+
+### Game list
+- A **Type** filter in the game list (`Load Game`) separates `Cartridges` from `Arcade sets`.
+- The ROM browser shows the game format (`Cartridge` / `Arcade`) and info such as region and file.
+
+### Remapping arcade controls
+`Input -> Arcade -> Map Game Inputs...` opens the arcade input dialog:
+
+- **Per-game and Global bindings**: bindings are stored per driver, and a `Global` profile is shared by every game. A driver-specific binding overrides the global one.
+- **Pick a game**: when no arcade game is running, choose the driver from the `Game:` dropdown to map it ahead of time.
+- **Up to 4 players**, each on its own `Player N` tab, with a `Device` selector (`Automatic`, `Keyboard`, or a connected controller).
+- Select a row, press **Set**, then press the key/button to bind it. **Clear** removes the binding.
+
+#### Combo macros
+Macro inputs are listed next to the normal buttons, so a single key/button can trigger a whole combination:
+
+- **Capcom (Punch + Kick)**: `3x Punch`, `3x Kick`, `Weak PK`, `Medium PK`, `Strong PK`, `SP + WK`
+- **NeoGeo (Buttons A-D)**: `AB`, `AC`, `AD`, `BC`, `BD`, `CD`, `ABC`, `ABD`, `ACD`, `BCD`, `ABCD`
+
+### DIP switches
+`Input -> Arcade -> Set DIP Switches...` lists a driver's DIP switch groups (region, free play, difficulty, ...); select a group and change its setting. **Defaults** restores the factory settings. DIP switches are read-only during a synchronized netplay session.
 
 
 ## Building
