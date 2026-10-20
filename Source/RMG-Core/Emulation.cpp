@@ -1156,10 +1156,24 @@ bool CoreStartEmulation(std::filesystem::path n64rom, std::filesystem::path n64d
     const int fbneoArchiveCount = static_cast<int>(fbneoArchives.size());
     const char* const* fbneoArchivePtrs = fbneoArchives.empty() ? nullptr : fbneoArchives.data();
 
+    const bool fbneoNetgameMode = fbneoTarget && (netplay || localRollbackEnabled);
     CoreAddCallbackMessage(CoreDebugMessageType::Info,
         std::string("CoreStartEmulation: fbneoTarget=") + (fbneoTarget ? "yes" : "no") +
+        " netgame=" + (fbneoNetgameMode ? "yes" : "no") +
         " rom=" + n64rom.filename().string() +
         (fbneoTarget ? (" driver=" + fbneoGame + " archives=" + std::to_string(fbneoArchiveCount)) : ""));
+
+    // Latched HERE, before every fbneo_rt::Initialize() below. Synchronized
+    // sessions (rollback netplay P2P/lobby, Kaillera) must pin the NeoGeo
+    // uPD4990A RTC and the BurnRandom seed so both peers boot bit-identical --
+    // otherwise each peer seeds them from its own wall clock and the rollback
+    // desync check fires from frame 0. NOTE: this includes the local rollback
+    // test session (localRollbackEnabled) whose frame-0 checksum IS the sync
+    // hash; a wall-clock RTC would make even two single-PC runs of the same rom
+    // differ, which is exactly what a peer comparison trips on. Every rollback
+    // session pins the clock; only a plain non-rollback session (and thus
+    // fbneoTarget == false) keeps the real local time.
+    fbneo_rt::SetNetgameMode(fbneoNetgameMode);
 
 #ifdef NETPLAY
     // Apply deterministic settings AFTER all overlays for synchronized netplay or

@@ -310,6 +310,30 @@ if (EXISTS "${RMGK_FBNEO_DIR}/meson.build")
     set(FBNEO_BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR}/FBNeo)
     set(FBNEO_LIB ${FBNEO_BUILD_DIR}/libfbneo_core.a)
 
+    # Apply the vendored "rmgk" frontend overlay (source/burner/rmgk + the two
+    # meson.build files that select it for -Dfrontend=lib). This is what makes a
+    # pristine upstream FBNeo checkout build the headless lib core RMG-K links:
+    # the overlay adds the frontend translation unit, the is_netgame_or_recording()
+    # determinism switch (NeoGeo uPD4990A RTC / BurnRandom seeding) and wires the
+    # 'lib' frontend into the meson subdir dispatch. Files are copied verbatim;
+    # anything under overlay/ mirrors the FBNeo source tree layout.
+    set(FBNEO_OVERLAY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/fbneo-rmgk/overlay)
+    if (EXISTS "${FBNEO_OVERLAY_DIR}/meson.build")
+        file(GLOB_RECURSE FBNEO_OVERLAY_FILES RELATIVE "${FBNEO_OVERLAY_DIR}"
+            "${FBNEO_OVERLAY_DIR}/*")
+        foreach(_ovl ${FBNEO_OVERLAY_FILES})
+            get_filename_component(_ovl_dir "${FBNEO_DIR}/${_ovl}" DIRECTORY)
+            file(MAKE_DIRECTORY "${_ovl_dir}")
+            configure_file("${FBNEO_OVERLAY_DIR}/${_ovl}"
+                "${FBNEO_DIR}/${_ovl}" COPYONLY)
+        endforeach()
+        message(STATUS "Applied FBNeo rmgk overlay (${FBNEO_OVERLAY_DIR})")
+    else()
+        message(STATUS
+            "FBNeo rmgk overlay not found at '${FBNEO_OVERLAY_DIR}'; the lib "
+            "core relies on the FBNeo tree already carrying src/burner/rmgk.")
+    endif()
+
     if (CMAKE_BUILD_TYPE STREQUAL "Debug")
         set(FBNEO_BUILDTYPE debug)
     elseif (CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")

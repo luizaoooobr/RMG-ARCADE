@@ -47,6 +47,12 @@ extern "C" {
 extern INT32 BurnStateCompress(UINT8** pDef, INT32* pnDefLen, INT32 bAll);
 extern INT32 BurnStateDecompress(UINT8* Def, INT32 nDefLen, INT32 bAll);
 
+// Global variable at global scope: the Itanium ABI does not mangle these, so the
+// symbol is literally "nRMGKNetgameMode" on both sides (no extern "C" needed).
+// Defined in FBNeo's src/burner/rmgk/frontend.cpp; backing storage for
+// is_netgame_or_recording(). Must be set BEFORE fbneo_rt::Initialize().
+extern int nRMGKNetgameMode;
+
 // The zip helpers live in src/burner/zipfn.cpp, which the lib frontend links in.
 // Same story as above: C++ linkage, so no extern "C". ZipGetList()/ZipLoadFile()
 // let BurnExtLoadRom resolve a ROM by CRC and copy it *clamped* to the driver's
@@ -1370,6 +1376,15 @@ void SetInputCallback(int (*callback)(void* values, int size, int players))
 }
 
 void SetInputPlayers(int players)     { g_inputPlayers = players; }
+
+void SetNetgameMode(bool netgame)
+{
+    // Pins/clears the NeoGeo RTC + BurnRandom seed inside the core. Meaningful
+    // only before Initialize(); changing it mid-session has no effect on the
+    // already-seeded drivers.
+    nRMGKNetgameMode = netgame ? 1 : 0;
+}
+
 void SetDeterministic(bool enabled)   { (void)enabled; }
 void SetTimesyncScale(double scale)   { (void)scale; }
 void SetVerboseStats(bool enabled)    { (void)enabled; }

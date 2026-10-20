@@ -198,6 +198,13 @@ RMG-K embeds a headless [FBNeo](https://github.com/finalburnneo/FBNeo) core for 
 
 `meson` must be on `PATH` (installed above as `mingw-w64-ucrt-x86_64-meson`). If `RMGK_FBNEO_DIR` has no `meson.build`, CMake prints a status message and skips the arcade core.
 
+**Vendored `rmgk` frontend overlay.** RMG-K does not build upstream FBNeo as-is: the embedded `-Dfrontend=lib` core needs a small headless frontend layer that upstream does not ship. That layer is vendored in this repository under `Source/3rdParty/fbneo-rmgk/overlay/` and copied over the FBNeo tree automatically during the CMake configure step (the files mirror the FBNeo source layout, so the overlay path maps 1:1 onto the checkout). It contains:
+
+- `src/burner/rmgk/` — the headless frontend translation unit (application callbacks/globals, savestate hooks, no-op video/audio/input/CD plugins) plus `tchar.h`.
+- `meson.build` and `src/burner/meson.build` — the only upstream build files that must change: they register the `lib → rmgk` frontend dir and select the reduced source set built for `-Dfrontend=lib`.
+
+Because the overlay is applied automatically, a **pristine** FBNeo clone is enough — no manual fork is required. The overlay also carries the deterministic-netplay switch `is_netgame_or_recording()` (read by the NeoGeo `uPD4990A` RTC seeding and `BurnRandom`): when RMG-Core sets it (rollback netplay, lobby, Kaillera), the RTC is pinned to a fixed date so both peers boot bit-identical; single-player keeps the real local clock. If you update FBNeo, keep the vendored `meson.build` files in sync (compare them against the new upstream ones before building).
+
 
 ## License
 
