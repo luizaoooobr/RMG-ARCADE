@@ -4555,9 +4555,15 @@ void RollbackLobbyDialog::beginSpectate(quint64 matchId, const QString& gameName
     if (m_spectatingMatchId != 0) return; // already spectating
     m_spectatingMatchId = matchId;
     m_spectateStreamArmed = false; // wait for this subscribe's SPECTATE_BEGIN before accepting data
+    m_spectateArcadeTarget = false; // MainWindow re-flags this from the resolved ROM below
     m_client->startSpectate(matchId);
     emit spectateLaunch(matchId, gameName);
     appendChatSystemLine(CHANNEL_LOBBY, "Connecting to live replay…");
+}
+
+void RollbackLobbyDialog::setSpectateArcadeTarget(bool arcade)
+{
+    m_spectateArcadeTarget = arcade;
 }
 
 void RollbackLobbyDialog::stopSpectating()
@@ -4575,12 +4581,20 @@ void RollbackLobbyDialog::onSpectateBegan(quint64 matchId, const QByteArray& man
     if (m_spectateStreamArmed) return;
     // Use the same parser and session-only cheat set as players, before any
     // replay input or keyframe can start emulation. An empty cheat set is valid;
-    // a missing manifest is not safe to replay with local or leftover cheats.
-    if (!m_client->applySpectateManifest(manifest))
+    // a missing manifest is not safe to replay with local or leftover cheats —
+    // except for arcade (FBNeo) matches, which have no N64 cheats at all, so the
+    // spectator accepts an absent manifest (dropped by an older lobby server).
+    const bool manifestMissing = manifest.isEmpty();
+    if (!m_client->applySpectateManifest(manifest, m_spectateArcadeTarget))
     {
         m_client->stopSpectate(matchId);
         onSpectateFailed(matchId, QStringLiteral("invalid_manifest"));
         return;
+    }
+    if (m_spectateArcadeTarget && manifestMissing)
+    {
+        appendChatSystemLine(CHANNEL_LOBBY,
+            "Watching without settings sync — arcade matches carry no netplay cheats.");
     }
     // The session boundary: everything on the wire before this is leftover from a
     // prior watch of this same match. Arm the stream now; keyframe + tail follow.

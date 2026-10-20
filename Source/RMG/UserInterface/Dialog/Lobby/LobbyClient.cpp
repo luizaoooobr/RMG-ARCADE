@@ -3266,13 +3266,22 @@ bool LobbyClient::sendBroadcastBegin(quint64 matchId)
     return true;
 }
 
-bool LobbyClient::applySpectateManifest(const QByteArray& manifest)
+bool LobbyClient::applySpectateManifest(const QByteArray& manifest, bool allowWithoutManifest)
 {
     uint64_t manifestHash = 0;
     size_t cheatCount = 0;
     if (manifest.isEmpty() || manifest.size() > 512 * 1024 ||
         !applyPrematchManifest(manifest.toStdString(), manifestHash, cheatCount))
-        return false;
+    {
+        if (!allowWithoutManifest)
+            return false;
+        // No usable manifest reached us (e.g. an older lobby server that doesn't
+        // relay it). Replay with an explicit empty cheat set so no stale cheats
+        // from a previous session leak into this watch.
+        CoreSetNetplayCheats(std::vector<CoreCheat>());
+        qInfo() << "Rollback lobby spectator proceeding without settings manifest";
+        return true;
+    }
     qInfo() << "Rollback lobby spectator prematch complete"
             << "hash" << static_cast<qulonglong>(manifestHash)
             << "cheats" << static_cast<qulonglong>(cheatCount);

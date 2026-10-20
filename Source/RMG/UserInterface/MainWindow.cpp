@@ -4519,6 +4519,20 @@ void MainWindow::on_Lobby_SpectateLaunch(quint64 matchId, QString gameName)
     this->ensureKailleraSessionManager();
     this->ui_SpectateCleanupPending = true;
 
+    // Arcade (FBNeo) matches carry no N64 netplay cheats, so flag the lobby dialog
+    // to accept a live replay whose settings manifest never arrived (an older lobby
+    // server may not relay it) rather than refusing to watch.
+    if (this->rollbackLobbyDialog != nullptr)
+    {
+        const QString spectateRomFile = this->findRomByName(gameName);
+        std::string fbneoShortName;
+        std::string fbneoFullName;
+        std::string fbneoRomId;
+        const bool spectateArcade = !spectateRomFile.isEmpty() &&
+            CoreGetFbneoRomInfo(spectateRomFile.toStdU32String(), fbneoShortName, fbneoFullName, fbneoRomId);
+        this->rollbackLobbyDialog->setSpectateArcadeTarget(spectateArcade);
+    }
+
     n02::activateMode(2);
     n02::playbackBeginStream();
 
