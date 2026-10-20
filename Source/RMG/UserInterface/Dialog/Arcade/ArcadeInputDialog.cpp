@@ -34,6 +34,9 @@
 #include <algorithm>
 #include <cstdlib>
 
+// Implemented in VidExt.cpp (same binary): re-reads the live FBNeo input mapping.
+void FbneoInputReloadSettings(void);
+
 using namespace UserInterface::Dialog;
 
 namespace
@@ -485,6 +488,14 @@ void ArcadeInputDialog::saveSettings(void)
     }
 
     CoreSettingsSave();
+
+    // While editing the controls of a game that is already running, the handler
+    // will not see an inactive->active transition again, so reload the mapping
+    // live for the new bindings/devices to take effect without a restart.
+    if (!m_pickGameMode)
+    {
+        FbneoInputReloadSettings();
+    }
 }
 
 void ArcadeInputDialog::rebuildTables(void)
