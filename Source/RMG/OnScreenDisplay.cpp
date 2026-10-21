@@ -81,6 +81,12 @@ static bool l_LiveReplayStatusEnabled = false;
 static std::string l_LiveReplayStatus;
 static std::mutex l_LiveReplayStatusMutex;
 
+// Persistent rollback/netplay stats overlay (top-left, small text). Fed by the
+// frontend from the core's live session snapshot. Hidden while empty.
+static bool l_NetplayStatsEnabled = false;
+static std::string l_NetplayStats;
+static std::mutex l_NetplayStatsMutex;
+
 static float OnScreenDisplayEaseOutCubic(float t)
 {
     t = std::clamp(t, 0.0f, 1.0f);
@@ -617,6 +623,12 @@ void OnScreenDisplaySetLiveReplayStatus(const std::string& message)
     l_LiveReplayStatus = message;
 }
 
+void OnScreenDisplaySetNetplayStats(const std::string& message)
+{
+    std::lock_guard<std::mutex> lock(l_NetplayStatsMutex);
+    l_NetplayStats = message;
+}
+
 void OnScreenDisplayRender(void)
 {
     if (!l_Initialized || l_RenderingPaused)
@@ -674,11 +686,18 @@ void OnScreenDisplayRender(void)
         std::lock_guard<std::mutex> lock(l_LiveReplayStatusMutex);
         liveReplayStatus = l_LiveReplayStatus;
     }
+    std::string netplayStats;
+    {
+        std::lock_guard<std::mutex> lock(l_NetplayStatsMutex);
+        netplayStats = l_NetplayStats;
+    }
     const bool hasPortLabels = l_KailleraPortLabelsEnabled && l_KailleraPortLabelPlayerCount > 0;
     const bool hasCenterMessage = !l_CenterMessage.empty();
     const bool hasLiveReplayStatus = l_LiveReplayStatusEnabled && !liveReplayStatus.empty();
+    const bool hasNetplayStats = !netplayStats.empty();
     const bool hasMessages = l_Enabled && (hasVisibleQueueMessage || l_InputPromptActive ||
-                                           hasPortLabels || hasCenterMessage || hasLiveReplayStatus);
+                                           hasPortLabels || hasCenterMessage || hasLiveReplayStatus ||
+                                           hasNetplayStats);
 
     if (!hasMessages)
     {
@@ -743,11 +762,15 @@ void OnScreenDisplayRender(void)
     float offsetY = 0.0f;
     int messageIndex = 0;
 
+    // Persistent top-left overlays share a fixed home: the live-replay badge
+    // first, then the rollback/netplay stats panel beneath it. Ordinary
+    // top-left messages are pushed below both.
+    const float overlayLeftX = l_MessagePaddingX;
+    float overlayTopY = l_MessagePaddingY;
+
     if (hasLiveReplayStatus)
     {
-        // The live audience badge has a stable home independent of the user's
-        // ordinary notification/chat anchor.
-        ImGui::SetNextWindowPos(ImVec2(l_MessagePaddingX, l_MessagePaddingY),
+        ImGui::SetNextWindowPos(ImVec2(overlayLeftX, overlayTopY),
                                 ImGuiCond_Always, ImVec2(0.0f, 0.0f));
         ImGui::Begin("OSD Live Replay", nullptr,
             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration |
@@ -756,8 +779,28 @@ void OnScreenDisplayRender(void)
         ImGui::Text("%s", liveReplayStatus.c_str());
         const ImVec2 windowSize = ImGui::GetWindowSize();
         ImGui::End();
-        // Stack ordinary top-left messages beneath the persistent badge. Other
-        // configured anchors have their own space and need no offset.
+        overlayTopY += windowSize.y;
+        // Stack ordinary top-left messages beneath the persistent overlays.
+        // Other configured anchors have their own space and need no offset.
+        if (l_MessagePosition == 1)
+            offsetY += windowSize.y * stackSpacingFactor;
+    }
+
+    if (hasNetplayStats)
+    {
+        ImGui::SetNextWindowPos(ImVec2(overlayLeftX, overlayTopY),
+                                ImGuiCond_Always, ImVec2(0.0f, 0.0f));
+        ImGui::Begin("OSD Netplay Stats", nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration |
+            ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+            ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoFocusOnAppearing);
+        // Smaller than the ordinary OSD text: this is a glanceable readout.
+        ImGui::SetWindowFontScale(0.85f);
+        ImGui::TextUnformatted(netplayStats.c_str());
+        ImGui::SetWindowFontScale(1.0f);
+        const ImVec2 windowSize = ImGui::GetWindowSize();
+        ImGui::End();
+        overlayTopY += windowSize.y;
         if (l_MessagePosition == 1)
             offsetY += windowSize.y * stackSpacingFactor;
     }

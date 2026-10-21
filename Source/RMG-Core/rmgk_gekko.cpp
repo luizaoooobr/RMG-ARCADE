@@ -187,6 +187,12 @@ std::atomic_bool g_GekkoExecuting{false};
 std::atomic_bool g_GekkoStopRequested{false};
 std::vector<PendingGekkoSave> g_GekkoPendingSaves;
 
+// Live-stats sampling for the frontend OSD overlay. The emulation thread bumps
+// the visible-frame counter here (see rollback_visible_frame_complete); the UI
+// thread reads the counter and derives FPS over a short window. Only the
+// counter is atomic — the derived samplers live on the reading thread.
+std::atomic<uint64_t> g_GekkoVisibleFrameCount{0};
+
 // Slots (1-indexed) queued by request_disconnect_player() on another thread,
 // drained on the emulation thread before each frame's update_session. Guarded
 // by its own mutex so the lobby/UI thread can push without touching the
@@ -3191,6 +3197,77 @@ bool rmgk_gekko::is_netplay_session_active()
 #endif
 }
 
+GekkoLiveStats rmgk_gekko::get_live_stats()
+{
+    GekkoLiveStats out;
+
+#ifdef RMGK_HAVE_GEKKONET
+    if (g_GekkoSession == nullptr)
+    {
+        return out;
+    }
+
+    out.active = true;
+    out.netplay = g_GekkoRemoteHandle >= 0;
+
+    // Report the best (lowest) ping across remote peers; the overlay wants a
+    // single representative number and the local sim is gated by the slowest
+    // peer, but the best link is the one worth surfacing.
+    int bestPing = -1;
+    int bestAvgPing = -1;
+    for (int player = 1; player <= g_GekkoPlayers; player++)
+    {
+        if (player == g_GekkoLocalPlayer ||
+            player > static_cast<int>(g_GekkoPlayerHandles.size()))
+        {
+            continue;
+        }
+        const int handle = g_GekkoPlayerHandles[static_cast<size_t>(player - 1)];
+        if (handle < 0)
+        {
+            continue;
+        }
+        GekkoNetworkStats stats = {};
+        gekko_network_stats(g_GekkoSession, handle, &stats);
+        const int ping = static_cast<int>(stats.last_ping);
+        const int avgPing = static_cast<int>(stats.avg_ping);
+        if (bestPing < 0 || ping < bestPing)
+        {
+            bestPing = ping;
+        }
+        if (bestAvgPing < 0 || avgPing < bestAvgPing)
+        {
+            bestAvgPing = avgPing;
+        }
+    }
+    out.pingMs = bestPing < 0 ? 0 : bestPing;
+    out.avgPingMs = bestAvgPing < 0 ? 0 : bestAvgPing;
+#endif
+
+    // FPS from the visible-frame counter. Persisted sampler state means the UI
+    // can poll at any cadence; each call folds the frames seen since the
+    // previous call into an exponentially smoothed rate so the number is stable
+    // yet still reacts within a fraction of a second.
+    static uint64_t s_lastFrameCount = 0;
+    static std::chrono::steady_clock::time_point s_lastSample = std::chrono::steady_clock::now();
+    static double s_smoothedFps = 0.0;
+    const uint64_t frameCount = g_GekkoVisibleFrameCount.load(std::memory_order_relaxed);
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(now - s_lastSample).count();
+    if (elapsed >= 0.20)
+    {
+        const uint64_t delta = frameCount - s_lastFrameCount;
+        const double instantFps = static_cast<double>(delta) / elapsed;
+        // Seed on the first real sample, then ease toward the instantaneous rate.
+        s_smoothedFps = (s_smoothedFps <= 0.0) ? instantFps : (s_smoothedFps * 0.6 + instantFps * 0.4);
+        s_lastFrameCount = frameCount;
+        s_lastSample = now;
+    }
+    out.fps = s_smoothedFps;
+
+    return out;
+}
+
 
 void rmgk_gekko::pace_before_present()
 {
@@ -3428,6 +3505,8 @@ static void rollback_visible_frame_complete(
     const m64p_rollback_run_frame_stats* stats)
 {
     (void)userData;
+
+    g_GekkoVisibleFrameCount.fetch_add(1, std::memory_order_relaxed);
 
     if (!g_RmgkPacingTraceEnabled || stats == nullptr ||
         g_RmgkPacingTraceActiveRow == kRmgkPacingTraceInvalidRow ||
