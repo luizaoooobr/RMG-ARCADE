@@ -123,14 +123,16 @@ INT32 CpsObjInit()
 		return 1;
 	}
 
-	// xmvsf3v3: every buffer its states hold starts the same way
-	if (CpsXmvSixEnabled) memset(ObjMem, 0, (nMax << 3) * nFrameCount);
+	// Every buffer the states hold must start deterministically, or two instances
+	// boot with different malloc contents and their first saved states diverge
+	// (a rollback checksum desync from the character-select screen onward).
+	if (Cps == 2) memset(ObjMem, 0, (nMax << 3) * nFrameCount);
 
 	// Set up the frame buffers
 	for (INT32 i = 0; i < nFrameCount; i++) {
 		of[i].Obj = ObjMem + (nMax << 3) * i;
 		of[i].nCount = 0;
-		if (CpsXmvSixEnabled) of[i].nShiftX = of[i].nShiftY = 0;
+		if (Cps == 2) of[i].nShiftX = of[i].nShiftY = 0;
 	}
 
 	nGetNext=0;

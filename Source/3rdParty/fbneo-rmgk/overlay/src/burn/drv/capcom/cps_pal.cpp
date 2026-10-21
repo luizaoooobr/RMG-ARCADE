@@ -25,7 +25,10 @@ INT32 CpsPalInit()
 	if (CpsPal == NULL) {
 		return 1;
 	}
-	if (CpsXmvSixEnabled) memset(CpsPal, 0, nLen);
+	// CpsPal is part of the rollback state for every CPS-2 title now, so it must
+	// start deterministically (malloc contents differ between two instances and
+	// would make their first saved states differ).
+	if (Cps == 2) memset(CpsPal, 0, nLen);
 	CpsXmvPaletteRestored = false;
 
 	return 0;
