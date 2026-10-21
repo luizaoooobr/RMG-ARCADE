@@ -28,6 +28,10 @@ struct GekkoLiveStats
     int  pingMs = 0;         // best (lowest) current peer ping, milliseconds
     int  avgPingMs = 0;      // best (lowest) average peer ping, milliseconds
     double fps = 0.0;        // visible frames per second measured by the core
+    bool desync = false;     // a checksum desync was detected this session
+    int  desyncFrame = -1;   // frame GekkoNet reported the desync at
+    unsigned int desyncLocalChecksum = 0;   // local checksum at the desync frame
+    unsigned int desyncRemoteChecksum = 0;  // remote checksum at the desync frame
 };
 
 // Describes one remote peer in a lobby-driven session. Each non-local

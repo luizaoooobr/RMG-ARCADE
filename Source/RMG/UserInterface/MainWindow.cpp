@@ -5826,11 +5826,20 @@ void MainWindow::updateNetplayStatsOverlay(void)
     const QString ping = stats.netplay
         ? QStringLiteral("%1ms").arg(stats.pingMs)
         : QStringLiteral("--");
-    const QString text =
+    QString text =
         QStringLiteral("ROLLBACK: %1\nPING: %2\nFPS: %3")
             .arg(rollback)
             .arg(ping)
             .arg(stats.fps, 0, 'f', 0);
+
+    if (stats.desync)
+    {
+        text += QStringLiteral("\nDESYNC @ frame %1\n  local=%2 remote=%3")
+            .arg(stats.desyncFrame)
+            .arg(stats.desyncLocalChecksum)
+            .arg(stats.desyncRemoteChecksum);
+    }
+
     OnScreenDisplaySetNetplayStats(text.toStdString());
 }
 

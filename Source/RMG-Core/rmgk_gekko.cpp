@@ -236,6 +236,14 @@ long long g_GekkoLastSaveStateUs = 0;
 long long g_GekkoLastRunFrameUs = 0;
 long long g_GekkoLastPendingSaveUs = 0;
 
+// Checksum desync reported by GekkoNet for this session (config.desync_detection
+// is on). Surfaced through get_live_stats() so the frontend can warn the player,
+// instead of the event being silently dropped.
+bool g_GekkoDesyncDetected = false;
+int  g_GekkoDesyncFrame = -1;
+unsigned int g_GekkoDesyncLocalChecksum = 0;
+unsigned int g_GekkoDesyncRemoteChecksum = 0;
+
 // ---------------------------------------------------------------------------
 // Buffered rollback pacing trace.
 //
@@ -1273,17 +1281,29 @@ const char* gekko_game_event_name(GekkoGameEventType type)
 
 void log_session_events()
 {
-    if (!g_GekkoLogEnabled)
-    {
-        return;
-    }
-
     int count = 0;
     GekkoSessionEvent** events = gekko_session_events(g_GekkoSession, &count);
     for (int i = 0; i < count; i++)
     {
         GekkoSessionEvent* event = events[i];
         if (event == nullptr)
+        {
+            continue;
+        }
+
+        // Capture a checksum desync regardless of logging: GekkoNet compares
+        // per-frame state checksums and reports the first frame that diverges
+        // from a remote peer. The frontend reads this through get_live_stats()
+        // to warn the player, so it must not depend on the verbose log switch.
+        if (event->type == GekkoDesyncDetected)
+        {
+            g_GekkoDesyncDetected = true;
+            g_GekkoDesyncFrame = event->data.desynced.frame;
+            g_GekkoDesyncLocalChecksum = event->data.desynced.local_checksum;
+            g_GekkoDesyncRemoteChecksum = event->data.desynced.remote_checksum;
+        }
+
+        if (!g_GekkoLogEnabled)
         {
             continue;
         }
@@ -3119,6 +3139,11 @@ void rmgk_gekko::close_session()
     g_GekkoMaxObservedFrame = -1;
     g_GekkoExecuting.store(false, std::memory_order_relaxed);
     g_GekkoPendingSaves.clear();
+    // Reset the checksum-desync report so a new session starts clean.
+    g_GekkoDesyncDetected = false;
+    g_GekkoDesyncFrame = -1;
+    g_GekkoDesyncLocalChecksum = 0;
+    g_GekkoDesyncRemoteChecksum = 0;
     // Reset spectate keyframe capture state for the next session.
     g_GekkoKeyframeRequested.store(false, std::memory_order_relaxed);
     g_GekkoKeyframePending = false;
@@ -3264,6 +3289,11 @@ GekkoLiveStats rmgk_gekko::get_live_stats()
         s_lastSample = now;
     }
     out.fps = s_smoothedFps;
+
+    out.desync = g_GekkoDesyncDetected;
+    out.desyncFrame = g_GekkoDesyncFrame;
+    out.desyncLocalChecksum = g_GekkoDesyncLocalChecksum;
+    out.desyncRemoteChecksum = g_GekkoDesyncRemoteChecksum;
 
     return out;
 }
