@@ -5819,15 +5819,18 @@ void MainWindow::updateNetplayStatsOverlay(void)
     if (!stats.active)
     {
         OnScreenDisplaySetNetplayStats("");
+        OnScreenDisplaySetRollbackGraph(nullptr, 0, 0.0f, 0);
         return;
     }
 
-    const QString rollback = stats.netplay ? QStringLiteral("ONLINE") : QStringLiteral("LOCAL");
+    const QString rollback = stats.netplay
+        ? QStringLiteral("ROLLBACK")
+        : QStringLiteral("LOCAL");
     const QString ping = stats.netplay
         ? QStringLiteral("%1ms").arg(stats.pingMs)
         : QStringLiteral("--");
     QString text =
-        QStringLiteral("ROLLBACK: %1\nPING: %2\nFPS: %3")
+        QStringLiteral("%1\nPING: %2\nFPS: %3")
             .arg(rollback)
             .arg(ping)
             .arg(stats.fps, 0, 'f', 0);
@@ -5841,6 +5844,17 @@ void MainWindow::updateNetplayStatsOverlay(void)
     }
 
     OnScreenDisplaySetNetplayStats(text.toStdString());
+
+    // Bar graph of recent rollback activity, shown beneath the stats readout.
+    if (stats.netplay && stats.historyCount > 0)
+    {
+        OnScreenDisplaySetRollbackGraph(stats.history, stats.historyCount,
+                                        stats.framesAhead, stats.jitterMs);
+    }
+    else
+    {
+        OnScreenDisplaySetRollbackGraph(nullptr, 0, 0.0f, 0);
+    }
 }
 
 void MainWindow::on_Emulation_Started(void)

@@ -87,6 +87,15 @@ static bool l_NetplayStatsEnabled = false;
 static std::string l_NetplayStats;
 static std::mutex l_NetplayStatsMutex;
 
+// Rollback/"jitter" bar graph data (drawn beneath the netplay stats panel).
+// Fed by the frontend from the core's live session snapshot.
+constexpr int l_RollbackGraphCapacity = 120;
+static int l_RollbackGraphHistory[l_RollbackGraphCapacity] = {};
+static int l_RollbackGraphCount = 0;
+static float l_RollbackGraphFramesAhead = 0.0f;
+static int l_RollbackGraphJitterMs = 0;
+static std::mutex l_RollbackGraphMutex;
+
 static float OnScreenDisplayEaseOutCubic(float t)
 {
     t = std::clamp(t, 0.0f, 1.0f);
@@ -629,6 +638,26 @@ void OnScreenDisplaySetNetplayStats(const std::string& message)
     l_NetplayStats = message;
 }
 
+void OnScreenDisplaySetRollbackGraph(const int* history, int count,
+    float framesAhead, int jitterMs)
+{
+    std::lock_guard<std::mutex> lock(l_RollbackGraphMutex);
+    if (history == nullptr || count <= 0)
+    {
+        l_RollbackGraphCount = 0;
+        return;
+    }
+    if (count > l_RollbackGraphCapacity)
+    {
+        history += (count - l_RollbackGraphCapacity);
+        count = l_RollbackGraphCapacity;
+    }
+    std::copy(history, history + count, l_RollbackGraphHistory);
+    l_RollbackGraphCount = count;
+    l_RollbackGraphFramesAhead = framesAhead;
+    l_RollbackGraphJitterMs = jitterMs;
+}
+
 void OnScreenDisplayRender(void)
 {
     if (!l_Initialized || l_RenderingPaused)
@@ -691,13 +720,29 @@ void OnScreenDisplayRender(void)
         std::lock_guard<std::mutex> lock(l_NetplayStatsMutex);
         netplayStats = l_NetplayStats;
     }
+    int rollbackGraphCount = 0;
+    int rollbackGraphHistory[l_RollbackGraphCapacity] = {};
+    float rollbackFramesAhead = 0.0f;
+    int rollbackJitterMs = 0;
+    {
+        std::lock_guard<std::mutex> lock(l_RollbackGraphMutex);
+        rollbackGraphCount = l_RollbackGraphCount;
+        if (rollbackGraphCount > 0)
+        {
+            std::copy(l_RollbackGraphHistory, l_RollbackGraphHistory + rollbackGraphCount,
+                      rollbackGraphHistory);
+        }
+        rollbackFramesAhead = l_RollbackGraphFramesAhead;
+        rollbackJitterMs = l_RollbackGraphJitterMs;
+    }
+    const bool hasRollbackGraph = rollbackGraphCount > 0;
     const bool hasPortLabels = l_KailleraPortLabelsEnabled && l_KailleraPortLabelPlayerCount > 0;
     const bool hasCenterMessage = !l_CenterMessage.empty();
     const bool hasLiveReplayStatus = l_LiveReplayStatusEnabled && !liveReplayStatus.empty();
     const bool hasNetplayStats = !netplayStats.empty();
     const bool hasMessages = l_Enabled && (hasVisibleQueueMessage || l_InputPromptActive ||
                                            hasPortLabels || hasCenterMessage || hasLiveReplayStatus ||
-                                           hasNetplayStats);
+                                           hasNetplayStats || hasRollbackGraph);
 
     if (!hasMessages)
     {
@@ -803,6 +848,69 @@ void OnScreenDisplayRender(void)
         overlayTopY += windowSize.y;
         if (l_MessagePosition == 1)
             offsetY += windowSize.y * stackSpacingFactor;
+    }
+
+    if (hasRollbackGraph)
+    {
+        ImGui::SetNextWindowPos(ImVec2(overlayLeftX, overlayTopY),
+                                ImGuiCond_Always, ImVec2(0.0f, 0.0f));
+        ImGui::Begin("OSD Rollback Graph", nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration |
+            ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+            ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoFocusOnAppearing);
+        ImGui::SetWindowFontScale(0.85f);
+        ImGui::Text("ROLLBACK  ahead %.1f  jit %dms",
+                    rollbackFramesAhead, rollbackJitterMs);
+
+        // Bar graph: one bar per sampled visible frame (oldest on the left,
+        // newest on the right). Bar height encodes how many frames were re-
+        // simulated that frame; a taller bar means the netcode rolled back
+        // further, i.e. the link hiccuped. Colour ramps green -> yellow -> red
+        // with depth so a well-behaved link stays green.
+        constexpr float barWidth = 3.0f;
+        constexpr float barGap = 1.0f;
+        constexpr float maxBarHeight = 28.0f;
+        constexpr int maxDepth = 8;
+        const ImU32 axisColor = IM_COL32(255, 255, 255, 60);
+
+        const ImVec2 graphOrigin = ImGui::GetCursorScreenPos();
+        const float graphWidth =
+            rollbackGraphCount * (barWidth + barGap);
+        const float graphHeight = maxBarHeight + 1.0f;
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+
+        // Baseline so an idle (zero-rollback) link still shows a flat line.
+        drawList->AddLine(
+            ImVec2(graphOrigin.x, graphOrigin.y + maxBarHeight),
+            ImVec2(graphOrigin.x + graphWidth, graphOrigin.y + maxBarHeight),
+            axisColor);
+
+        for (int i = 0; i < rollbackGraphCount; i++)
+        {
+            const int depth = std::clamp(rollbackGraphHistory[i], 0, maxDepth);
+            const float ratio = static_cast<float>(depth) / static_cast<float>(maxDepth);
+            const float barHeight = 1.0f + ratio * (maxBarHeight - 1.0f);
+            // Green (0) -> yellow (~0.5) -> red (1.0).
+            const float redChannel = ratio < 0.5f ? (ratio * 2.0f) : 1.0f;
+            const float greenChannel = ratio < 0.5f ? 1.0f : (1.0f - (ratio - 0.5f) * 2.0f);
+            const ImU32 barColor = IM_COL32(
+                static_cast<int>(redChannel * 255.0f),
+                static_cast<int>(greenChannel * 255.0f),
+                40, 220);
+            const float x = graphOrigin.x + i * (barWidth + barGap);
+            drawList->AddRectFilled(
+                ImVec2(x, graphOrigin.y + maxBarHeight - barHeight),
+                ImVec2(x + barWidth, graphOrigin.y + maxBarHeight),
+                barColor);
+        }
+        ImGui::Dummy(ImVec2(graphWidth, graphHeight));
+
+        ImGui::SetWindowFontScale(1.0f);
+        const ImVec2 graphWindowSize = ImGui::GetWindowSize();
+        ImGui::End();
+        overlayTopY += graphWindowSize.y;
+        if (l_MessagePosition == 1)
+            offsetY += graphWindowSize.y * stackSpacingFactor;
     }
 
     if (l_InputPromptActive)

@@ -63,6 +63,13 @@ void OnScreenDisplaySetLiveReplayStatus(const std::string& message);
 // Pass an empty string to hide it.
 void OnScreenDisplaySetNetplayStats(const std::string& message);
 
+// Sets the rollback/"jitter" bar graph data, drawn under the netplay stats
+// panel. history holds recent per-frame rollback depths (oldest first) and is
+// copied internally, so the caller's buffer can be reused. Pass count <= 0 to
+// hide the graph.
+void OnScreenDisplaySetRollbackGraph(const int* history, int count,
+    float framesAhead, int jitterMs);
+
 // renders the OSD
 void OnScreenDisplayRender(void);
 

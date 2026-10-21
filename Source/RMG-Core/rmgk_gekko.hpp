@@ -32,6 +32,24 @@ struct GekkoLiveStats
     int  desyncFrame = -1;   // frame GekkoNet reported the desync at
     unsigned int desyncLocalChecksum = 0;   // local checksum at the desync frame
     unsigned int desyncRemoteChecksum = 0;  // remote checksum at the desync frame
+
+    // Rollback/"jitter" telemetry for the on-screen rollback graph. fpsAhead is
+    // GekkoNet's delay-balanced frame error (positive = locally ahead); a
+    // negative value means the local sim is catching up, which is the "rollback
+    // working" signal. jitterMs is the peer's measured network jitter. The
+    // history array is a fixed ring of recent rollback depths (number of frames
+    // re-simulated on each visible frame), newest at historyHead for the front-
+    // end to draw as a bar graph.
+    float framesAhead = 0.0f;
+    int   jitterMs = 0;
+    int   rollbackDepth = 0;          // frames rolled back on the last visible frame
+    int   runaheadDepth = 0;          // frames run ahead on the last visible frame
+    // Ring buffer of recent per-frame rollback depths, in display order after
+    // get_live_stats() linearises it (oldest first, newest last). Sized to fit
+    // the graph without per-frame allocation.
+    static constexpr int historyCapacity = 120;
+    int historyCount = 0;             // number of valid entries (<= historyCapacity)
+    int history[historyCapacity] = {};
 };
 
 // Describes one remote peer in a lobby-driven session. Each non-local
