@@ -5819,7 +5819,6 @@ void MainWindow::updateNetplayStatsOverlay(void)
     if (!stats.active)
     {
         OnScreenDisplaySetNetplayStats("");
-        OnScreenDisplaySetRollbackGraph(nullptr, 0, 0.0f, 0);
         return;
     }
 
@@ -5830,10 +5829,13 @@ void MainWindow::updateNetplayStatsOverlay(void)
         ? QStringLiteral("%1ms").arg(stats.pingMs)
         : QStringLiteral("--");
     QString text =
-        QStringLiteral("%1\nPING: %2\nFPS: %3")
+        QStringLiteral("%1\nPING: %2\nFPS: %3\nJITTER: %4ms\nAHEAD: %5\nRB: %6")
             .arg(rollback)
             .arg(ping)
-            .arg(stats.fps, 0, 'f', 0);
+            .arg(stats.fps, 0, 'f', 0)
+            .arg(stats.netplay ? stats.jitterMs : 0)
+            .arg(stats.framesAhead, 0, 'f', 1)
+            .arg(stats.rollbackDepth);
 
     if (stats.desync)
     {
@@ -5844,17 +5846,6 @@ void MainWindow::updateNetplayStatsOverlay(void)
     }
 
     OnScreenDisplaySetNetplayStats(text.toStdString());
-
-    // Bar graph of recent rollback activity, shown beneath the stats readout.
-    if (stats.netplay && stats.historyCount > 0)
-    {
-        OnScreenDisplaySetRollbackGraph(stats.history, stats.historyCount,
-                                        stats.framesAhead, stats.jitterMs);
-    }
-    else
-    {
-        OnScreenDisplaySetRollbackGraph(nullptr, 0, 0.0f, 0);
-    }
 }
 
 void MainWindow::on_Emulation_Started(void)

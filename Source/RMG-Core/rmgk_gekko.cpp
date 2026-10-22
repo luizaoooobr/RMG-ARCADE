@@ -244,21 +244,15 @@ int  g_GekkoDesyncFrame = -1;
 unsigned int g_GekkoDesyncLocalChecksum = 0;
 unsigned int g_GekkoDesyncRemoteChecksum = 0;
 
-// Rollback/"jitter" telemetry for the on-screen rollback graph. Updated on the
+// Rollback/"jitter" telemetry for the on-screen stats overlay. Updated on the
 // emulation thread each frame (apply_gekko_frame_pacing) and sampled by the
-// frontend through get_live_stats(). g_GekkoRollbackDepthHistory is a ring of
-// recent per-frame rollback depths; g_GekkoRollbackHistoryHead points at the
-// newest entry.
+// frontend through get_live_stats().
 float g_GekkoFramesAhead = 0.0f;
 int   g_GekkoJitterMs = 0;
 int   g_GekkoLastRollbackDepth = 0;
 int   g_GekkoLastRunaheadDepth = 0;
 int   g_GekkoFrameRollbackCount = 0;   // rollback advances seen since the last visible frame
 int   g_GekkoFrameRunaheadCount = 0;   // runahead advances seen since the last visible frame
-constexpr int kGekkoRollbackHistoryCapacity = GekkoLiveStats::historyCapacity;
-int g_GekkoRollbackDepthHistory[kGekkoRollbackHistoryCapacity] = {};
-int g_GekkoRollbackHistoryHead = 0;   // index of newest entry
-int g_GekkoRollbackHistoryCount = 0;  // number of valid entries
 
 // ---------------------------------------------------------------------------
 // Buffered rollback pacing trace.
@@ -1858,48 +1852,42 @@ void apply_gekko_frame_pacing()
         static_cast<int>(g_GekkoPacingMode);
     g_RmgkTraceSampleFrame = isSampleFrame ? 1 : 0;
 
-    // Publish rollback/"jitter" telemetry for the on-screen rollback graph.
+    // Publish rollback/"jitter" telemetry for the on-screen stats overlay.
     // This runs once per visible frame: roll backs that happened while
-    // processing the previous frame's events are folded into a single depth,
-    // then the ring buffer advances. frames_ahead is GekkoNet's delay-balanced
-    // error; jitter comes from the peer network stats.
+    // processing the previous frame's events are folded into a single depth.
+    // frames_ahead is GekkoNet's delay-balanced error; jitter comes from the
+    // peer network stats, sampled less often since it changes slowly and the
+    // read walks the RTT history.
     {
-        const int rollbackDepth = g_GekkoFrameRollbackCount;
-        const int runaheadDepth = g_GekkoFrameRunaheadCount;
-        g_GekkoLastRollbackDepth = rollbackDepth;
-        g_GekkoLastRunaheadDepth = runaheadDepth;
+        g_GekkoLastRollbackDepth = g_GekkoFrameRollbackCount;
+        g_GekkoLastRunaheadDepth = g_GekkoFrameRunaheadCount;
 
-        int jitterMs = 0;
-        for (int player = 1; player <= g_GekkoPlayers; player++)
+        if ((g_GekkoPacingLogFrames % 15) == 0)
         {
-            if (player == g_GekkoLocalPlayer ||
-                player > static_cast<int>(g_GekkoPlayerHandles.size()))
+            int jitterMs = 0;
+            for (int player = 1; player <= g_GekkoPlayers; player++)
             {
-                continue;
+                if (player == g_GekkoLocalPlayer ||
+                    player > static_cast<int>(g_GekkoPlayerHandles.size()))
+                {
+                    continue;
+                }
+                const int handle = g_GekkoPlayerHandles[static_cast<size_t>(player - 1)];
+                if (handle < 0)
+                {
+                    continue;
+                }
+                GekkoNetworkStats netStats = {};
+                gekko_network_stats(g_GekkoSession, handle, &netStats);
+                const int value = static_cast<int>(netStats.jitter);
+                if (value > jitterMs)
+                {
+                    jitterMs = value;
+                }
             }
-            const int handle = g_GekkoPlayerHandles[static_cast<size_t>(player - 1)];
-            if (handle < 0)
-            {
-                continue;
-            }
-            GekkoNetworkStats netStats = {};
-            gekko_network_stats(g_GekkoSession, handle, &netStats);
-            const int value = static_cast<int>(netStats.jitter);
-            if (value > jitterMs)
-            {
-                jitterMs = value;
-            }
+            g_GekkoJitterMs = jitterMs;
         }
-        g_GekkoJitterMs = jitterMs;
         g_GekkoFramesAhead = framesAhead;
-
-        g_GekkoRollbackDepthHistory[g_GekkoRollbackHistoryHead] = rollbackDepth;
-        g_GekkoRollbackHistoryHead =
-            (g_GekkoRollbackHistoryHead + 1) % kGekkoRollbackHistoryCapacity;
-        if (g_GekkoRollbackHistoryCount < kGekkoRollbackHistoryCapacity)
-        {
-            g_GekkoRollbackHistoryCount++;
-        }
 
         g_GekkoFrameRollbackCount = 0;
         g_GekkoFrameRunaheadCount = 0;
@@ -3209,17 +3197,13 @@ void rmgk_gekko::close_session()
     g_GekkoDesyncFrame = -1;
     g_GekkoDesyncLocalChecksum = 0;
     g_GekkoDesyncRemoteChecksum = 0;
-    // Reset rollback/"jitter" telemetry for the on-screen rollback graph.
+    // Reset rollback/"jitter" telemetry for the on-screen stats overlay.
     g_GekkoFramesAhead = 0.0f;
     g_GekkoJitterMs = 0;
     g_GekkoLastRollbackDepth = 0;
     g_GekkoLastRunaheadDepth = 0;
     g_GekkoFrameRollbackCount = 0;
     g_GekkoFrameRunaheadCount = 0;
-    g_GekkoRollbackHistoryHead = 0;
-    g_GekkoRollbackHistoryCount = 0;
-    std::fill(std::begin(g_GekkoRollbackDepthHistory),
-              std::end(g_GekkoRollbackDepthHistory), 0);
     // Reset spectate keyframe capture state for the next session.
     g_GekkoKeyframeRequested.store(false, std::memory_order_relaxed);
     g_GekkoKeyframePending = false;
@@ -3371,22 +3355,11 @@ GekkoLiveStats rmgk_gekko::get_live_stats()
     out.desyncLocalChecksum = g_GekkoDesyncLocalChecksum;
     out.desyncRemoteChecksum = g_GekkoDesyncRemoteChecksum;
 
-    // Rollback/"jitter" telemetry for the on-screen rollback graph. Linearise the
-    // ring buffer so the frontend receives the history oldest-first.
+    // Rollback/"jitter" telemetry for the on-screen stats overlay.
     out.framesAhead = g_GekkoFramesAhead;
     out.jitterMs = g_GekkoJitterMs;
     out.rollbackDepth = g_GekkoLastRollbackDepth;
     out.runaheadDepth = g_GekkoLastRunaheadDepth;
-    const int historyCount = std::min(g_GekkoRollbackHistoryCount, GekkoLiveStats::historyCapacity);
-    out.historyCount = historyCount;
-    for (int i = 0; i < historyCount; i++)
-    {
-        // Oldest entry first: the head points one past the newest.
-        const int index =
-            (g_GekkoRollbackHistoryHead - historyCount + i + kGekkoRollbackHistoryCapacity) %
-            kGekkoRollbackHistoryCapacity;
-        out.history[i] = g_GekkoRollbackDepthHistory[index];
-    }
 
     return out;
 }
