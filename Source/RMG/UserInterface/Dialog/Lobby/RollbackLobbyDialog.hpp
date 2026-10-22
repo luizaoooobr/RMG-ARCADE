@@ -72,12 +72,6 @@ public:
     // stopped) so the server can drop us from the broadcast. Idempotent.
     void stopSpectating();
 
-    // MainWindow flags whether the match being watched is an arcade (FBNeo) set
-    // once it has resolved the ROM. Arcade matches carry no N64 netplay cheats,
-    // so a lobby server that doesn't relay the settings manifest can still be
-    // watched safely — see onSpectateBegan.
-    void setSpectateArcadeTarget(bool arcade);
-
 signals:
     // Fired when the server has issued MATCH_BEGIN. Each entry in remotePeers
     // is pre-formatted as "<slot>,<ip>,<port>" — matches the LOBBY| address
@@ -421,11 +415,6 @@ private:
     // the stale data on the wire — so we drop every keyframe/data message until we
     // see the BEGIN for the current subscribe. Reset false in beginSpectate.
     bool       m_spectateStreamArmed = false;
-
-    // True when the match being watched is an arcade (FBNeo) set, set by
-    // MainWindow after it resolves the ROM. Lets the spectator accept a live
-    // replay whose settings manifest was dropped by an older lobby server.
-    bool       m_spectateArcadeTarget = false;
 
     // Guards clampTreeColumns against re-entering itself: the setColumnWidth
     // calls it makes emit sectionResized, which is what invokes it. One flag

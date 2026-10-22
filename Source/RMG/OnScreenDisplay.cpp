@@ -81,12 +81,6 @@ static bool l_LiveReplayStatusEnabled = false;
 static std::string l_LiveReplayStatus;
 static std::mutex l_LiveReplayStatusMutex;
 
-// Persistent rollback/netplay stats overlay (top-left, small text). Fed by the
-// frontend from the core's live session snapshot. Hidden while empty.
-static bool l_NetplayStatsEnabled = false;
-static std::string l_NetplayStats;
-static std::mutex l_NetplayStatsMutex;
-
 static float OnScreenDisplayEaseOutCubic(float t)
 {
     t = std::clamp(t, 0.0f, 1.0f);
@@ -623,12 +617,6 @@ void OnScreenDisplaySetLiveReplayStatus(const std::string& message)
     l_LiveReplayStatus = message;
 }
 
-void OnScreenDisplaySetNetplayStats(const std::string& message)
-{
-    std::lock_guard<std::mutex> lock(l_NetplayStatsMutex);
-    l_NetplayStats = message;
-}
-
 void OnScreenDisplayRender(void)
 {
     if (!l_Initialized || l_RenderingPaused)
@@ -686,18 +674,11 @@ void OnScreenDisplayRender(void)
         std::lock_guard<std::mutex> lock(l_LiveReplayStatusMutex);
         liveReplayStatus = l_LiveReplayStatus;
     }
-    std::string netplayStats;
-    {
-        std::lock_guard<std::mutex> lock(l_NetplayStatsMutex);
-        netplayStats = l_NetplayStats;
-    }
     const bool hasPortLabels = l_KailleraPortLabelsEnabled && l_KailleraPortLabelPlayerCount > 0;
     const bool hasCenterMessage = !l_CenterMessage.empty();
     const bool hasLiveReplayStatus = l_LiveReplayStatusEnabled && !liveReplayStatus.empty();
-    const bool hasNetplayStats = !netplayStats.empty();
     const bool hasMessages = l_Enabled && (hasVisibleQueueMessage || l_InputPromptActive ||
-                                           hasPortLabels || hasCenterMessage || hasLiveReplayStatus ||
-                                           hasNetplayStats);
+                                           hasPortLabels || hasCenterMessage || hasLiveReplayStatus);
 
     if (!hasMessages)
     {
@@ -762,15 +743,11 @@ void OnScreenDisplayRender(void)
     float offsetY = 0.0f;
     int messageIndex = 0;
 
-    // Persistent top-left overlays share a fixed home: the live-replay badge
-    // first, then the rollback/netplay stats panel beneath it. Ordinary
-    // top-left messages are pushed below both.
-    const float overlayLeftX = l_MessagePaddingX;
-    float overlayTopY = l_MessagePaddingY;
-
     if (hasLiveReplayStatus)
     {
-        ImGui::SetNextWindowPos(ImVec2(overlayLeftX, overlayTopY),
+        // The live audience badge has a stable home independent of the user's
+        // ordinary notification/chat anchor.
+        ImGui::SetNextWindowPos(ImVec2(l_MessagePaddingX, l_MessagePaddingY),
                                 ImGuiCond_Always, ImVec2(0.0f, 0.0f));
         ImGui::Begin("OSD Live Replay", nullptr,
             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration |
@@ -779,55 +756,10 @@ void OnScreenDisplayRender(void)
         ImGui::Text("%s", liveReplayStatus.c_str());
         const ImVec2 windowSize = ImGui::GetWindowSize();
         ImGui::End();
-        overlayTopY += windowSize.y;
-        // Stack ordinary top-left messages beneath the persistent overlays.
-        // Other configured anchors have their own space and need no offset.
+        // Stack ordinary top-left messages beneath the persistent badge. Other
+        // configured anchors have their own space and need no offset.
         if (l_MessagePosition == 1)
             offsetY += windowSize.y * stackSpacingFactor;
-    }
-
-    if (hasNetplayStats)
-    {
-        // Drawn straight onto the foreground draw list instead of as an ImGui
-        // window: no background panel, no decoration, no per-frame window
-        // layout. The readout is a glanceable corner label, so a plain text
-        // overlay is both lighter and closer to what we want on top of a game.
-        constexpr float statsScale = 0.85f;
-        const float lineHeight = ImGui::GetTextLineHeight() * statsScale;
-        ImDrawList* drawList = ImGui::GetForegroundDrawList();
-        const float textX = overlayLeftX;
-        float textY = overlayTopY;
-
-        const char* lineBegin = netplayStats.c_str();
-        while (*lineBegin != '\0')
-        {
-            const char* lineEnd = lineBegin;
-            while (*lineEnd != '\0' && *lineEnd != '\n')
-            {
-                lineEnd++;
-            }
-            const std::string line(lineBegin, lineEnd);
-
-            // Draw a 1px dark offset copy first so the text stays readable over
-            // bright game pixels without needing a filled background box.
-            const ImU32 shadowColor = IM_COL32(0, 0, 0, 200);
-            drawList->AddText(nullptr, lineHeight, ImVec2(textX + 1.0f, textY + 1.0f),
-                              shadowColor, line.c_str());
-            drawList->AddText(nullptr, lineHeight, ImVec2(textX, textY),
-                              IM_COL32(255, 255, 255, 255), line.c_str());
-
-            textY += lineHeight;
-            if (*lineEnd == '\0')
-            {
-                break;
-            }
-            lineBegin = lineEnd + 1;
-        }
-
-        const float statsHeight = textY - overlayTopY;
-        overlayTopY += statsHeight;
-        if (l_MessagePosition == 1)
-            offsetY += statsHeight * stackSpacingFactor;
     }
 
     if (l_InputPromptActive)

@@ -1156,24 +1156,10 @@ bool CoreStartEmulation(std::filesystem::path n64rom, std::filesystem::path n64d
     const int fbneoArchiveCount = static_cast<int>(fbneoArchives.size());
     const char* const* fbneoArchivePtrs = fbneoArchives.empty() ? nullptr : fbneoArchives.data();
 
-    const bool fbneoNetgameMode = fbneoTarget && (netplay || localRollbackEnabled);
     CoreAddCallbackMessage(CoreDebugMessageType::Info,
         std::string("CoreStartEmulation: fbneoTarget=") + (fbneoTarget ? "yes" : "no") +
-        " netgame=" + (fbneoNetgameMode ? "yes" : "no") +
         " rom=" + n64rom.filename().string() +
         (fbneoTarget ? (" driver=" + fbneoGame + " archives=" + std::to_string(fbneoArchiveCount)) : ""));
-
-    // Latched HERE, before every fbneo_rt::Initialize() below. Synchronized
-    // sessions (rollback netplay P2P/lobby, Kaillera) must pin the NeoGeo
-    // uPD4990A RTC and the BurnRandom seed so both peers boot bit-identical --
-    // otherwise each peer seeds them from its own wall clock and the rollback
-    // desync check fires from frame 0. NOTE: this includes the local rollback
-    // test session (localRollbackEnabled) whose frame-0 checksum IS the sync
-    // hash; a wall-clock RTC would make even two single-PC runs of the same rom
-    // differ, which is exactly what a peer comparison trips on. Every rollback
-    // session pins the clock; only a plain non-rollback session (and thus
-    // fbneoTarget == false) keeps the real local time.
-    fbneo_rt::SetNetgameMode(fbneoNetgameMode);
 
 #ifdef NETPLAY
     // Apply deterministic settings AFTER all overlays for synchronized netplay or
@@ -1201,52 +1187,6 @@ bool CoreStartEmulation(std::filesystem::path n64rom, std::filesystem::path n64d
                 // Store player number for input plugin to use
                 CoreSetKailleraPlayerNumber(player);
                 netplay_ret = true;
-
-                // Arcade (FBNeo) replay/spectate: the Kaillera path normally
-                // drives the mupen64plus core through the PIF sync callback.
-                // Arcade romsets never open an N64 ROM, so the rollback frame
-                // loop has to drive FBNeo instead -- which needs FBNeo plus a
-                // local Gekko session (the .krec supplies every seat's input, see
-                // submit_local_input()). No DIP overlay is applied here: netplay
-                // matches are recorded with driver-default DIPs, so a replay must
-                // use those same defaults to stay faithful.
-                if (fbneoTarget)
-                {
-                    CoreSettingsSetValue(SettingsID::Core_CPU_Emulator, 2);
-                    fprintf(stderr, "[FBNEO-DBG] kaillera-arcade init game=%s archives=%d\n", fbneoGame.c_str(), fbneoArchiveCount); fflush(stderr);
-                    const bool fbInit = fbneo_rt::Initialize(fbneoGame.c_str(), fbneoArchivePtrs, fbneoArchiveCount, 2);
-                    fprintf(stderr, "[FBNEO-DBG] kaillera-arcade fbneo_rt::Initialize=%d err=%s\n", (int)fbInit, CoreGetError().c_str()); fflush(stderr);
-                    if (!fbInit)
-                    {
-                        const std::string fbErr = CoreGetError();
-                        CoreSetError("CoreStartEmulation: FBNeo initialization failed" + (fbErr.empty() ? std::string() : (": " + fbErr)));
-                        m64p_ret = M64ERR_SYSTEM_FAIL;
-                        netplay_ret = false;
-                    }
-                    else
-                    {
-                        s_FbneoActive = true;
-                        int seats = fbneo_rt::PlayerCount();
-                        if (seats < 2) { seats = 2; }
-                        if (seats > 4) { seats = 4; }
-                        netplay_ret = rmgk_gekko::start_local_session("rmgk-gekko-kaillera", seats, 4, 0);
-                        fprintf(stderr, "[FBNEO-DBG] kaillera-arcade start_local_session=%d seats=%d err=%s\n", (int)netplay_ret, seats, CoreGetError().c_str()); fflush(stderr);
-                        if (!netplay_ret)
-                        {
-                            if (CoreGetError().empty())
-                            {
-                                CoreSetError("CoreStartEmulation: GekkoNet session initialization failed");
-                            }
-                            m64p_ret = M64ERR_SYSTEM_FAIL;
-                        }
-                        else
-                        {
-                            // Session is up; drop any benign error latched during setup
-                            // (e.g. a probe for a mupen config parameter that doesn't apply).
-                            CoreSetError(std::string());
-                        }
-                    }
-                }
             }
         }
         else if (address.rfind("GEKKO|", 0) == 0)

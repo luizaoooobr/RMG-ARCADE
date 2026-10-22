@@ -144,13 +144,6 @@ namespace fbneo_rt
     void SetInputCallback(int (*callback)(void* values, int size, int players));
     void SetInputPlayers(int players);
 
-    // Determines whether the core seeds machine-local values (NeoGeo uPD4990A RTC,
-    // BurnRandom) from the wall clock or from a pinned deterministic value. Must be
-    // called BEFORE Initialize(): rollback netplay / lobby / Kaillera sessions set
-    // true so two peers boot bit-identical; local single-player sets false to keep
-    // the real clock.
-    void SetNetgameMode(bool netgame);
-
     // FBNeo has no equivalents for these; kept for API parity.
     void SetDeterministic(bool enabled);
     void SetTimesyncScale(double scale);

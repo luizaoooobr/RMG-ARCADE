@@ -207,10 +207,7 @@ public:
     // Spectate (pull a broadcast match's krec stream back down).
     void startSpectate(quint64 matchId);
     void stopSpectate(quint64 matchId);
-    // allowWithoutManifest: when true (arcade/FBNeo matches, which have no N64
-    // netplay cheats) a missing/invalid manifest is accepted and the session cheat
-    // set is cleared instead of failing the spectate.
-    bool applySpectateManifest(const QByteArray& manifest, bool allowWithoutManifest = false);
+    bool applySpectateManifest(const QByteArray& manifest);
 
     // Moderation. sendAdminAuth claims the moderator role with a password;
     // sendModAction issues a command once authenticated. action is one of

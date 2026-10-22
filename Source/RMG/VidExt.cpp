@@ -1377,22 +1377,6 @@ public:
         this->closeDevices();
     }
 
-    // Re-read the bindings/devices from settings and re-open the controllers.
-    // Used when the user reconfigures controls while a game is already running,
-    // where the inactive->active reload in poll() will not fire again.
-    void reloadSettings(void)
-    {
-        this->closeDevices();
-        this->loadPlayers();
-        this->openDevices();
-        this->m_openRetryTicks = 0;
-        this->m_openAttempts   = 0;
-        for (int player = 0; player < FBNEO_MAX_PLAYERS; player++)
-        {
-            this->lastMask[player] = 0;
-        }
-    }
-
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override
     {
@@ -1706,16 +1690,6 @@ private:
 } // namespace
 
 static FbneoInputHandler* s_FbneoInputHandler = nullptr;
-
-// Reload the live FBNeo input mapping from settings. Safe to call from the GUI
-// thread (where both the dialog and the handler's poll() run).
-void FbneoInputReloadSettings(void)
-{
-    if (s_FbneoInputHandler != nullptr)
-    {
-        s_FbneoInputHandler->reloadSettings();
-    }
-}
 
 static void FbneoPushAudio(const int16_t* audio, int audioFrames)
 {

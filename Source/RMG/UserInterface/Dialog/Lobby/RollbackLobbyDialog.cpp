@@ -96,23 +96,17 @@ extern bool n02_kaillera_recording_enabled;
 extern char recording_player_names[4][32];
 
 namespace {
-// Auto input-delay buckets by ping. Runahead is disabled for FBNeo (the core's
-// timesync scale is a no-op), so the session runs as delay netcode: every peer
-// waits for the other's real input each frame. The delay therefore has to
-// absorb the full one-way latency plus jitter, not just half the RTT. The
-// old buckets (ping<=50 -> 1) left the local player permanently several frames
-// behind (log showed frames_ahead stuck at about -7.5), which read as input
-// lag. These buckets add a flat margin for the lockstep round trip and grow
-// with ping. Ping < 0 (unknown) keeps the conservative default.
+// Auto input-delay buckets by ping, migrated from the P2P rollback tab.
+// Ping < 0 (unknown) falls back to the default. Automatic selection remains at
+// least one frame; zero delay is an explicit low-latency choice.
 int autoFrameDelayForPing(int ping)
 {
-    if (ping < 0)    return 4;   // default when ping is unknown
-    if (ping <= 50)  return 3;
-    if (ping <= 80)  return 4;
-    if (ping <= 120) return 5;
-    if (ping <= 160) return 6;
-    if (ping <= 220) return 7;
-    return 8;
+    if (ping < 0)    return 2;   // default when ping is unknown
+    if (ping <= 50)  return 1;
+    if (ping <= 100) return 2;
+    if (ping <= 150) return 3;
+    if (ping <= 220) return 4;
+    return 5;
 }
 
 // The host-controlled room prediction defaults to the earlier configurable
@@ -4561,15 +4555,9 @@ void RollbackLobbyDialog::beginSpectate(quint64 matchId, const QString& gameName
     if (m_spectatingMatchId != 0) return; // already spectating
     m_spectatingMatchId = matchId;
     m_spectateStreamArmed = false; // wait for this subscribe's SPECTATE_BEGIN before accepting data
-    m_spectateArcadeTarget = false; // MainWindow re-flags this from the resolved ROM below
     m_client->startSpectate(matchId);
     emit spectateLaunch(matchId, gameName);
     appendChatSystemLine(CHANNEL_LOBBY, "Connecting to live replay…");
-}
-
-void RollbackLobbyDialog::setSpectateArcadeTarget(bool arcade)
-{
-    m_spectateArcadeTarget = arcade;
 }
 
 void RollbackLobbyDialog::stopSpectating()
@@ -4587,20 +4575,12 @@ void RollbackLobbyDialog::onSpectateBegan(quint64 matchId, const QByteArray& man
     if (m_spectateStreamArmed) return;
     // Use the same parser and session-only cheat set as players, before any
     // replay input or keyframe can start emulation. An empty cheat set is valid;
-    // a missing manifest is not safe to replay with local or leftover cheats —
-    // except for arcade (FBNeo) matches, which have no N64 cheats at all, so the
-    // spectator accepts an absent manifest (dropped by an older lobby server).
-    const bool manifestMissing = manifest.isEmpty();
-    if (!m_client->applySpectateManifest(manifest, m_spectateArcadeTarget))
+    // a missing manifest is not safe to replay with local or leftover cheats.
+    if (!m_client->applySpectateManifest(manifest))
     {
         m_client->stopSpectate(matchId);
         onSpectateFailed(matchId, QStringLiteral("invalid_manifest"));
         return;
-    }
-    if (m_spectateArcadeTarget && manifestMissing)
-    {
-        appendChatSystemLine(CHANNEL_LOBBY,
-            "Watching without settings sync — arcade matches carry no netplay cheats.");
     }
     // The session boundary: everything on the wire before this is leftover from a
     // prior watch of this same match. Arm the stream now; keyframe + tail follow.
