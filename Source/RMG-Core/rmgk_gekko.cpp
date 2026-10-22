@@ -67,7 +67,11 @@
 
 namespace
 {
-constexpr unsigned int kGekkoStateCapacity = 24u * 1024u * 1024u;
+// FBNeo's packed CPS2 state measured ~564 KB; 2 MB leaves ~3.6x head room for
+// larger drivers while keeping each rollback buffer (and the copies GekkoNet
+// makes of it) small. The old 24 MB value was 42x the real state and is what
+// made multi-buffer allocation and per-save copies expensive.
+constexpr unsigned int kGekkoStateCapacity = 2u * 1024u * 1024u;
 constexpr int kGekkoMaxLoggedFrames = 600;
 constexpr int kGekkoWaitSleepUs = 1000;
 // PreciseWaitFor busy-spins this tail only; the remainder is a kernel sleep.
@@ -2593,7 +2597,14 @@ bool rmgk_gekko::start_p2p_session(const char* gameName, int players, int inputS
     config.input_prediction_window = static_cast<unsigned char>(clampedPredictionWindow);
     config.input_size = static_cast<unsigned int>(inputSize);
     config.state_size = kGekkoStateCapacity;
-    config.limited_saving = false;
+    // Limited saving keeps GekkoNet's state ring at 2 buffers instead of
+    // (input_prediction_window + 2) == 9, and stops it from saving the full
+    // emulator state every frame and every re-simulated frame. With the FBNeo
+    // state buffer sized at kGekkoStateCapacity that removes a full
+    // BurnStateCompress (scan + malloc + copy) per frame, which is what was
+    // cutting the frame rate and ballooning memory during netplay.
+    // GekkoNet disables desync detection when limited saving is on.
+    config.limited_saving = true;
     config.desync_detection = true;
     config.check_distance = 10;
     gekko_start(g_GekkoSession, &config);
@@ -2840,7 +2851,14 @@ bool rmgk_gekko::start_lobby_session(const char* gameName, int players, int inpu
     config.input_prediction_window = static_cast<unsigned char>(clampedPredictionWindow);
     config.input_size = static_cast<unsigned int>(inputSize);
     config.state_size = kGekkoStateCapacity;
-    config.limited_saving = false;
+    // Limited saving keeps GekkoNet's state ring at 2 buffers instead of
+    // (input_prediction_window + 2) == 9, and stops it from saving the full
+    // emulator state every frame and every re-simulated frame. With the FBNeo
+    // state buffer sized at kGekkoStateCapacity that removes a full
+    // BurnStateCompress (scan + malloc + copy) per frame, which is what was
+    // cutting the frame rate and ballooning memory during netplay.
+    // GekkoNet disables desync detection when limited saving is on.
+    config.limited_saving = true;
     config.desync_detection = true;
     config.check_distance = 10;
     gekko_start(g_GekkoSession, &config);
@@ -3069,7 +3087,14 @@ bool rmgk_gekko::start_local_session(const char* gameName, int players, int inpu
     config.input_prediction_window = static_cast<unsigned char>(predictionWindow);
     config.input_size = static_cast<unsigned int>(inputSize);
     config.state_size = kGekkoStateCapacity;
-    config.limited_saving = false;
+    // Limited saving keeps GekkoNet's state ring at 2 buffers instead of
+    // (input_prediction_window + 2) == 9, and stops it from saving the full
+    // emulator state every frame and every re-simulated frame. With the FBNeo
+    // state buffer sized at kGekkoStateCapacity that removes a full
+    // BurnStateCompress (scan + malloc + copy) per frame, which is what was
+    // cutting the frame rate and ballooning memory during netplay.
+    // GekkoNet disables desync detection when limited saving is on.
+    config.limited_saving = true;
     config.desync_detection = true;
     config.check_distance = 10;
     gekko_start(g_GekkoSession, &config);
