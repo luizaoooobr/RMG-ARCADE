@@ -58,11 +58,6 @@ void OnScreenDisplaySetCenterMessage(const std::string& message);
 // Pass an empty string to hide it.
 void OnScreenDisplaySetLiveReplayStatus(const std::string& message);
 
-// Sets persistent rollback/netplay stats text (rollback status, ping, FPS),
-// rendered as a small top-left overlay independent of the message stack.
-// Pass an empty string to hide it.
-void OnScreenDisplaySetNetplayStats(const std::string& message);
-
 // renders the OSD
 void OnScreenDisplayRender(void);
 
