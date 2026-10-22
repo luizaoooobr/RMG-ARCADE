@@ -69,7 +69,10 @@ namespace
 {
 constexpr unsigned int kGekkoStateCapacity = 24u * 1024u * 1024u;
 constexpr int kGekkoMaxLoggedFrames = 600;
-constexpr int kGekkoWaitSleepUs = 100;
+constexpr int kGekkoWaitSleepUs = 1000;
+// PreciseWaitFor busy-spins this tail only; the remainder is a kernel sleep.
+// Keep it well below kGekkoWaitSleepUs so a network stall does not pin a core.
+constexpr int kGekkoWaitSpinTailUs = 200;
 // Lightweight stall diagnostics: don't treat a wait as a stall until it exceeds a
 // normal sub-frame hitch (~a frame), then snapshot per-peer stats at a coarse
 // wall-clock cadence. This keeps a multi-second freeze down to a handful of log
@@ -2456,9 +2459,14 @@ int rollback_execute_begin_frame(void* userData)
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
 
+        // Stall wait between update_session polls. This is a network wait, not a
+        // sub-frame deadline: it must not burn a CPU core. PreciseWaitFor only
+        // busy-spins its spinTail; passing a tail equal to the whole duration
+        // (the old behaviour) meant 100% spin and pinned a core for the entire
+        // stall. Use a small spin tail and let the kernel sleep the bulk of it.
         rmgk::timing::PreciseWaitFor(
             std::chrono::microseconds{kGekkoWaitSleepUs},
-            std::chrono::microseconds{kGekkoWaitSleepUs});
+            std::chrono::microseconds{kGekkoWaitSpinTailUs});
 
         const long long traceWaitUs = timingEnabled
             ? std::chrono::duration_cast<std::chrono::microseconds>(
