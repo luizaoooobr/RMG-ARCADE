@@ -150,6 +150,7 @@ class MainWindow : public QMainWindow, private Ui::MainWindow
     int ui_UpdateSaveStateSlotTimerId = 0;
     int ui_CheckVideoSizeTimerId = 0;
     int ui_RollbackLivePumpTimerId = 0;
+    int ui_NetplayStatsTimerId = 0;
 
     int ui_LoadSaveStateSlotCounter = 0;
     int ui_LoadSaveStateSlotTimerId = -1;
@@ -259,6 +260,11 @@ class MainWindow : public QMainWindow, private Ui::MainWindow
     void removeActions(void);
 
     bool shouldBlockEmulationPauseForNetplay(void) const;
+
+    // Samples the core's live rollback/netplay session status (rollback active,
+    // peer ping, measured FPS) and pushes it to the OSD stats overlay. Called on
+    // a timer while emulation runs; clears the overlay when no session is up.
+    void updateNetplayStatsOverlay(void);
 
 #ifdef UPDATER
     void checkForUpdates(bool silent, bool force);

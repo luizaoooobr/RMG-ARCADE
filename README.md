@@ -2,7 +2,7 @@
 
 Rosalie's Mupen GUI is a free and open-source mupen64plus front-end written in C++.
 
-This fork is focused around netplay with the Kaillera protocol, supporting both traditional Kaillera servers and direct peer-to-peer connections. Available on Windows and Linux.
+This fork is focused around netplay with the Kaillera protocol, supporting both traditional Kaillera servers and direct peer-to-peer connections, and adds an embedded **FBNeo arcade core** so arcade sets can be played alongside N64 games. Available on Windows and Linux.
 
 
 
@@ -77,6 +77,32 @@ RMG-Input uses independent per-axis scaling similar to the Ownasaurus [USBtoN64v
 - Per-axis deadzone handling instead of circular deadzone
 
 <img width="919" height="793" alt="image" src="https://github.com/user-attachments/assets/6192636d-4bcb-4104-b08a-696dcb416e7d" />
+
+
+## Arcade (FBNeo)
+
+RMG-K embeds a headless [FBNeo](https://github.com/finalburnneo/FBNeo) core, so arcade sets run alongside your N64 games. Arcade ROM sets (zipped) appear in the ROM browser like any other game and launch through the FBNeo core, while `.n64`/`.z64`/`.v64` files still run on mupen64plus.
+
+### Game list
+- A **Type** filter in the game list (`Load Game`) separates `Cartridges` from `Arcade sets`.
+- The ROM browser shows the game format (`Cartridge` / `Arcade`) and info such as region and file.
+
+### Remapping arcade controls
+`Input -> Arcade -> Map Game Inputs...` opens the arcade input dialog:
+
+- **Per-game and Global bindings**: bindings are stored per driver, and a `Global` profile is shared by every game. A driver-specific binding overrides the global one.
+- **Pick a game**: when no arcade game is running, choose the driver from the `Game:` dropdown to map it ahead of time.
+- **Up to 4 players**, each on its own `Player N` tab, with a `Device` selector (`Automatic`, `Keyboard`, or a connected controller).
+- Select a row, press **Set**, then press the key/button to bind it. **Clear** removes the binding.
+
+#### Combo macros
+Macro inputs are listed next to the normal buttons, so a single key/button can trigger a whole combination:
+
+- **Capcom (Punch + Kick)**: `3x Punch`, `3x Kick`, `Weak PK`, `Medium PK`, `Strong PK`, `SP + WK`
+- **NeoGeo (Buttons A-D)**: `AB`, `AC`, `AD`, `BC`, `BD`, `CD`, `ABC`, `ABD`, `ACD`, `BCD`, `ABCD`
+
+### DIP switches
+`Input -> Arcade -> Set DIP Switches...` lists a driver's DIP switch groups (region, free play, difficulty, ...); select a group and change its setting. **Defaults** restores the factory settings. DIP switches are read-only during a synchronized netplay session.
 
 
 ## Building
@@ -171,6 +197,13 @@ RMG-K embeds a headless [FBNeo](https://github.com/finalburnneo/FBNeo) core for 
    ```
 
 `meson` must be on `PATH` (installed above as `mingw-w64-ucrt-x86_64-meson`). If `RMGK_FBNEO_DIR` has no `meson.build`, CMake prints a status message and skips the arcade core.
+
+**Vendored `rmgk` frontend overlay.** RMG-K does not build upstream FBNeo as-is: the embedded `-Dfrontend=lib` core needs a small headless frontend layer that upstream does not ship. That layer is vendored in this repository under `Source/3rdParty/fbneo-rmgk/overlay/` and copied over the FBNeo tree automatically during the CMake configure step (the files mirror the FBNeo source layout, so the overlay path maps 1:1 onto the checkout). It contains:
+
+- `src/burner/rmgk/` — the headless frontend translation unit (application callbacks/globals, savestate hooks, no-op video/audio/input/CD plugins) plus `tchar.h`.
+- `meson.build` and `src/burner/meson.build` — the only upstream build files that must change: they register the `lib → rmgk` frontend dir and select the reduced source set built for `-Dfrontend=lib`.
+
+Because the overlay is applied automatically, a **pristine** FBNeo clone is enough — no manual fork is required. The overlay also carries the deterministic-netplay switch `is_netgame_or_recording()` (read by the NeoGeo `uPD4990A` RTC seeding and `BurnRandom`): when RMG-Core sets it (rollback netplay, lobby, Kaillera), the RTC is pinned to a fixed date so both peers boot bit-identical; single-player keeps the real local clock. If you update FBNeo, keep the vendored `meson.build` files in sync (compare them against the new upstream ones before building).
 
 
 ## License

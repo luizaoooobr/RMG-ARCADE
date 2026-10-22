@@ -25,6 +25,7 @@
 
 #include "Directories.hpp"
 #include "Error.hpp"
+#include "Kaillera.hpp"
 #include "Library.hpp"
 #include "Settings.hpp"
 #ifdef NETPLAY
@@ -66,9 +67,16 @@
 
 namespace
 {
-constexpr unsigned int kGekkoStateCapacity = 24u * 1024u * 1024u;
+// FBNeo's packed CPS2 state measured ~564 KB; 2 MB leaves ~3.6x head room for
+// larger drivers while keeping each rollback buffer (and the copies GekkoNet
+// makes of it) small. The old 24 MB value was 42x the real state and is what
+// made multi-buffer allocation and per-save copies expensive.
+constexpr unsigned int kGekkoStateCapacity = 2u * 1024u * 1024u;
 constexpr int kGekkoMaxLoggedFrames = 600;
-constexpr int kGekkoWaitSleepUs = 100;
+constexpr int kGekkoWaitSleepUs = 1000;
+// PreciseWaitFor busy-spins this tail only; the remainder is a kernel sleep.
+// Keep it well below kGekkoWaitSleepUs so a network stall does not pin a core.
+constexpr int kGekkoWaitSpinTailUs = 200;
 // Lightweight stall diagnostics: don't treat a wait as a stall until it exceeds a
 // normal sub-frame hitch (~a frame), then snapshot per-peer stats at a coarse
 // wall-clock cadence. This keeps a multi-second freeze down to a handful of log
@@ -186,6 +194,12 @@ std::atomic_bool g_GekkoExecuting{false};
 std::atomic_bool g_GekkoStopRequested{false};
 std::vector<PendingGekkoSave> g_GekkoPendingSaves;
 
+// Live-stats sampling for the frontend OSD overlay. The emulation thread bumps
+// the visible-frame counter here (see rollback_visible_frame_complete); the UI
+// thread reads the counter and derives FPS over a short window. Only the
+// counter is atomic — the derived samplers live on the reading thread.
+std::atomic<uint64_t> g_GekkoVisibleFrameCount{0};
+
 // Slots (1-indexed) queued by request_disconnect_player() on another thread,
 // drained on the emulation thread before each frame's update_session. Guarded
 // by its own mutex so the lobby/UI thread can push without touching the
@@ -228,6 +242,24 @@ long long g_GekkoLastLoadStateUs = 0;
 long long g_GekkoLastSaveStateUs = 0;
 long long g_GekkoLastRunFrameUs = 0;
 long long g_GekkoLastPendingSaveUs = 0;
+
+// Checksum desync reported by GekkoNet for this session (config.desync_detection
+// is on). Surfaced through get_live_stats() so the frontend can warn the player,
+// instead of the event being silently dropped.
+bool g_GekkoDesyncDetected = false;
+int  g_GekkoDesyncFrame = -1;
+unsigned int g_GekkoDesyncLocalChecksum = 0;
+unsigned int g_GekkoDesyncRemoteChecksum = 0;
+
+// Rollback/"jitter" telemetry for the on-screen stats overlay. Updated on the
+// emulation thread each frame (apply_gekko_frame_pacing) and sampled by the
+// frontend through get_live_stats().
+float g_GekkoFramesAhead = 0.0f;
+int   g_GekkoJitterMs = 0;
+int   g_GekkoLastRollbackDepth = 0;
+int   g_GekkoLastRunaheadDepth = 0;
+int   g_GekkoFrameRollbackCount = 0;   // rollback advances seen since the last visible frame
+int   g_GekkoFrameRunaheadCount = 0;   // runahead advances seen since the last visible frame
 
 // ---------------------------------------------------------------------------
 // Buffered rollback pacing trace.
@@ -1266,17 +1298,29 @@ const char* gekko_game_event_name(GekkoGameEventType type)
 
 void log_session_events()
 {
-    if (!g_GekkoLogEnabled)
-    {
-        return;
-    }
-
     int count = 0;
     GekkoSessionEvent** events = gekko_session_events(g_GekkoSession, &count);
     for (int i = 0; i < count; i++)
     {
         GekkoSessionEvent* event = events[i];
         if (event == nullptr)
+        {
+            continue;
+        }
+
+        // Capture a checksum desync regardless of logging: GekkoNet compares
+        // per-frame state checksums and reports the first frame that diverges
+        // from a remote peer. The frontend reads this through get_live_stats()
+        // to warn the player, so it must not depend on the verbose log switch.
+        if (event->type == GekkoDesyncDetected)
+        {
+            g_GekkoDesyncDetected = true;
+            g_GekkoDesyncFrame = event->data.desynced.frame;
+            g_GekkoDesyncLocalChecksum = event->data.desynced.local_checksum;
+            g_GekkoDesyncRemoteChecksum = event->data.desynced.remote_checksum;
+        }
+
+        if (!g_GekkoLogEnabled)
         {
             continue;
         }
@@ -1485,7 +1529,24 @@ bool submit_local_input()
     const bool localOnlySession = g_GekkoRemoteHandle < 0 && g_GekkoLocalHandles.size() > 1;
     const int samplePlayers = localOnlySession ? g_GekkoPlayers : 1;
     std::vector<uint32_t> physicalInputs(static_cast<size_t>(std::max(samplePlayers, 1)), 0);
-    if (!CoreRollbackSampleInput(physicalInputs.data(), g_GekkoInputSize, samplePlayers))
+
+    // Replay/spectate: every seat's input comes from the .krec through n02's
+    // playback module (the same call the N64 PIF sync path uses). Physical
+    // devices must not be sampled here, otherwise the viewer's own controls
+    // would override the recorded match.
+    if (CoreIsKailleraPlaybackMode())
+    {
+        std::vector<uint32_t> playbackInputs(
+            static_cast<size_t>(std::max(g_GekkoPlayers, 4)), 0);
+        if (CoreModifyKailleraPlayValues(playbackInputs.data(), sizeof(uint32_t)) >= 0)
+        {
+            for (int i = 0; i < samplePlayers; i++)
+            {
+                physicalInputs[static_cast<size_t>(i)] = playbackInputs[static_cast<size_t>(i)];
+            }
+        }
+    }
+    else if (!CoreRollbackSampleInput(physicalInputs.data(), g_GekkoInputSize, samplePlayers))
     {
         write_gekko_log("add_local_input sample=fail");
         return false;
@@ -1797,6 +1858,47 @@ void apply_gekko_frame_pacing()
     g_RmgkTracePacingMode =
         static_cast<int>(g_GekkoPacingMode);
     g_RmgkTraceSampleFrame = isSampleFrame ? 1 : 0;
+
+    // Publish rollback/"jitter" telemetry for the on-screen stats overlay.
+    // This runs once per visible frame: roll backs that happened while
+    // processing the previous frame's events are folded into a single depth.
+    // frames_ahead is GekkoNet's delay-balanced error; jitter comes from the
+    // peer network stats, sampled less often since it changes slowly and the
+    // read walks the RTT history.
+    {
+        g_GekkoLastRollbackDepth = g_GekkoFrameRollbackCount;
+        g_GekkoLastRunaheadDepth = g_GekkoFrameRunaheadCount;
+
+        if ((g_GekkoPacingLogFrames % 15) == 0)
+        {
+            int jitterMs = 0;
+            for (int player = 1; player <= g_GekkoPlayers; player++)
+            {
+                if (player == g_GekkoLocalPlayer ||
+                    player > static_cast<int>(g_GekkoPlayerHandles.size()))
+                {
+                    continue;
+                }
+                const int handle = g_GekkoPlayerHandles[static_cast<size_t>(player - 1)];
+                if (handle < 0)
+                {
+                    continue;
+                }
+                GekkoNetworkStats netStats = {};
+                gekko_network_stats(g_GekkoSession, handle, &netStats);
+                const int value = static_cast<int>(netStats.jitter);
+                if (value > jitterMs)
+                {
+                    jitterMs = value;
+                }
+            }
+            g_GekkoJitterMs = jitterMs;
+        }
+        g_GekkoFramesAhead = framesAhead;
+
+        g_GekkoFrameRollbackCount = 0;
+        g_GekkoFrameRunaheadCount = 0;
+    }
 
     g_GekkoPacingLogFrames++;
     if (g_GekkoLogEnabled &&
@@ -2144,10 +2246,12 @@ int rollback_execute_begin_frame(void* userData)
                     if (event->data.adv.rolling_back)
                     {
                         summaryRollbackAdvanceCount++;
+                        g_GekkoFrameRollbackCount++;
                     }
                     if (event->data.adv.running_ahead)
                     {
                         summaryRunaheadAdvanceCount++;
+                        g_GekkoFrameRunaheadCount++;
                     }
                     const auto runFrameBeginTime = timingEnabled
                         ? std::chrono::steady_clock::now()
@@ -2359,9 +2463,14 @@ int rollback_execute_begin_frame(void* userData)
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
 
+        // Stall wait between update_session polls. This is a network wait, not a
+        // sub-frame deadline: it must not burn a CPU core. PreciseWaitFor only
+        // busy-spins its spinTail; passing a tail equal to the whole duration
+        // (the old behaviour) meant 100% spin and pinned a core for the entire
+        // stall. Use a small spin tail and let the kernel sleep the bulk of it.
         rmgk::timing::PreciseWaitFor(
             std::chrono::microseconds{kGekkoWaitSleepUs},
-            std::chrono::microseconds{kGekkoWaitSleepUs});
+            std::chrono::microseconds{kGekkoWaitSpinTailUs});
 
         const long long traceWaitUs = timingEnabled
             ? std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2488,7 +2597,14 @@ bool rmgk_gekko::start_p2p_session(const char* gameName, int players, int inputS
     config.input_prediction_window = static_cast<unsigned char>(clampedPredictionWindow);
     config.input_size = static_cast<unsigned int>(inputSize);
     config.state_size = kGekkoStateCapacity;
-    config.limited_saving = false;
+    // Limited saving keeps GekkoNet's state ring at 2 buffers instead of
+    // (input_prediction_window + 2) == 9, and stops it from saving the full
+    // emulator state every frame and every re-simulated frame. With the FBNeo
+    // state buffer sized at kGekkoStateCapacity that removes a full
+    // BurnStateCompress (scan + malloc + copy) per frame, which is what was
+    // cutting the frame rate and ballooning memory during netplay.
+    // GekkoNet disables desync detection when limited saving is on.
+    config.limited_saving = true;
     config.desync_detection = true;
     config.check_distance = 10;
     gekko_start(g_GekkoSession, &config);
@@ -2735,7 +2851,14 @@ bool rmgk_gekko::start_lobby_session(const char* gameName, int players, int inpu
     config.input_prediction_window = static_cast<unsigned char>(clampedPredictionWindow);
     config.input_size = static_cast<unsigned int>(inputSize);
     config.state_size = kGekkoStateCapacity;
-    config.limited_saving = false;
+    // Limited saving keeps GekkoNet's state ring at 2 buffers instead of
+    // (input_prediction_window + 2) == 9, and stops it from saving the full
+    // emulator state every frame and every re-simulated frame. With the FBNeo
+    // state buffer sized at kGekkoStateCapacity that removes a full
+    // BurnStateCompress (scan + malloc + copy) per frame, which is what was
+    // cutting the frame rate and ballooning memory during netplay.
+    // GekkoNet disables desync detection when limited saving is on.
+    config.limited_saving = true;
     config.desync_detection = true;
     config.check_distance = 10;
     gekko_start(g_GekkoSession, &config);
@@ -2964,7 +3087,14 @@ bool rmgk_gekko::start_local_session(const char* gameName, int players, int inpu
     config.input_prediction_window = static_cast<unsigned char>(predictionWindow);
     config.input_size = static_cast<unsigned int>(inputSize);
     config.state_size = kGekkoStateCapacity;
-    config.limited_saving = false;
+    // Limited saving keeps GekkoNet's state ring at 2 buffers instead of
+    // (input_prediction_window + 2) == 9, and stops it from saving the full
+    // emulator state every frame and every re-simulated frame. With the FBNeo
+    // state buffer sized at kGekkoStateCapacity that removes a full
+    // BurnStateCompress (scan + malloc + copy) per frame, which is what was
+    // cutting the frame rate and ballooning memory during netplay.
+    // GekkoNet disables desync detection when limited saving is on.
+    config.limited_saving = true;
     config.desync_detection = true;
     config.check_distance = 10;
     gekko_start(g_GekkoSession, &config);
@@ -3095,6 +3225,18 @@ void rmgk_gekko::close_session()
     g_GekkoMaxObservedFrame = -1;
     g_GekkoExecuting.store(false, std::memory_order_relaxed);
     g_GekkoPendingSaves.clear();
+    // Reset the checksum-desync report so a new session starts clean.
+    g_GekkoDesyncDetected = false;
+    g_GekkoDesyncFrame = -1;
+    g_GekkoDesyncLocalChecksum = 0;
+    g_GekkoDesyncRemoteChecksum = 0;
+    // Reset rollback/"jitter" telemetry for the on-screen stats overlay.
+    g_GekkoFramesAhead = 0.0f;
+    g_GekkoJitterMs = 0;
+    g_GekkoLastRollbackDepth = 0;
+    g_GekkoLastRunaheadDepth = 0;
+    g_GekkoFrameRollbackCount = 0;
+    g_GekkoFrameRunaheadCount = 0;
     // Reset spectate keyframe capture state for the next session.
     g_GekkoKeyframeRequested.store(false, std::memory_order_relaxed);
     g_GekkoKeyframePending = false;
@@ -3171,6 +3313,88 @@ bool rmgk_gekko::is_netplay_session_active()
 #else
     return false;
 #endif
+}
+
+GekkoLiveStats rmgk_gekko::get_live_stats()
+{
+    GekkoLiveStats out;
+
+#ifdef RMGK_HAVE_GEKKONET
+    if (g_GekkoSession == nullptr)
+    {
+        return out;
+    }
+
+    out.active = true;
+    out.netplay = g_GekkoRemoteHandle >= 0;
+
+    // Report the best (lowest) ping across remote peers; the overlay wants a
+    // single representative number and the local sim is gated by the slowest
+    // peer, but the best link is the one worth surfacing.
+    int bestPing = -1;
+    int bestAvgPing = -1;
+    for (int player = 1; player <= g_GekkoPlayers; player++)
+    {
+        if (player == g_GekkoLocalPlayer ||
+            player > static_cast<int>(g_GekkoPlayerHandles.size()))
+        {
+            continue;
+        }
+        const int handle = g_GekkoPlayerHandles[static_cast<size_t>(player - 1)];
+        if (handle < 0)
+        {
+            continue;
+        }
+        GekkoNetworkStats stats = {};
+        gekko_network_stats(g_GekkoSession, handle, &stats);
+        const int ping = static_cast<int>(stats.last_ping);
+        const int avgPing = static_cast<int>(stats.avg_ping);
+        if (bestPing < 0 || ping < bestPing)
+        {
+            bestPing = ping;
+        }
+        if (bestAvgPing < 0 || avgPing < bestAvgPing)
+        {
+            bestAvgPing = avgPing;
+        }
+    }
+    out.pingMs = bestPing < 0 ? 0 : bestPing;
+    out.avgPingMs = bestAvgPing < 0 ? 0 : bestAvgPing;
+#endif
+
+    // FPS from the visible-frame counter. Persisted sampler state means the UI
+    // can poll at any cadence; each call folds the frames seen since the
+    // previous call into an exponentially smoothed rate so the number is stable
+    // yet still reacts within a fraction of a second.
+    static uint64_t s_lastFrameCount = 0;
+    static std::chrono::steady_clock::time_point s_lastSample = std::chrono::steady_clock::now();
+    static double s_smoothedFps = 0.0;
+    const uint64_t frameCount = g_GekkoVisibleFrameCount.load(std::memory_order_relaxed);
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(now - s_lastSample).count();
+    if (elapsed >= 0.20)
+    {
+        const uint64_t delta = frameCount - s_lastFrameCount;
+        const double instantFps = static_cast<double>(delta) / elapsed;
+        // Seed on the first real sample, then ease toward the instantaneous rate.
+        s_smoothedFps = (s_smoothedFps <= 0.0) ? instantFps : (s_smoothedFps * 0.6 + instantFps * 0.4);
+        s_lastFrameCount = frameCount;
+        s_lastSample = now;
+    }
+    out.fps = s_smoothedFps;
+
+    out.desync = g_GekkoDesyncDetected;
+    out.desyncFrame = g_GekkoDesyncFrame;
+    out.desyncLocalChecksum = g_GekkoDesyncLocalChecksum;
+    out.desyncRemoteChecksum = g_GekkoDesyncRemoteChecksum;
+
+    // Rollback/"jitter" telemetry for the on-screen stats overlay.
+    out.framesAhead = g_GekkoFramesAhead;
+    out.jitterMs = g_GekkoJitterMs;
+    out.rollbackDepth = g_GekkoLastRollbackDepth;
+    out.runaheadDepth = g_GekkoLastRunaheadDepth;
+
+    return out;
 }
 
 
@@ -3410,6 +3634,8 @@ static void rollback_visible_frame_complete(
     const m64p_rollback_run_frame_stats* stats)
 {
     (void)userData;
+
+    g_GekkoVisibleFrameCount.fetch_add(1, std::memory_order_relaxed);
 
     if (!g_RmgkPacingTraceEnabled || stats == nullptr ||
         g_RmgkPacingTraceActiveRow == kRmgkPacingTraceInvalidRow ||

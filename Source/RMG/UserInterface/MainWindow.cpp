@@ -3518,6 +3518,17 @@ void MainWindow::timerEvent(QTimerEvent *event)
 
         this->killTimer(this->ui_LoadSaveStateSlotTimerId);
     }
+    else if (timerId == this->ui_NetplayStatsTimerId)
+    {
+        if (!this->emulationThread->isRunning())
+        {
+            this->killTimer(timerId);
+            this->ui_NetplayStatsTimerId = 0;
+            return;
+        }
+        this->updateNetplayStatsOverlay();
+        return;
+    }
 #ifdef NETPLAY
     else if (timerId == this->ui_RollbackLivePumpTimerId)
     {
@@ -4518,6 +4529,20 @@ void MainWindow::on_Lobby_SpectateLaunch(quint64 matchId, QString gameName)
     }
     this->ensureKailleraSessionManager();
     this->ui_SpectateCleanupPending = true;
+
+    // Arcade (FBNeo) matches carry no N64 netplay cheats, so flag the lobby dialog
+    // to accept a live replay whose settings manifest never arrived (an older lobby
+    // server may not relay it) rather than refusing to watch.
+    if (this->rollbackLobbyDialog != nullptr)
+    {
+        const QString spectateRomFile = this->findRomByName(gameName);
+        std::string fbneoShortName;
+        std::string fbneoFullName;
+        std::string fbneoRomId;
+        const bool spectateArcade = !spectateRomFile.isEmpty() &&
+            CoreGetFbneoRomInfo(spectateRomFile.toStdU32String(), fbneoShortName, fbneoFullName, fbneoRomId);
+        this->rollbackLobbyDialog->setSpectateArcadeTarget(spectateArcade);
+    }
 
     n02::activateMode(2);
     n02::playbackBeginStream();
@@ -5788,11 +5813,53 @@ void MainWindow::on_Action_Audio_ToggleVolumeMute(void)
     }
 }
 
+void MainWindow::updateNetplayStatsOverlay(void)
+{
+    const GekkoLiveStats stats = rmgk_gekko::get_live_stats();
+    if (!stats.active)
+    {
+        OnScreenDisplaySetNetplayStats("");
+        return;
+    }
+
+    const QString rollback = stats.netplay
+        ? QStringLiteral("ROLLBACK")
+        : QStringLiteral("LOCAL");
+    const QString ping = stats.netplay
+        ? QStringLiteral("%1ms").arg(stats.pingMs)
+        : QStringLiteral("--");
+    QString text =
+        QStringLiteral("%1\nPING: %2\nFPS: %3\nJITTER: %4ms\nAHEAD: %5\nRB: %6")
+            .arg(rollback)
+            .arg(ping)
+            .arg(stats.fps, 0, 'f', 0)
+            .arg(stats.netplay ? stats.jitterMs : 0)
+            .arg(stats.framesAhead, 0, 'f', 1)
+            .arg(stats.rollbackDepth);
+
+    if (stats.desync)
+    {
+        text += QStringLiteral("\nDESYNC @ frame %1\n  local=%2 remote=%3")
+            .arg(stats.desyncFrame)
+            .arg(stats.desyncLocalChecksum)
+            .arg(stats.desyncRemoteChecksum);
+    }
+
+    OnScreenDisplaySetNetplayStats(text.toStdString());
+}
+
 void MainWindow::on_Emulation_Started(void)
 {
     this->controllerStartupNotice.dismiss();
     this->updateControllerConnectionNotice();
     this->ui_FocusPausedEmulation = false;
+
+    // Poll the core for rollback/netplay status while a game runs; the overlay
+    // hides itself when no rollback session is active.
+    if (this->ui_NetplayStatsTimerId == 0)
+    {
+        this->ui_NetplayStatsTimerId = this->startTimer(250);
+    }
 
     // only clear log dialog when we've gone over the limit
     if (this->logDialog.GetLineCount() >= 500000)
@@ -5890,6 +5957,13 @@ void MainWindow::on_Emulation_Finished(bool ret, QString error)
         this->killTimer(this->ui_CheckVideoSizeTimerId);
         this->ui_CheckVideoSizeTimerId = 0;
     }
+
+    if (this->ui_NetplayStatsTimerId != 0)
+    {
+        this->killTimer(this->ui_NetplayStatsTimerId);
+        this->ui_NetplayStatsTimerId = 0;
+    }
+    OnScreenDisplaySetNetplayStats("");
 
     if (this->ui_QuitAfterEmulation)
     {
