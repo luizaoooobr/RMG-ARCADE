@@ -788,21 +788,46 @@ void OnScreenDisplayRender(void)
 
     if (hasNetplayStats)
     {
-        ImGui::SetNextWindowPos(ImVec2(overlayLeftX, overlayTopY),
-                                ImGuiCond_Always, ImVec2(0.0f, 0.0f));
-        ImGui::Begin("OSD Netplay Stats", nullptr,
-            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration |
-            ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
-            ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoFocusOnAppearing);
-        // Smaller than the ordinary OSD text: this is a glanceable readout.
-        ImGui::SetWindowFontScale(0.85f);
-        ImGui::TextUnformatted(netplayStats.c_str());
-        ImGui::SetWindowFontScale(1.0f);
-        const ImVec2 windowSize = ImGui::GetWindowSize();
-        ImGui::End();
-        overlayTopY += windowSize.y;
+        // Drawn straight onto the foreground draw list instead of as an ImGui
+        // window: no background panel, no decoration, no per-frame window
+        // layout. The readout is a glanceable corner label, so a plain text
+        // overlay is both lighter and closer to what we want on top of a game.
+        constexpr float statsScale = 0.85f;
+        const float lineHeight = ImGui::GetTextLineHeight() * statsScale;
+        ImDrawList* drawList = ImGui::GetForegroundDrawList();
+        const float textX = overlayLeftX;
+        float textY = overlayTopY;
+
+        const char* lineBegin = netplayStats.c_str();
+        while (*lineBegin != '\0')
+        {
+            const char* lineEnd = lineBegin;
+            while (*lineEnd != '\0' && *lineEnd != '\n')
+            {
+                lineEnd++;
+            }
+            const std::string line(lineBegin, lineEnd);
+
+            // Draw a 1px dark offset copy first so the text stays readable over
+            // bright game pixels without needing a filled background box.
+            const ImU32 shadowColor = IM_COL32(0, 0, 0, 200);
+            drawList->AddText(nullptr, lineHeight, ImVec2(textX + 1.0f, textY + 1.0f),
+                              shadowColor, line.c_str());
+            drawList->AddText(nullptr, lineHeight, ImVec2(textX, textY),
+                              IM_COL32(255, 255, 255, 255), line.c_str());
+
+            textY += lineHeight;
+            if (*lineEnd == '\0')
+            {
+                break;
+            }
+            lineBegin = lineEnd + 1;
+        }
+
+        const float statsHeight = textY - overlayTopY;
+        overlayTopY += statsHeight;
         if (l_MessagePosition == 1)
-            offsetY += windowSize.y * stackSpacingFactor;
+            offsetY += statsHeight * stackSpacingFactor;
     }
 
     if (l_InputPromptActive)
