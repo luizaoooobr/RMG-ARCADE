@@ -17,6 +17,33 @@
 #include <string>
 #include <vector>
 
+// Live status of the rollback/netplay session, sampled from the emulation
+// thread and read by the frontend for the on-screen stats overlay. Filled by
+// rmgk_gekko::get_live_stats(); a snapshot, so it is safe to read from the
+// render thread while a game runs.
+struct GekkoLiveStats
+{
+    bool active = false;     // a GekkoNet session is running
+    bool netplay = false;    // session has at least one remote peer
+    int  pingMs = 0;         // best (lowest) current peer ping, milliseconds
+    int  avgPingMs = 0;      // best (lowest) average peer ping, milliseconds
+    double fps = 0.0;        // visible frames per second measured by the core
+    bool desync = false;     // a checksum desync was detected this session
+    int  desyncFrame = -1;   // frame GekkoNet reported the desync at
+    unsigned int desyncLocalChecksum = 0;   // local checksum at the desync frame
+    unsigned int desyncRemoteChecksum = 0;  // remote checksum at the desync frame
+
+    // Rollback/"jitter" telemetry for the on-screen stats overlay. framesAhead
+    // is GekkoNet's delay-balanced frame error (positive = locally ahead); a
+    // negative value means the local sim is catching up. jitterMs is the peer's
+    // measured network jitter. rollbackDepth is how many frames were re-
+    // simulated on the last visible frame.
+    float framesAhead = 0.0f;
+    int   jitterMs = 0;
+    int   rollbackDepth = 0;          // frames rolled back on the last visible frame
+    int   runaheadDepth = 0;          // frames run ahead on the last visible frame
+};
+
 // Describes one remote peer in a lobby-driven session. Each non-local
 // slot needs its own endpoint — GekkoNet's gekko_add_actor takes a
 // per-actor address, and in a 3-/4-player room every remote talks to
@@ -66,6 +93,11 @@ class rmgk_gekko
     // a no-op if there's no active session or the slot isn't a remote.
     static void request_disconnect_player(int slot);
     static bool is_netplay_session_active();
+    // Thread-safe snapshot of the current session's live status (rollback
+    // active, remote-peer ping, measured FPS) for the frontend stats overlay.
+    // Safe to call from the render/UI thread; returns an inactive snapshot when
+    // no session is running.
+    static GekkoLiveStats get_live_stats();
     static bool execute();
     // Rollback presentation pacer. The core invokes this through the video
     // plugin rendering callback immediately before OpenGL or Vulkan presents.

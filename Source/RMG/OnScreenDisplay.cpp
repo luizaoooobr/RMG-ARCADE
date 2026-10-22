@@ -81,6 +81,12 @@ static bool l_LiveReplayStatusEnabled = false;
 static std::string l_LiveReplayStatus;
 static std::mutex l_LiveReplayStatusMutex;
 
+// Persistent rollback/netplay stats overlay (top-left, small text). Fed by the
+// frontend from the core's live session snapshot. Hidden while empty.
+static bool l_NetplayStatsEnabled = false;
+static std::string l_NetplayStats;
+static std::mutex l_NetplayStatsMutex;
+
 static float OnScreenDisplayEaseOutCubic(float t)
 {
     t = std::clamp(t, 0.0f, 1.0f);
@@ -617,6 +623,12 @@ void OnScreenDisplaySetLiveReplayStatus(const std::string& message)
     l_LiveReplayStatus = message;
 }
 
+void OnScreenDisplaySetNetplayStats(const std::string& message)
+{
+    std::lock_guard<std::mutex> lock(l_NetplayStatsMutex);
+    l_NetplayStats = message;
+}
+
 void OnScreenDisplayRender(void)
 {
     if (!l_Initialized || l_RenderingPaused)
@@ -674,11 +686,18 @@ void OnScreenDisplayRender(void)
         std::lock_guard<std::mutex> lock(l_LiveReplayStatusMutex);
         liveReplayStatus = l_LiveReplayStatus;
     }
+    std::string netplayStats;
+    {
+        std::lock_guard<std::mutex> lock(l_NetplayStatsMutex);
+        netplayStats = l_NetplayStats;
+    }
     const bool hasPortLabels = l_KailleraPortLabelsEnabled && l_KailleraPortLabelPlayerCount > 0;
     const bool hasCenterMessage = !l_CenterMessage.empty();
     const bool hasLiveReplayStatus = l_LiveReplayStatusEnabled && !liveReplayStatus.empty();
+    const bool hasNetplayStats = !netplayStats.empty();
     const bool hasMessages = l_Enabled && (hasVisibleQueueMessage || l_InputPromptActive ||
-                                           hasPortLabels || hasCenterMessage || hasLiveReplayStatus);
+                                           hasPortLabels || hasCenterMessage || hasLiveReplayStatus ||
+                                           hasNetplayStats);
 
     if (!hasMessages)
     {
@@ -765,6 +784,50 @@ void OnScreenDisplayRender(void)
         // Other configured anchors have their own space and need no offset.
         if (l_MessagePosition == 1)
             offsetY += windowSize.y * stackSpacingFactor;
+    }
+
+    if (hasNetplayStats)
+    {
+        // Drawn straight onto the foreground draw list instead of as an ImGui
+        // window: no background panel, no decoration, no per-frame window
+        // layout. The readout is a glanceable corner label, so a plain text
+        // overlay is both lighter and closer to what we want on top of a game.
+        constexpr float statsScale = 0.85f;
+        const float lineHeight = ImGui::GetTextLineHeight() * statsScale;
+        ImDrawList* drawList = ImGui::GetForegroundDrawList();
+        const float textX = overlayLeftX;
+        float textY = overlayTopY;
+
+        const char* lineBegin = netplayStats.c_str();
+        while (*lineBegin != '\0')
+        {
+            const char* lineEnd = lineBegin;
+            while (*lineEnd != '\0' && *lineEnd != '\n')
+            {
+                lineEnd++;
+            }
+            const std::string line(lineBegin, lineEnd);
+
+            // Draw a 1px dark offset copy first so the text stays readable over
+            // bright game pixels without needing a filled background box.
+            const ImU32 shadowColor = IM_COL32(0, 0, 0, 200);
+            drawList->AddText(nullptr, lineHeight, ImVec2(textX + 1.0f, textY + 1.0f),
+                              shadowColor, line.c_str());
+            drawList->AddText(nullptr, lineHeight, ImVec2(textX, textY),
+                              IM_COL32(255, 255, 255, 255), line.c_str());
+
+            textY += lineHeight;
+            if (*lineEnd == '\0')
+            {
+                break;
+            }
+            lineBegin = lineEnd + 1;
+        }
+
+        const float statsHeight = textY - overlayTopY;
+        overlayTopY += statsHeight;
+        if (l_MessagePosition == 1)
+            offsetY += statsHeight * stackSpacingFactor;
     }
 
     if (l_InputPromptActive)
