@@ -65,6 +65,10 @@
 #include <thread>
 #include <vector>
 
+// Keep external linkage: FbneoRuntime.cpp logs the rollback sound-state
+// snapshot/replay diagnostics through this file's sink.
+void write_gekko_log(const std::string& message);
+
 namespace
 {
 // FBNeo's packed CPS2 state measured ~564 KB; 2 MB leaves ~3.6x head room for
@@ -1069,16 +1073,8 @@ void append_gekko_log_line(const std::string& message)
     }
 }
 
-void write_gekko_log(const std::string& message)
-{
-    if (!g_GekkoLogEnabled)
-    {
-        return;
-    }
-
-    append_gekko_log_line(message);
-}
-
+// write_gekko_log is defined after the anonymous namespace closes (external
+// linkage; see the forward declaration near the top of this file).
 // Stall-diagnostics writer: fires when EITHER verbose logging or the lightweight
 // stall-only toggle is on, so stall records show up in both modes (and in the
 // stall-only mode they are the only thing written). Same one-line-append shape as
@@ -2677,6 +2673,16 @@ int rollback_execute_end_frame(void* userData)
 }
 #endif
 } // namespace
+
+void write_gekko_log(const std::string& message)
+{
+    if (!g_GekkoLogEnabled)
+    {
+        return;
+    }
+
+    append_gekko_log_line(message);
+}
 
 bool rmgk_gekko::start_p2p_session(const char* gameName, int players, int inputSize,
     int localPlayer, unsigned short localPort, const char* remoteIp, unsigned short remotePort, int localDelay, int predictionWindow)

@@ -54,23 +54,51 @@ extern INT32 BurnStateDecompress(UINT8* Def, INT32 nDefLen, INT32 bAll);
 // audible voices (SFX overlap "toca-discos" on netplay).
 extern INT32 RMGK_FBNEO_SndStateSnapshot();
 extern INT32 RMGK_FBNEO_SndStateReplay();
+// Diagnostics sink (rmgk_gekko.cpp): one line per snapshot/replay so a test
+// session proves whether the rollback audio patch actually fired.
+extern void write_gekko_log(const std::string& message);
 
 static int      rmgkSndAudioFramesEmitted = 0;   // audible-history depth (gates the snapshot)
 static bool     rmgkSndPending            = false;
 static long long rmgkSndPendingUs         = 0;
 static int      rmgkSndRestores           = 0;
+static int      rmgkSndSnapshots          = 0;
+static int      rmgkSndSnapshotFails      = 0;
+static int      rmgkSndReplayFails        = 0;
+static int      rmgkSndGateSkips          = 0;
+static bool     rmgkSndGateLogged         = false;
+
+static void rmgkSndLog(const std::string& message)
+{
+    write_gekko_log("rmgk " + message);
+}
 
 static bool rmgkSndArm()
 {
     // Only arm once ~0.75s of audible history has passed so startup savestate
     // loads never replay garbage/pre-init chip state.
-    if (rmgkSndAudioFramesEmitted < 45) return false;
-    if (RMGK_FBNEO_SndStateSnapshot() > 0)
+    if (rmgkSndAudioFramesEmitted < 45)
     {
+        rmgkSndGateSkips++;
+        if (!rmgkSndGateLogged)
+        {
+            rmgkSndGateLogged = true;
+            rmgkSndLog("snd_snapshot skip gate frames=" +
+                       std::to_string(rmgkSndAudioFramesEmitted));
+        }
+        return false;
+    }
+    const INT32 snap = RMGK_FBNEO_SndStateSnapshot();
+    if (snap > 0)
+    {
+        rmgkSndSnapshots++;
+        rmgkSndLog("snd_snapshot result=ok len=" + std::to_string((long long)snap));
         const auto now = std::chrono::steady_clock::now().time_since_epoch();
         rmgkSndPendingUs = (long long)std::chrono::duration_cast<std::chrono::microseconds>(now).count();
         return true;
     }
+    rmgkSndSnapshotFails++;
+    rmgkSndLog("snd_snapshot result=fail code=" + std::to_string((long long)snap));
     return false;
 }
 
@@ -83,9 +111,22 @@ static void rmgkSndMaybeReplay()
     // A stale snapshot (e.g. captured at session teardown then re-arm never
     // happened) must not replay on an unrelated session: snapshots only stay
     // valid for one rollback batch (a few ms), allow a generous 2s.
-    if (nowUs - rmgkSndPendingUs > 2000000LL) return;    // drop stale
-    RMGK_FBNEO_SndStateReplay();
+    if (nowUs - rmgkSndPendingUs > 2000000LL)
+    {
+        rmgkSndLog("snd_replay result=drop_stale");
+        return;    // drop stale
+    }
+    const INT32 r = RMGK_FBNEO_SndStateReplay();
     rmgkSndRestores++;
+    if (r == 0)
+    {
+        rmgkSndLog("snd_replay result=ok");
+    }
+    else
+    {
+        rmgkSndReplayFails++;
+        rmgkSndLog("snd_replay result=fail code=" + std::to_string((long long)r));
+    }
 }
 
 // Global variable at global scope: the Itanium ABI does not mangle these, so the
