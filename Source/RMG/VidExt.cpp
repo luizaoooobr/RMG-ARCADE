@@ -1097,8 +1097,8 @@ struct FbneoAudioTraceState
     // Lines are buffered in memory and written when the audio stream closes.
     // Flushing one byte-line per second from inside the present callback showed
     // up as ~38 ms disk-write spikes once per second on the present path
-    // (93 present-phase spikes in the 22:21 pacing CSV ≈ the 91 trace ticks),
-    // costing +1.3 ms/frame on average and pushing the loop to 56.6 fps —
+    // (93 present-phase spikes in the 22:21 pacing CSV - the 91 trace ticks),
+    // costing +1.3 ms/frame on average and pushing the loop to 56.6 fps -
     // which starved the audio queue and read as repeating netplay audio.
     std::vector<std::string> pending;
     Uint64        windowStartNs = 0;
@@ -1114,6 +1114,18 @@ struct FbneoAudioTraceState
     Uint64        repeats = 0;
     Uint64        lastRepeats = 0;
     Uint32        lastHash = 0;
+    // Far-repeat detector: same chunk content re-pushed after a gap (the
+    // "record skipping / echo on top of itself" audible pattern). Open-addressed
+    // table hash -> last seq; gap>1 counts as a far repeat. Zero-silence chunks
+    // are skipped because they legitimately repeat forever.
+    static const int kSeenSlots = 8192;
+    Uint32        seenHash[kSeenSlots] = {};
+    Uint64        seenSeq[kSeenSlots]  = {};
+    Uint64        farRepeats = 0;
+    Uint64        lastFarRepeats = 0;
+    Uint64        farGapMin = 0;
+    Uint64        farGapMax = 0;
+    Uint64        farWindowBaseSeq = 0;
 };
 
 static FbneoAudioTraceState s_FbneoAudioTrace;
@@ -1145,6 +1157,8 @@ static void FbneoAudioTraceTick(const Uint64 nowNs)
         s_FbneoAudioTrace.clears - s_FbneoAudioTrace.lastClears;
     const Sint64 newRepeats =
         s_FbneoAudioTrace.repeats - s_FbneoAudioTrace.lastRepeats;
+    const Sint64 newFarRepeats =
+        s_FbneoAudioTrace.farRepeats - s_FbneoAudioTrace.lastFarRepeats;
     const double maxGapMs =
         static_cast<double>(s_FbneoAudioTrace.maxGapNs) / 1e6;
 
@@ -1173,15 +1187,18 @@ static void FbneoAudioTraceTick(const Uint64 nowNs)
                 static_cast<unsigned int>(static_cast<uint16_t>(rec.s2)) & 0xffff,
                 static_cast<unsigned int>(static_cast<uint16_t>(rec.s3)) & 0xffff);
         }
-        char line[1120];
+        char line[1280];
         SDL_snprintf(line, sizeof(line),
-            "t_ns=%llu fps=%d samples_s=%lld queue=%llu clears=%lld repeats=%lld gapmax=%.1f ratio=%.4f hash=%s\n",
+            "t_ns=%llu fps=%d samples_s=%lld queue=%llu clears=%lld repeats=%lld far=%lld farmin=%llu farmax=%llu gapmax=%.1f ratio=%.4f hash=%s\n",
             static_cast<unsigned long long>(nowNs),
             static_cast<int>(pushesPerSec + 0.5),
             s_FbneoAudioTrace.windowSamples,
             static_cast<unsigned long long>(queueBytes),
             newClears,
             newRepeats,
+            newFarRepeats,
+            static_cast<unsigned long long>(s_FbneoAudioTrace.farGapMin),
+            static_cast<unsigned long long>(s_FbneoAudioTrace.farGapMax),
             maxGapMs,
             static_cast<double>(s_ratio),
             used > 0 ? hashStr + 1 : hashStr);
@@ -1193,6 +1210,10 @@ static void FbneoAudioTraceTick(const Uint64 nowNs)
     s_FbneoAudioTrace.windowStartNs = nowNs;
     s_FbneoAudioTrace.lastClears = s_FbneoAudioTrace.clears;
     s_FbneoAudioTrace.lastRepeats = s_FbneoAudioTrace.repeats;
+    s_FbneoAudioTrace.lastFarRepeats = s_FbneoAudioTrace.farRepeats;
+    s_FbneoAudioTrace.farGapMin = 0;
+    s_FbneoAudioTrace.farGapMax = 0;
+    s_FbneoAudioTrace.farWindowBaseSeq = s_FbneoAudioTrace.pushSeq;
     s_FbneoAudioTrace.maxGapNs = 0;
     s_FbneoAudioTrace.windowPushes = 0;
     s_FbneoAudioTrace.windowSamples = 0;
@@ -1250,6 +1271,16 @@ static void FbneoAudioTraceFlush()
     s_FbneoAudioTrace.lastPushNs = 0;
     s_FbneoAudioTrace.lastHash = 0;
     s_FbneoAudioTrace.next = 0;
+    s_FbneoAudioTrace.farRepeats = 0;
+    s_FbneoAudioTrace.lastFarRepeats = 0;
+    s_FbneoAudioTrace.farGapMin = 0;
+    s_FbneoAudioTrace.farGapMax = 0;
+    s_FbneoAudioTrace.farWindowBaseSeq = 0;
+    for (int i = 0; i < s_FbneoAudioTrace.kSeenSlots; i++)
+    {
+        s_FbneoAudioTrace.seenHash[i] = 0;
+        s_FbneoAudioTrace.seenSeq[i] = 0;
+    }
     for (FbneoAudioPushRecord& rec : s_FbneoAudioTrace.recent)
     {
         rec = FbneoAudioPushRecord{};
@@ -2002,6 +2033,54 @@ static void FbneoPushAudio(const int16_t* audio, int audioFrames)
         rec.s2 = n > 2 ? static_cast<int>(audio[n / 2]) : 0;
         rec.s3 = n > 3 ? static_cast<int>(audio[n - 1]) : 0;
         s_FbneoAudioTrace.lastPushNs = nowNs;
+        if (peak > 0)
+        {
+            const Uint32 start = hash % 8192u;
+            Uint32 probe = start;
+            bool inserted = false;
+            for (int step = 0; step < 16 && !inserted; step++)
+            {
+                if (s_FbneoAudioTrace.seenSeq[probe] == 0 ||
+                    s_FbneoAudioTrace.seenHash[probe] == hash ||
+                    s_FbneoAudioTrace.pushSeq -
+                        s_FbneoAudioTrace.seenSeq[probe] > 16384)
+                {
+                    // Expired or new slot claims are safe to store here even
+                    // mid-chain because the chain is walked from the bucket.
+                    if (s_FbneoAudioTrace.seenHash[probe] == hash)
+                    {
+                        const Uint64 gap =
+                            s_FbneoAudioTrace.pushSeq -
+                            s_FbneoAudioTrace.seenSeq[probe];
+                        if (gap > 1 && s_FbneoAudioTrace.seenSeq[probe] >=
+                                s_FbneoAudioTrace.farWindowBaseSeq)
+                        {
+                            s_FbneoAudioTrace.farRepeats += 1;
+                        }
+                        if (gap > 1 &&
+                            (s_FbneoAudioTrace.farGapMin == 0 ||
+                               gap < s_FbneoAudioTrace.farGapMin))
+                        {
+                            s_FbneoAudioTrace.farGapMin = gap;
+                        }
+                        if (gap > s_FbneoAudioTrace.farGapMax)
+                        {
+                            s_FbneoAudioTrace.farGapMax = gap;
+                        }
+                    }
+                    s_FbneoAudioTrace.seenHash[probe] = hash;
+                    s_FbneoAudioTrace.seenSeq[probe] = s_FbneoAudioTrace.pushSeq;
+                    inserted = true;
+                }
+                probe = (probe + 1) % 8192u;
+            }
+            if (!inserted)
+            {
+                // Table full in window: replace the home bucket.
+                s_FbneoAudioTrace.seenHash[start] = hash;
+                s_FbneoAudioTrace.seenSeq[start] = s_FbneoAudioTrace.pushSeq;
+            }
+        }
         if (rec.gapNs > s_FbneoAudioTrace.maxGapNs)
         {
             s_FbneoAudioTrace.maxGapNs = rec.gapNs;
