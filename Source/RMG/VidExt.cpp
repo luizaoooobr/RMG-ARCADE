@@ -1131,6 +1131,10 @@ static void FbneoAudioTraceTick(const Uint64 nowNs)
     const double pushesPerSec =
         static_cast<double>(s_FbneoAudioTrace.windowPushes) *
         1e9 / static_cast<double>(windowNs);
+    const Uint64 queueBytes =
+        s_FbneoAudioStream != nullptr
+            ? SDL_GetAudioStreamQueued(s_FbneoAudioStream)
+            : 0;
     const Sint64 newClears =
         s_FbneoAudioTrace.clears - s_FbneoAudioTrace.lastClears;
     const Sint64 newRepeats =
