@@ -35,6 +35,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -1724,6 +1725,16 @@ static void FbneoPushAudio(const int16_t* audio, int audioFrames)
         return;
     }
 
+    // The netcode paces visible frames at the timesync scale (0.99..1.01), so the
+    // number of samples pushed per real second is not exactly the declared 48000
+    // (e.g. 805 samples/frame at 59.0 fps = 47.5k/s starves the device and makes
+    // netplay audio glitch/repeat, while pacing at 60.6 fps pushes 48.8k/s and
+    // overflows the queue). Measure the real push rate over a rolling window and
+    // feed the delta into the stream's frequency ratio: the queue then drains at
+    // exactly the push rate and the pitch shift stays under 1%.
+    static Uint64 s_windowStartNs = 0;
+    static Sint64 s_windowSamples = 0;
+    static float  s_ratio = 1.0f;
     if (s_FbneoAudioStream == nullptr)
     {
         if (!SDL_InitSubSystem(SDL_INIT_AUDIO))
@@ -1753,9 +1764,39 @@ static void FbneoPushAudio(const int16_t* audio, int audioFrames)
         SDL_ResumeAudioStreamDevice(s_FbneoAudioStream);
         fprintf(stderr, "[FBNEO-DBG] audio: opened S16 stereo 48000 stream\n");
         fflush(stderr);
+        s_windowStartNs = 0;
+        s_windowSamples = 0;
     }
 
     const int len = audioFrames * 2 * (int)sizeof(int16_t);
+
+    // overflows the queue). Measure the real push rate over a rolling window and
+    // feed the delta into the stream's frequency ratio: the queue then drains at
+    // exactly the push rate and the pitch shift stays under 1%.
+    const Uint64 nowNs = SDL_GetTicksNS();
+    if (s_windowStartNs == 0)
+    {
+        s_windowStartNs = nowNs;
+        s_windowSamples = 0;
+    }
+    s_windowSamples += audioFrames;
+    const Uint64 windowNs = nowNs - s_windowStartNs;
+    if (windowNs >= 500000000)
+    {
+        if (s_windowSamples > 0)
+        {
+            float target = (float)(((double)s_windowSamples * 1e9) / ((double)windowNs * 48000.0));
+            if (target < 0.90f) target = 0.90f;
+            if (target > 1.10f) target = 1.10f;
+            if (std::abs(target - s_ratio) * 48000.0f > 24.0f)
+            {
+                s_ratio = target;
+                SDL_SetAudioStreamFrequencyRatio(s_FbneoAudioStream, s_ratio);
+            }
+        }
+        s_windowStartNs = nowNs;
+        s_windowSamples = 0;
+    }
 
     // Keep latency bounded: if the core ever runs ahead of the device (e.g. during
     // fast-forward or a slow first frame), drop the backlog instead of drifting.

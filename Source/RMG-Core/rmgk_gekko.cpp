@@ -77,6 +77,12 @@ constexpr int kGekkoWaitSleepUs = 1000;
 // PreciseWaitFor busy-spins this tail only; the remainder is a kernel sleep.
 // Keep it well below kGekkoWaitSleepUs so a network stall does not pin a core.
 constexpr int kGekkoWaitSpinTailUs = 200;
+// Spin tail for the presentation pacer. The waitable timer fires up to ~0.5 ms
+// late on Windows (strictly depending on system timer resolution), which at
+// 60 Hz made the real netplay loop run at ~59.0 fps and starved the audio
+// device. Spinning the last stretch after the timer fires costs ~4% of one
+// core and keeps the pacer deadline within a few tens of microseconds.
+constexpr int kGekkoPresentPacerSpinTailUs = 700;
 // Lightweight stall diagnostics: don't treat a wait as a stall until it exceeds a
 // normal sub-frame hitch (~a frame), then snapshot per-peer stats at a coarse
 // wall-clock cadence. This keeps a multi-second freeze down to a handful of log
@@ -3626,7 +3632,7 @@ void rmgk_gekko::pace_before_present()
             std::chrono::microseconds{
                 std::min<long long>(
                     waitRequestedUs,
-                    100)});
+                    kGekkoPresentPacerSpinTailUs)});
 
         now = std::chrono::steady_clock::now();
 
