@@ -724,19 +724,13 @@ static INT32 __cdecl rmgkSndLoadAcbFiltered(struct BurnArea* pba)
 	return rmgkSndLoadAcb(pba);
 }
 
-// Capture the sound-chip state (save; blob kept internally). Returns the blob
-// size in bytes, or < 0 when this driver family is unsupported / capture failed.
-// ORDER MATTERS and must mirror RMGK_FBNEO_SndStateReplay 1:1: the shared HP-DMA
-// areas (CpsZRamC0/F0: the 68K->Z80 command mailbox + Z80 work RAM for the
-// QSound family) are saved AFTER the chip scan so the Z80's catch-up after a
-// rollback restore stops re-sending already-played sound commands.
-// Capture the sound-chip state (save; blob kept internally). Returns the blob
-// size in bytes, or < 0 when this driver family is unsupported / capture failed.
-// ORDER MATTERS and must mirror RMGK_FBNEO_SndStateReplay 1:1: the shared HP-DMA
-// areas (CpsZRamC0/F0: the 68K->Z80 command mailbox + Z80 work RAM for the
-// QSound family) are saved AFTER the chip scan so the Z80's catch-up after a
-// rollback restore stops re-sending already-played sound commands.
-INT32 RMGK_FBNEO_SndStateSnapshot()
+// Capture the sound-chip state (save; blob goes into the active cursor buffer).
+// Returns the blob size in bytes, or < 0 when this driver family is unsupported.
+// ORDER MATTERS and must mirror rmgkSndRestoreBody 1:1: the shared HP-DMA areas
+// (CpsZRamC0/F0: the 68K->Z80 command mailbox + Z80 work RAM for the QSound
+// family) are saved AFTER the chip scan so the Z80's catch-up after a rollback
+// restore stops re-sending already-played sound commands.
+static INT32 rmgkSndCaptureBody(void)
 {
 	rmgkSndLen    = 0;
 	rmgkSndCursor = 0;
@@ -781,8 +775,9 @@ INT32 RMGK_FBNEO_SndStateSnapshot()
 	return rmgkSndLen;
 }
 
-// Restore the last captured sound-chip state (load). Returns 0 on success.
-INT32 RMGK_FBNEO_SndStateReplay()
+// Restore a captured sound-chip state (load) from the active cursor buffer.
+// Returns 0 on success.
+static INT32 rmgkSndRestoreBody(void)
 {
 	if (rmgkSndLen <= 0 || rmgkSndBuf == nullptr) return -1;
 
@@ -822,4 +817,95 @@ INT32 RMGK_FBNEO_SndStateReplay()
 		return -2;
 	}
 	return 0;
+}
+
+// One-shot capture into an external buffer: the Acbs above write through the
+// file-scope globals, so the active triple is swapped while the body runs.
+static INT32 rmgkSndCaptureTo(UINT8** pBuf, INT32* pCap, INT32* pLen)
+{
+	UINT8* saveBuf = rmgkSndBuf;
+	INT32  saveCap = rmgkSndCap;
+	INT32  saveLen = rmgkSndLen;
+	rmgkSndBuf = *pBuf;
+	rmgkSndCap = *pCap;
+	const INT32 r = rmgkSndCaptureBody();
+	*pBuf = rmgkSndBuf;
+	*pCap = rmgkSndCap;
+	*pLen = rmgkSndLen;
+	rmgkSndBuf = saveBuf;
+	rmgkSndCap = saveCap;
+	rmgkSndLen = saveLen;
+	return r;
+}
+
+static INT32 rmgkSndRestoreFrom(UINT8* buf, INT32 len)
+{
+	UINT8* saveBuf = rmgkSndBuf;
+	INT32  saveCap = rmgkSndCap;
+	INT32  saveLen = rmgkSndLen;
+	rmgkSndBuf = buf;
+	rmgkSndCap = len;
+	rmgkSndLen = len;
+	const INT32 r = rmgkSndRestoreBody();
+	rmgkSndBuf = saveBuf;
+	rmgkSndCap = saveCap;
+	rmgkSndLen = saveLen;
+	return r;
+}
+
+// ---------------------------------------------------------------------------
+// Audible-frontier shadow
+//
+// The state that must survive a rollback is the sound state at the END of the
+// last frame actually pushed to the listener. Between audible frames the
+// netcode runs speculative Output_None frames: during those the Z80 and the
+// 68K->Z80 mailbox keep advancing, but the sound chips' render position does
+// not (XxxUpdate is only called when pBurnSoundOut != nullptr). So the state at
+// load time sits K frames ahead of the audible stream (K = prediction depth),
+// which is exactly the K-frame echo/periodicity measured on netplay captures.
+// Keep a shadow captured right after every audible frame and restore THAT.
+// ---------------------------------------------------------------------------
+static UINT8* rmgkSndShadowBuf   = nullptr;
+static INT32  rmgkSndShadowCap   = 0;
+static INT32  rmgkSndShadowLen   = 0;
+static bool   rmgkSndShadowValid = false;
+static bool   rmgkSndShadowStale = false;
+
+// Load-time capture (kept as the fallback when no shadow exists yet, e.g. the
+// first rollback right after the gate opens).
+INT32 RMGK_FBNEO_SndStateSnapshot()
+{
+	return rmgkSndCaptureTo(&rmgkSndBuf, &rmgkSndCap, &rmgkSndLen);
+}
+
+// Capture the audible frontier. Called right after each audible frame.
+void RMGK_FBNEO_SndStateShadowCapture()
+{
+	const INT32 r = rmgkSndCaptureTo(&rmgkSndShadowBuf, &rmgkSndShadowCap, &rmgkSndShadowLen);
+	rmgkSndShadowValid = (r > 0);
+	rmgkSndShadowStale = false;
+}
+
+// A rollback load rewound the emu: from now on the shadow is the frontier.
+void RMGK_FBNEO_SndStateMarkLoad()
+{
+	rmgkSndShadowStale = true;
+}
+
+INT32 RMGK_FBNEO_SndStateShadowLength()
+{
+	return rmgkSndShadowValid ? rmgkSndShadowLen : -1;
+}
+
+int RMGK_FBNEO_SndStateShadowUsed()
+{
+	return (rmgkSndShadowValid && rmgkSndShadowStale) ? 1 : 0;
+}
+
+INT32 RMGK_FBNEO_SndStateReplay()
+{
+	if (rmgkSndShadowValid && rmgkSndShadowStale) {
+		return rmgkSndRestoreFrom(rmgkSndShadowBuf, rmgkSndShadowLen);
+	}
+	return rmgkSndRestoreBody();
 }

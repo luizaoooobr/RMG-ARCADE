@@ -54,6 +54,10 @@ extern INT32 BurnStateDecompress(UINT8* Def, INT32 nDefLen, INT32 bAll);
 // audible voices (SFX overlap "toca-discos" on netplay).
 extern INT32 RMGK_FBNEO_SndStateSnapshot();
 extern INT32 RMGK_FBNEO_SndStateReplay();
+extern void  RMGK_FBNEO_SndStateShadowCapture();
+extern void  RMGK_FBNEO_SndStateMarkLoad();
+extern INT32 RMGK_FBNEO_SndStateShadowLength();
+extern int   RMGK_FBNEO_SndStateShadowUsed();
 // Diagnostics sink (rmgk_gekko.cpp): one line per snapshot/replay so a test
 // session proves whether the rollback audio patch actually fired.
 extern void write_gekko_log(const std::string& message);
@@ -116,11 +120,15 @@ static void rmgkSndMaybeReplay()
         rmgkSndLog("snd_replay result=drop_stale");
         return;    // drop stale
     }
+    const INT32 shadowLen = RMGK_FBNEO_SndStateShadowLength();
+    const bool  useShadow = RMGK_FBNEO_SndStateShadowUsed() != 0;
     const INT32 r = RMGK_FBNEO_SndStateReplay();
     rmgkSndRestores++;
     if (r == 0)
     {
-        rmgkSndLog("snd_replay result=ok");
+        rmgkSndLog(std::string("snd_replay result=ok via=") +
+                   (useShadow ? "shadow" : "snapshot") +
+                   " len=" + std::to_string((long long)shadowLen));
     }
     else
     {
@@ -1341,6 +1349,9 @@ bool LoadState(const unsigned char* buffer, int len)
     {
         rmgkSndPending = rmgkSndArm();
     }
+    // The emu is about to rewind: the shadow (audible frontier) is now the
+    // state that must be restored after the resim batch completes.
+    RMGK_FBNEO_SndStateMarkLoad();
     return BurnStateDecompress((UINT8*)buffer, len, 1) == 0;
 }
 
@@ -1429,6 +1440,13 @@ bool RunFrame(int flags)
 
     auto t0 = clock_::now();
     BurnDrvFrame();
+    // Audible frames are the rollback sound frontier: keep the exact chip state
+    // they ended on. Speculative (Output_None) frames below advance the sound
+    // CPUs without rendering, so a load-time capture would be K frames ahead.
+    if (audioOutput)
+    {
+        RMGK_FBNEO_SndStateShadowCapture();
+    }
     g_stats = {};
     g_stats.total_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
         clock_::now() - t0).count();
