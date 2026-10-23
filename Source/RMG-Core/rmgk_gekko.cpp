@@ -207,6 +207,13 @@ std::atomic<uint64_t> g_GekkoVisibleFrameCount{0};
 std::mutex g_GekkoDisconnectMutex;
 std::vector<int> g_GekkoPendingDisconnectSlots;
 std::mutex g_GekkoLogMutex;
+// The emulation thread logs ~5 lines per netplay frame. Opening and closing the
+// file per line (the old behaviour) put a CreateFile/CloseFile cycle plus any
+// antivirus filter callback directly on the frame path — measured as end_frame
+// spikes of 93..345 ms in csv pacing traces. One persistent handle + per-line
+// flush keeps the log live at ~1/100th of the cost.
+std::ofstream g_GekkoLogStream;
+std::filesystem::path g_GekkoLogStreamPath;
 std::filesystem::path g_GekkoLogDirectory;
 std::string g_GekkoLogPrefix;
 int g_GekkoLogFrames = 0;
@@ -367,6 +374,16 @@ struct RmgkPacingTraceRow
     long long endTotalUs = 0;
     long long pendingSaveUs = 0;
     long long debugEndUs = 0;
+
+    long long loopBeginEntryUs = 0;
+    long long loopBeginExitUs = 0;
+    long long loopPacerExitUs = 0;
+    long long loopRunFrameEntryUs = 0;
+    long long loopRunFrameExitUs = 0;
+    long long loopPresentEntryUs = 0;
+    long long loopPresentExitUs = 0;
+    long long loopEndEntryUs = 0;
+    long long loopEndExitUs = 0;
 };
 
 std::vector<RmgkPacingTraceRow> g_RmgkPacingTraceRows;
@@ -400,6 +417,28 @@ std::chrono::steady_clock::time_point g_RollbackPresentLastSwapTime;
 std::chrono::steady_clock::time_point g_RollbackPresentTargetTime;
 std::chrono::steady_clock::time_point g_RollbackPresentHookReturnTime;
 bool g_RollbackPresentHookReturnValid = false;
+
+// Full-loop-iteration phase marks (absolute steady_clock microseconds since
+// epoch), recorded once per visible frame at well-defined points around the
+// Execute() loop so the unaccounted gap between the pacing hook and SwapBuffers
+// can be split into: hook->RunFrame, RunFrame, RunFrame->present, present,
+// present->end_frame, end_frame, end_frame->next hook.
+enum RmgkLoopMark
+{
+    kRmgkLoopMarkBeginEntry = 0,
+    kRmgkLoopMarkBeginExit,
+    kRmgkLoopMarkPacerExit,
+    kRmgkLoopMarkRunFrameEntry,
+    kRmgkLoopMarkRunFrameExit,
+    kRmgkLoopMarkPresentEntry,
+    kRmgkLoopMarkPresentExit,
+    kRmgkLoopMarkEndEntry,
+    kRmgkLoopMarkEndExit,
+    kRmgkLoopMarkCount
+};
+
+std::atomic<long long> g_RmgkLoopMarks[kRmgkLoopMarkCount];
+bool g_RmgkLoopMarksValid = false;
 
 void reset_rollback_present_pacer()
 {
@@ -541,7 +580,11 @@ void rmgk_pacing_trace_flush()
             << "visible_cached_code_range_invalidate_count,"
             << "visible_pif_sync_count,visible_pif_sync_us,"
             << "visible_pif_input_callback_us,visible_pif_controller_reads,"
-            << "end_total_us,pending_save_us,debug_end_us\n";
+            << "end_total_us,pending_save_us,debug_end_us,"
+            << "loop_begin_entry_us,loop_begin_exit_us,loop_pacer_exit_us,"
+            << "loop_runframe_entry_us,loop_runframe_exit_us,"
+            << "loop_present_entry_us,loop_present_exit_us,"
+            << "loop_end_entry_us,loop_end_exit_us\n";
 
         file << std::fixed << std::setprecision(9);
 
@@ -632,7 +675,16 @@ void rmgk_pacing_trace_flush()
                 << row.visiblePifControllerReads << ','
                 << row.endTotalUs << ','
                 << row.pendingSaveUs << ','
-                << row.debugEndUs
+                << row.debugEndUs << ','
+                << row.loopBeginEntryUs << ','
+                << row.loopBeginExitUs << ','
+                << row.loopPacerExitUs << ','
+                << row.loopRunFrameEntryUs << ','
+                << row.loopRunFrameExitUs << ','
+                << row.loopPresentEntryUs << ','
+                << row.loopPresentExitUs << ','
+                << row.loopEndEntryUs << ','
+                << row.loopEndExitUs
                 << '\n';
         }
     }
@@ -761,6 +813,28 @@ void rmgk_pacing_trace_end_frame(
     row.endTotalUs = endTotalUs;
     row.pendingSaveUs = pendingSaveUs;
     row.debugEndUs = debugEndUs;
+
+    if (g_RmgkLoopMarksValid)
+    {
+        row.loopBeginEntryUs =
+            g_RmgkLoopMarks[kRmgkLoopMarkBeginEntry].load(std::memory_order_relaxed);
+        row.loopBeginExitUs =
+            g_RmgkLoopMarks[kRmgkLoopMarkBeginExit].load(std::memory_order_relaxed);
+        row.loopPacerExitUs =
+            g_RmgkLoopMarks[kRmgkLoopMarkPacerExit].load(std::memory_order_relaxed);
+        row.loopRunFrameEntryUs =
+            g_RmgkLoopMarks[kRmgkLoopMarkRunFrameEntry].load(std::memory_order_relaxed);
+        row.loopRunFrameExitUs =
+            g_RmgkLoopMarks[kRmgkLoopMarkRunFrameExit].load(std::memory_order_relaxed);
+        row.loopPresentEntryUs =
+            g_RmgkLoopMarks[kRmgkLoopMarkPresentEntry].load(std::memory_order_relaxed);
+        row.loopPresentExitUs =
+            g_RmgkLoopMarks[kRmgkLoopMarkPresentExit].load(std::memory_order_relaxed);
+        row.loopEndEntryUs =
+            g_RmgkLoopMarks[kRmgkLoopMarkEndEntry].load(std::memory_order_relaxed);
+        row.loopEndExitUs =
+            g_RmgkLoopMarks[kRmgkLoopMarkEndExit].load(std::memory_order_relaxed);
+    }
 
     g_RmgkPacingTraceActiveRow =
         kRmgkPacingTraceInvalidRow;
@@ -944,9 +1018,12 @@ void reset_gekko_log()
 
     std::lock_guard<std::mutex> lock(g_GekkoLogMutex);
     const std::filesystem::path path = get_gekko_log_path();
-    std::ofstream file(path, std::ios::out | std::ios::trunc);
-    file << "RMG-K GekkoNet log (verbose=" << (g_GekkoLogEnabled ? 1 : 0)
+    g_GekkoLogStream.close();
+    g_GekkoLogStreamPath = path;
+    g_GekkoLogStream.open(path, std::ios::out | std::ios::trunc);
+    g_GekkoLogStream << "RMG-K GekkoNet log (verbose=" << (g_GekkoLogEnabled ? 1 : 0)
          << " stall_only=" << ((g_GekkoStallLogEnabled && !g_GekkoLogEnabled) ? 1 : 0) << ")\n";
+    g_GekkoLogStream.flush();
     g_GekkoLogFrames = 0;
     g_GekkoLastSubmittedInput = 0xffffffffu;
     g_GekkoLastLatchedInput.clear();
@@ -962,6 +1039,30 @@ void reset_gekko_log()
     g_GekkoLastPendingSaveUs = 0;
 }
 
+// Shared append path for both log writers. The stream is opened once and kept
+// open for the session; each line is flushed so log content stays consistent
+// with the pacing trace without a per-line open/close cycle.
+void append_gekko_log_line(const std::string& message)
+{
+    std::lock_guard<std::mutex> lock(g_GekkoLogMutex);
+    const std::filesystem::path path = get_gekko_log_path();
+    if (g_GekkoLogStream.is_open() && g_GekkoLogStreamPath != path)
+    {
+        g_GekkoLogStream.close();
+    }
+    if (!g_GekkoLogStream.is_open())
+    {
+        g_GekkoLogStreamPath = path;
+        g_GekkoLogStream.open(path, std::ios::out | std::ios::app);
+    }
+    if (g_GekkoLogStream.is_open())
+    {
+        g_GekkoLogStream << "core_frame=" << CoreGetCurrentFrameCount()
+                         << " " << message << "\n";
+        g_GekkoLogStream.flush();
+    }
+}
+
 void write_gekko_log(const std::string& message)
 {
     if (!g_GekkoLogEnabled)
@@ -969,10 +1070,7 @@ void write_gekko_log(const std::string& message)
         return;
     }
 
-    std::lock_guard<std::mutex> lock(g_GekkoLogMutex);
-    const std::filesystem::path path = get_gekko_log_path();
-    std::ofstream file(path, std::ios::out | std::ios::app);
-    file << "core_frame=" << CoreGetCurrentFrameCount() << " " << message << "\n";
+    append_gekko_log_line(message);
 }
 
 // Stall-diagnostics writer: fires when EITHER verbose logging or the lightweight
@@ -986,10 +1084,7 @@ void write_gekko_stall_log(const std::string& message)
         return;
     }
 
-    std::lock_guard<std::mutex> lock(g_GekkoLogMutex);
-    const std::filesystem::path path = get_gekko_log_path();
-    std::ofstream file(path, std::ios::out | std::ios::app);
-    file << "core_frame=" << CoreGetCurrentFrameCount() << " " << message << "\n";
+    append_gekko_log_line(message);
 }
 
 #ifdef RMGK_HAVE_P2P_TRANSPORT
@@ -1954,6 +2049,12 @@ void process_pending_disconnects()
 int rollback_execute_begin_frame(void* userData)
 {
     (void)userData;
+    if (g_RmgkPacingTraceEnabled)
+    {
+        g_RmgkLoopMarks[kRmgkLoopMarkBeginEntry].store(
+            rmgk_pacing_trace_now_us(), std::memory_order_relaxed);
+        g_RmgkLoopMarksValid = true;
+    }
     const bool timingEnabled =
         g_GekkoLogEnabled || g_RmgkPacingTraceEnabled;
     const auto beginTime = timingEnabled
@@ -2433,6 +2534,12 @@ int rollback_execute_begin_frame(void* userData)
                     std::chrono::steady_clock::now() - beginTime).count()
                 : 0;
 
+            if (g_RmgkPacingTraceEnabled)
+            {
+                g_RmgkLoopMarks[kRmgkLoopMarkBeginExit].store(
+                    rmgk_pacing_trace_now_us(), std::memory_order_relaxed);
+            }
+
             rmgk_pacing_trace_begin_frame(
                 summaryEventCount,
                 summarySaveCount,
@@ -2486,6 +2593,11 @@ int rollback_execute_begin_frame(void* userData)
 int rollback_execute_end_frame(void* userData)
 {
     (void)userData;
+    if (g_RmgkPacingTraceEnabled)
+    {
+        g_RmgkLoopMarks[kRmgkLoopMarkEndEntry].store(
+            rmgk_pacing_trace_now_us(), std::memory_order_relaxed);
+    }
     const bool timingEnabled =
         g_GekkoLogEnabled || g_RmgkPacingTraceEnabled;
     const auto beginTime = timingEnabled
@@ -2528,6 +2640,12 @@ int rollback_execute_end_frame(void* userData)
         ? std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - beginTime).count()
         : 0;
+
+    if (g_RmgkPacingTraceEnabled)
+    {
+        g_RmgkLoopMarks[kRmgkLoopMarkEndExit].store(
+            rmgk_pacing_trace_now_us(), std::memory_order_relaxed);
+    }
 
     rmgk_pacing_trace_end_frame(
         traceEndTotalUs,
@@ -3572,6 +3690,31 @@ void rmgk_gekko::pace_before_present()
 #endif
 }
 
+void rmgk_gekko::trace_loop_mark(int which)
+{
+#if defined(RMGK_HAVE_GEKKONET)
+    if (!g_RmgkPacingTraceEnabled ||
+        which < 0 || which >= kRmgkLoopMarkCount)
+    {
+        return;
+    }
+
+    g_RmgkLoopMarks[which].store(
+        rmgk_pacing_trace_now_us(),
+        std::memory_order_relaxed);
+    g_RmgkLoopMarksValid = true;
+#else
+    (void)which;
+#endif
+}
+
+// C-linkage hook so the low-level FBNeo runtime loop (FbneoRuntime::Execute)
+// can drop full-loop-iteration phase marks without pulling in rmgk_gekko.hpp.
+extern "C" void rmgk_gekko_trace_loop_mark(int which)
+{
+    rmgk_gekko::trace_loop_mark(which);
+}
+
 void rmgk_gekko::trace_swap_duration(
     long long swapUs,
     long long makeCurrentUs,
@@ -3626,6 +3769,8 @@ static void rollback_pace_before_present(void* userData)
         g_RollbackPresentHookReturnTime =
             std::chrono::steady_clock::now();
         g_RollbackPresentHookReturnValid = true;
+        g_RmgkLoopMarks[kRmgkLoopMarkPacerExit].store(
+            rmgk_pacing_trace_now_us(), std::memory_order_relaxed);
     }
 }
 

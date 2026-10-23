@@ -106,6 +106,12 @@ class rmgk_gekko
     // Buffered rollback-pacing trace hook used by VidExt.cpp.
     // No-op unless Rollback -> Logging -> Pacing Trace is enabled.
     static void trace_swap_duration(long long swapUs, long long makeCurrentUs, int path);
+
+    // Full-loop-iteration phase mark for the pacing trace. `which` indexes the
+    // RmgkLoopMark enum (begin entry/exit, pacer exit, RunFrame entry/exit,
+    // present entry/exit, end entry/exit). The core calls this from Execute()
+    // around each callback slot; no-op unless the pacing trace is enabled.
+    static void trace_loop_mark(int which);
     static bool set_deterministic(bool enabled);
     static bool install_core_input_callback();
     static void clear_core_input_callback();

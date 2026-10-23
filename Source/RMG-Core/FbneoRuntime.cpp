@@ -53,6 +53,11 @@ extern INT32 BurnStateDecompress(UINT8* Def, INT32 nDefLen, INT32 bAll);
 // is_netgame_or_recording(). Must be set BEFORE fbneo_rt::Initialize().
 extern int nRMGKNetgameMode;
 
+// Full-loop-iteration phase mark (defined in rmgk_gekko.cpp). Indices mirror
+// RmgkLoopMark: 3 = RunFrame entry, 4 = RunFrame exit, 5 = present entry,
+// 6 = present exit. No-op unless the pacing trace is enabled.
+extern "C" void rmgk_gekko_trace_loop_mark(int which);
+
 // The zip helpers live in src/burner/zipfn.cpp, which the lib frontend links in.
 // Same story as above: C++ linkage, so no extern "C". ZipGetList()/ZipLoadFile()
 // let BurnExtLoadRom resolve a ROM by CRC and copy it *clamped* to the driver's
@@ -1340,12 +1345,18 @@ bool Execute(const m64p_rollback_execute_callbacks& callbacks)
         if (r != 1) break;
         if (callbacks.pace_before_present)
             callbacks.pace_before_present(callbacks.user_data);
+        rmgk_gekko_trace_loop_mark(3);
         RunFrame(Output_Video | Output_Audio);
+        rmgk_gekko_trace_loop_mark(4);
         debug_maybe_dump_frame();
         if (g_presentCallback)
+        {
+            rmgk_gekko_trace_loop_mark(5);
             g_presentCallback(g_videoFrame.pixels, g_videoFrame.width, g_videoFrame.height,
                               g_videoFrame.pitch, g_orientationFlags,
                               g_soundBuffer.data(), g_soundFrames, g_presentUser);
+            rmgk_gekko_trace_loop_mark(6);
+        }
         if (callbacks.visible_frame_complete)
             callbacks.visible_frame_complete(callbacks.user_data, &g_stats);
         if (callbacks.end_frame && callbacks.end_frame(callbacks.user_data) == 0)
