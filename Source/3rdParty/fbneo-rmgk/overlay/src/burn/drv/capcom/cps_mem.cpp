@@ -641,9 +641,10 @@ static void rmgkSndReserve(INT32 extra)
 
 static INT32 __cdecl rmgkSndSaveAcb(struct BurnArea* pba)
 {
-	if (rmgkSndBuf == nullptr) return 1;
 	UINT32 h = rmgkSndHash(pba->szName);
 	INT32 need = (INT32)(sizeof(UINT32) * 2 + pba->nLen);
+	// Reserve FIRST: the buffer only exists after the first reserve, so any
+	// check before this call sees nullptr and the whole capture stays empty.
 	rmgkSndReserve(need);
 	if (rmgkSndBuf == nullptr || rmgkSndLen + need > rmgkSndCap) return 1;
 
