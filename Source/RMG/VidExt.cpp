@@ -1126,6 +1126,12 @@ struct FbneoAudioTraceState
     Uint64        farGapMin = 0;
     Uint64        farGapMax = 0;
     Uint64        farWindowBaseSeq = 0;
+    // Rolling raw-audio dump of everything pushed to the SDL stream (last ~90 s
+    // kept in RAM, written once at stream close). Env RMGK_FBNEO_AUDIO_DUMP=0
+    // disables. Lets the exact pushed PCM be listened to / analyzed offline.
+    std::vector<int16_t> dumpPcm;
+    bool          dumpTrimmed = false;
+    Uint64        dumpFrames = 0;
 };
 
 static FbneoAudioTraceState s_FbneoAudioTrace;
@@ -1236,6 +1242,75 @@ static std::filesystem::path FbneoAudioTracePath()
     return std::filesystem::path(prefix + "_audio_trace.log");
 }
 
+static void FbneoAudioDumpWriteWav()
+{
+    if (s_FbneoAudioTrace.dumpPcm.empty())
+    {
+        return;
+    }
+    const char* dirEnv = std::getenv("RMGK_ROLLBACK_LOG_DIR");
+    std::string prefix = "fbneo_audio";
+    const char* prefixEnv = std::getenv("RMGK_ROLLBACK_LOG_PREFIX");
+    if (prefixEnv != nullptr && prefixEnv[0] != 0)
+    {
+        prefix = prefixEnv;
+    }
+    std::filesystem::path path;
+    if (dirEnv != nullptr && dirEnv[0] != 0)
+    {
+        path = std::filesystem::path(dirEnv) / (prefix + "_audio_dump.wav");
+    }
+    else
+    {
+        path = prefix + "_audio_dump.wav";
+    }
+    std::ofstream out(path, std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!out.is_open())
+    {
+        return;
+    }
+    const unsigned int sampleRate = 48000;
+    const unsigned short channels = 2;
+    const unsigned short bitsPerSample = 16;
+    const unsigned int dataLen =
+        static_cast<unsigned int>(s_FbneoAudioTrace.dumpPcm.size()) * 2u;
+    unsigned char hdr[44];
+    hdr[0] = 'R';  hdr[1] = 'I';  hdr[2] = 'F';  hdr[3] = 'F';
+    Uint32 riff = 36u + dataLen;
+    memcpy(hdr + 4, &riff, 4);
+    memcpy(hdr + 8, "WAVEfmt ", 8);
+    Uint32 fmtLen = 16u;
+    memcpy(hdr + 12, &fmtLen, 4);
+    unsigned short fmtPcm = 1u;
+    memcpy(hdr + 16, &fmtPcm, 2);
+    memcpy(hdr + 18, &channels, 2);
+    memcpy(hdr + 20, &sampleRate, 4);
+    Uint32 byteRate = sampleRate * channels * (bitsPerSample / 8);
+    memcpy(hdr + 24, &byteRate, 4);
+    unsigned short blockAlign = channels * (bitsPerSample / 8);
+    memcpy(hdr + 28, &blockAlign, 2);
+    memcpy(hdr + 30, &bitsPerSample, 2);
+    memcpy(hdr + 34, "data", 4);
+    memcpy(hdr + 36, &dataLen, 4);
+    out.write(reinterpret_cast<const char*>(hdr), 44);
+    out.write(reinterpret_cast<const char*>(s_FbneoAudioTrace.dumpPcm.data()),
+        static_cast<std::streamsize>(s_FbneoAudioTrace.dumpPcm.size() * 2));
+    if (!s_FbneoAudioTrace.pending.empty() &&
+        s_FbneoAudioTrace.pending.back().size() > 0)
+    {
+        // Append a marker to the trace so the dump's coverage is documented.
+        char tail[128];
+        SDL_snprintf(tail, sizeof(tail),
+            "audio_dump frames=%llu trimmed=%d\n",
+            static_cast<unsigned long long>(s_FbneoAudioTrace.dumpFrames),
+            s_FbneoAudioTrace.dumpTrimmed ? 1 : 0);
+        s_FbneoAudioTrace.pending.push_back(tail);
+    }
+    s_FbneoAudioTrace.dumpPcm.clear();
+    s_FbneoAudioTrace.dumpFrames = 0;
+    s_FbneoAudioTrace.dumpTrimmed = false;
+}
+
 // Writes the buffered trace lines in one shot. Called when the audio stream is
 // torn down, so a mid-match disk write can never spike the present path.
 static void FbneoAudioTraceFlush()
@@ -1244,6 +1319,7 @@ static void FbneoAudioTraceFlush()
     {
         return;
     }
+    FbneoAudioDumpWriteWav();
     std::ofstream out(FbneoAudioTracePath(), std::ios::out | std::ios::trunc);
     if (!out.is_open())
     {
@@ -2033,6 +2109,25 @@ static void FbneoPushAudio(const int16_t* audio, int audioFrames)
         rec.s2 = n > 2 ? static_cast<int>(audio[n / 2]) : 0;
         rec.s3 = n > 3 ? static_cast<int>(audio[n - 1]) : 0;
         s_FbneoAudioTrace.lastPushNs = nowNs;
+        // Rolling dump: keep the last ~90 s of pushed PCM in RAM.
+        if (!std::getenv("RMGK_FBNEO_AUDIO_DUMP") ||
+            std::strcmp(std::getenv("RMGK_FBNEO_AUDIO_DUMP"), "0") != 0)
+        {
+            const size_t samples = static_cast<size_t>(len / 2);
+            s_FbneoAudioTrace.dumpPcm.insert(
+                s_FbneoAudioTrace.dumpPcm.end(), audio, audio + samples);
+            s_FbneoAudioTrace.dumpFrames += 1;
+            const size_t cap = 90ull * 48000ull * 2ull; // 90 s stereo
+            const size_t block = 48000ull * 2ull;
+            if (s_FbneoAudioTrace.dumpPcm.size() > cap + block)
+            {
+                s_FbneoAudioTrace.dumpPcm.erase(
+                    s_FbneoAudioTrace.dumpPcm.begin(),
+                    s_FbneoAudioTrace.dumpPcm.begin() +
+                        (s_FbneoAudioTrace.dumpPcm.size() - cap));
+                s_FbneoAudioTrace.dumpTrimmed = true;
+            }
+        }
         if (peak > 0)
         {
             const Uint32 start = hash % 8192u;
