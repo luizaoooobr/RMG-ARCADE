@@ -679,24 +679,96 @@ static INT32 __cdecl rmgkSndLoadAcb(struct BurnArea* pba)
 	return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Generic driver support (every non-CPS family)
+//
+// For non-CPS drivers the sound-chip state is spread over the driver walk and
+// the MAME-style registered chip states (FM cores etc). The generic capture
+// walks BurnAreaScan (registered state + driver AreaScan in one pass) and
+// keeps only areas whose name matches the family's allow-list; CPU/palette/
+// sprite/NVRAM state stays untouched so the resimmed logic is preserved.
+// ---------------------------------------------------------------------------
+static const char* rmgkSndNeoNames[] = {
+	"Z80 RAM",
+	"Z80 program RAM",
+	"ADPCM sample RAM",
+	"YM2610",
+	"nSoundLatch",
+	"nSoundReply",
+	"nSoundStatus",
+	"nCyclesExtra",
+	"nZ80Bank",
+	"bZ80BoardROMBankedIn",
+	"bZ80NMIEnable",
+	"nIRQAcknowledge",
+	NULL,
+};
+
+static bool rmgkSndNameAllowed(const char* szName)
+{
+	for (const char** keep = rmgkSndNeoNames; *keep != NULL; keep++) {
+		if (strncmp(szName, *keep, strlen(*keep)) == 0) return true;
+	}
+	return false;
+}
+
+static INT32 __cdecl rmgkSndSaveAcbFiltered(struct BurnArea* pba)
+{
+	if (!rmgkSndNameAllowed(pba->szName)) return 0;
+	return rmgkSndSaveAcb(pba);
+}
+
+static INT32 __cdecl rmgkSndLoadAcbFiltered(struct BurnArea* pba)
+{
+	if (!rmgkSndNameAllowed(pba->szName)) return 0;
+	return rmgkSndLoadAcb(pba);
+}
+
 // Capture the sound-chip state (save; blob kept internally). Returns the blob
 // size in bytes, or < 0 when this driver family is unsupported / capture failed.
+// ORDER MATTERS and must mirror RMGK_FBNEO_SndStateReplay 1:1: the shared HP-DMA
+// areas (CpsZRamC0/F0: the 68K->Z80 command mailbox + Z80 work RAM for the
+// QSound family) are saved AFTER the chip scan so the Z80's catch-up after a
+// rollback restore stops re-sending already-played sound commands.
+// Capture the sound-chip state (save; blob kept internally). Returns the blob
+// size in bytes, or < 0 when this driver family is unsupported / capture failed.
+// ORDER MATTERS and must mirror RMGK_FBNEO_SndStateReplay 1:1: the shared HP-DMA
+// areas (CpsZRamC0/F0: the 68K->Z80 command mailbox + Z80 work RAM for the
+// QSound family) are saved AFTER the chip scan so the Z80's catch-up after a
+// rollback restore stops re-sending already-played sound commands.
 INT32 RMGK_FBNEO_SndStateSnapshot()
 {
-	if (CpsMem == NULL) return -1;
-
 	rmgkSndLen    = 0;
 	rmgkSndCursor = 0;
 	rmgkSndBad    = false;
 
 	INT32 (__cdecl* oldAcb)(struct BurnArea*) = BurnAcb;
-	BurnAcb = rmgkSndSaveAcb;
 	INT32 pnMinDummy = 0;
 	INT32 r = 0;
-	if (((Cps == 2) && !Cps2DisableQSnd) || Cps1Qs == 1) {
-		r = QsndScan(ACB_DRIVER_DATA | ACB_READ);
-	} else if ((Cps & 1) && !Cps1DisablePSnd) {
-		r = PsndScan(ACB_DRIVER_DATA | ACB_READ, &pnMinDummy);
+	bool sharedQRam = false;
+
+	if (CpsMem != NULL) {
+		BurnAcb = rmgkSndSaveAcb;
+		if (((Cps == 2) && !Cps2DisableQSnd) || Cps1Qs == 1) {
+			r = QsndScan(ACB_DRIVER_DATA | ACB_READ);
+			sharedQRam = true;
+		} else if ((Cps & 1) && !Cps1DisablePSnd) {
+			r = PsndScan(ACB_DRIVER_DATA | ACB_READ, &pnMinDummy);
+		} else {
+			r = 1;
+		}
+		if (r == 0 && sharedQRam) {
+			struct BurnArea ba;
+			memset(&ba, 0, sizeof(ba));
+			ba.Data = CpsZRamC0; ba.nLen = 0x001000; ba.szName = "CpsZRamC0";  BurnAcb(&ba);
+			ba.Data = CpsZRamF0; ba.nLen = 0x001000; ba.szName = "CpsZRamF0";  BurnAcb(&ba);
+		}
+	} else if ((BurnDrvGetHardwareCode() & 0xFFFF0000) == HARDWARE_PREFIX_SNK) {
+		// NeoGeo family: one filtered walk over BOTH the MAME-registered chip
+		// states (YM2610 FM/ADPCM/DeltaT) AND the driver's own scan (Z80 RAM,
+		// sound latches, Z80 banks). Only RAM + driver data - no ROMs/NVRAM.
+		BurnAcb = rmgkSndSaveAcbFiltered;
+		r = BurnAreaScan(ACB_MEMORY_RAM | ACB_DRIVER_DATA | ACB_READ, &pnMinDummy);
 	} else {
 		r = 1;
 	}
@@ -712,19 +784,35 @@ INT32 RMGK_FBNEO_SndStateSnapshot()
 // Restore the last captured sound-chip state (load). Returns 0 on success.
 INT32 RMGK_FBNEO_SndStateReplay()
 {
-	if (CpsMem == NULL || rmgkSndLen <= 0 || rmgkSndBuf == nullptr) return -1;
+	if (rmgkSndLen <= 0 || rmgkSndBuf == nullptr) return -1;
 
 	rmgkSndCursor = 0;
 	rmgkSndBad    = false;
 
 	INT32 (__cdecl* oldAcb)(struct BurnArea*) = BurnAcb;
-	BurnAcb = rmgkSndLoadAcb;
 	INT32 pnMinDummy = 0;
 	INT32 r = 0;
-	if (((Cps == 2) && !Cps2DisableQSnd) || Cps1Qs == 1) {
-		r = QsndScan(ACB_DRIVER_DATA | ACB_WRITE);
-	} else if ((Cps & 1) && !Cps1DisablePSnd) {
-		r = PsndScan(ACB_DRIVER_DATA | ACB_WRITE, &pnMinDummy);
+	bool sharedQRam = false;
+
+	if (CpsMem != NULL) {
+		BurnAcb = rmgkSndLoadAcb;
+		if (((Cps == 2) && !Cps2DisableQSnd) || Cps1Qs == 1) {
+			r = QsndScan(ACB_DRIVER_DATA | ACB_WRITE);
+			sharedQRam = true;
+		} else if ((Cps & 1) && !Cps1DisablePSnd) {
+			r = PsndScan(ACB_DRIVER_DATA | ACB_WRITE, &pnMinDummy);
+		} else {
+			r = 2;
+		}
+		if (r == 0 && sharedQRam) {
+			struct BurnArea ba;
+			memset(&ba, 0, sizeof(ba));
+			ba.Data = CpsZRamC0; ba.nLen = 0x001000; ba.szName = "CpsZRamC0";  BurnAcb(&ba);
+			ba.Data = CpsZRamF0; ba.nLen = 0x001000; ba.szName = "CpsZRamF0";  BurnAcb(&ba);
+		}
+	} else if ((BurnDrvGetHardwareCode() & 0xFFFF0000) == HARDWARE_PREFIX_SNK) {
+		BurnAcb = rmgkSndLoadAcbFiltered;
+		r = BurnAreaScan(ACB_MEMORY_RAM | ACB_DRIVER_DATA | ACB_WRITE, &pnMinDummy);
 	} else {
 		r = 2;
 	}
