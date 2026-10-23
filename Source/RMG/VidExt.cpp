@@ -1081,6 +1081,12 @@ struct FbneoAudioPushRecord
     Uint64  seq = 0;
     Uint32  hash = 0;
     Uint64  gapNs = 0;
+    int     peak = 0;
+    int     rms = 0;
+    int     s0 = 0;
+    int     s1 = 0;
+    int     s2 = 0;
+    int     s3 = 0;
 };
 
 struct FbneoAudioTraceState
@@ -1144,7 +1150,7 @@ static void FbneoAudioTraceTick(const Uint64 nowNs)
 
     if (true)
     {
-        char hashStr[193];
+        char hashStr[769];
         size_t used = 0;
         for (int i = 0; i < 8; i++)
         {
@@ -1156,11 +1162,18 @@ static void FbneoAudioTraceTick(const Uint64 nowNs)
                 break;
             }
             used += (size_t)SDL_snprintf(hashStr + used,
-                sizeof(hashStr) - used, " %llu:%08x",
+                sizeof(hashStr) - used,
+                " %llu:%08x:%d:%d:%04x-%04x-%04x-%04x",
                 static_cast<unsigned long long>(rec.seq),
-                static_cast<unsigned int>(rec.hash));
+                static_cast<unsigned int>(rec.hash),
+                rec.rms,
+                rec.peak,
+                static_cast<unsigned int>(static_cast<uint16_t>(rec.s0)) & 0xffff,
+                static_cast<unsigned int>(static_cast<uint16_t>(rec.s1)) & 0xffff,
+                static_cast<unsigned int>(static_cast<uint16_t>(rec.s2)) & 0xffff,
+                static_cast<unsigned int>(static_cast<uint16_t>(rec.s3)) & 0xffff);
         }
-        char line[448];
+        char line[1120];
         SDL_snprintf(line, sizeof(line),
             "t_ns=%llu fps=%d samples_s=%lld queue=%llu clears=%lld repeats=%lld gapmax=%.1f ratio=%.4f hash=%s\n",
             static_cast<unsigned long long>(nowNs),
@@ -1959,16 +1972,35 @@ static void FbneoPushAudio(const int16_t* audio, int audioFrames)
     if (s_FbneoAudioTrace.enabled)
     {
         Uint32 hash = 2166136261u;
-        for (int i = 0; i + 1 < len; i += 2)
+        int peak = 0;
+        double sumSq = 0.0;
+        int n = len / 2;
+        for (int i = 0; i < n; i++)
         {
+            int v = static_cast<int>(audio[i]);
             hash ^= static_cast<Uint32>(static_cast<uint16_t>(audio[i]));
             hash *= 16777619u;
+            const int av = v < 0 ? -v : v;
+            if (av > peak)
+            {
+                peak = av;
+            }
+            sumSq += static_cast<double>(v) * v;
         }
+        const int rms = n > 0
+            ? static_cast<int>(std::sqrt(sumSq / n) + 0.5)
+            : 0;
         FbneoAudioPushRecord& rec = s_FbneoAudioTrace.recent[s_FbneoAudioTrace.next];
         s_FbneoAudioTrace.next = (s_FbneoAudioTrace.next + 1) % 8;
         rec.seq = ++s_FbneoAudioTrace.pushSeq;
         rec.hash = hash;
         rec.gapNs = s_FbneoAudioTrace.lastPushNs != 0 ? nowNs - s_FbneoAudioTrace.lastPushNs : 0;
+        rec.peak = peak;
+        rec.rms = rms;
+        rec.s0 = n > 0 ? static_cast<int>(audio[0]) : 0;
+        rec.s1 = n > 1 ? static_cast<int>(audio[n / 4]) : 0;
+        rec.s2 = n > 2 ? static_cast<int>(audio[n / 2]) : 0;
+        rec.s3 = n > 3 ? static_cast<int>(audio[n - 1]) : 0;
         s_FbneoAudioTrace.lastPushNs = nowNs;
         if (rec.gapNs > s_FbneoAudioTrace.maxGapNs)
         {
