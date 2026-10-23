@@ -38,6 +38,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -1069,6 +1070,107 @@ static int    s_FbneoTextureH    = 0;
 // which resamples/converts to whatever the output device actually wants.
 static SDL_AudioStream* s_FbneoAudioStream = nullptr;
 
+// Netplay audio diagnostics (RMGK_FBNEO_AUDIO_TRACE=1). Writes a 1 Hz snapshot
+// of the push path to "<rollback log dir>\<prefix>_audio_trace.log": pushes
+// per second, samples pushed, device queue depth in bytes, how many times the
+// overflow guard cleared the queue that second and the stream's frequency
+// ratio. The repeat/glitch reports only happen netplay-side, so the trace
+// names whether the queue starves, overflows or the ratio calibration is inert.
+struct FbneoAudioTraceState
+{
+    bool          enabled = false;
+    bool          loaded  = false;
+    SDL_IOStream* out     = nullptr;
+    Uint64        windowStartNs = 0;
+    Uint64        windowPushes  = 0;
+    Sint64        windowSamples = 0;
+    Sint64        clears        = 0;
+    Sint64        lastClears    = 0;
+    Uint64        peakQueue     = 0;
+    Sint64        peakWindowSamples = 0;
+};
+
+static FbneoAudioTraceState s_FbneoAudioTrace;
+static Uint64 s_windowStartNs = 0;
+static Sint64 s_windowSamples = 0;
+static float  s_ratio = 1.0f;
+
+static void FbneoAudioTraceTick(const Uint64 nowNs)
+{
+    if (!s_FbneoAudioTrace.enabled)
+    {
+        return;
+    }
+
+    const Uint64 windowNs = nowNs - s_FbneoAudioTrace.windowStartNs;
+    if (windowNs < 1000000000)
+    {
+        return;
+    }
+
+    const double pushesPerSec =
+        static_cast<double>(s_FbneoAudioTrace.windowPushes) *
+        1e9 / static_cast<double>(windowNs);
+    const double samplesPerSec =
+        static_cast<double>(s_FbneoAudioTrace.windowSamples) *
+        1e9 / static_cast<double>(windowNs);
+    const Uint64 queueBytes =
+        s_FbneoAudioStream != nullptr
+            ? SDL_GetAudioStreamQueued(s_FbneoAudioStream)
+            : 0;
+    const Sint64 newClears =
+        s_FbneoAudioTrace.clears - s_FbneoAudioTrace.lastClears;
+
+    if (s_FbneoAudioTrace.out != nullptr)
+    {
+        char line[224];
+        SDL_snprintf(line, sizeof(line),
+            "t_ns=%llu fps=%d samples_s=%lld queue=%llu clears=%lld samples_win=%lld ratio=%.4f\n",
+            static_cast<unsigned long long>(nowNs),
+            static_cast<int>(pushesPerSec + 0.5),
+            s_FbneoAudioTrace.windowSamples,
+            static_cast<unsigned long long>(queueBytes),
+            newClears,
+            s_FbneoAudioTrace.windowSamples,
+            static_cast<double>(s_ratio));
+        SDL_IOprintf(s_FbneoAudioTrace.out, "%s", line);
+        SDL_FlushIO(s_FbneoAudioTrace.out);
+    }
+
+    s_FbneoAudioTrace.windowStartNs = nowNs;
+    s_FbneoAudioTrace.lastClears = s_FbneoAudioTrace.clears;
+    s_FbneoAudioTrace.windowPushes = 0;
+    s_FbneoAudioTrace.windowSamples = 0;
+}
+
+static void FbneoAudioTraceOpen()
+{
+    const char* dirEnv = std::getenv("RMGK_ROLLBACK_LOG_DIR");
+    std::string prefix = "fbneo_audio";
+    const char* prefixEnv = std::getenv("RMGK_ROLLBACK_LOG_PREFIX");
+    if (prefixEnv != nullptr && prefixEnv[0] != 0)
+    {
+        prefix = prefixEnv;
+    }
+    std::filesystem::path path;
+    if (dirEnv != nullptr && dirEnv[0] != 0)
+    {
+        path = std::filesystem::path(dirEnv) /
+            (prefix + "_audio_trace.log");
+    }
+    else
+    {
+        path = prefix + "_audio_trace.log";
+    }
+    s_FbneoAudioTrace.out = SDL_IOFromFile(path.string().c_str(), "w");
+    if (s_FbneoAudioTrace.out == nullptr)
+    {
+        fprintf(stderr, "[FBNEO-DBG] audio trace open failed: %s\n",
+            SDL_GetError());
+        fflush(stderr);
+    }
+}
+
 static GLuint s_FbneoProgram = 0;
 static GLuint s_FbneoVbo     = 0;
 static int    s_FbneoSampler = -1;
@@ -1732,9 +1834,7 @@ static void FbneoPushAudio(const int16_t* audio, int audioFrames)
     // overflows the queue). Measure the real push rate over a rolling window and
     // feed the delta into the stream's frequency ratio: the queue then drains at
     // exactly the push rate and the pitch shift stays under 1%.
-    static Uint64 s_windowStartNs = 0;
-    static Sint64 s_windowSamples = 0;
-    static float  s_ratio = 1.0f;
+    const Uint64 nowNs = SDL_GetTicksNS();
     if (s_FbneoAudioStream == nullptr)
     {
         if (!SDL_InitSubSystem(SDL_INIT_AUDIO))
@@ -1770,10 +1870,23 @@ static void FbneoPushAudio(const int16_t* audio, int audioFrames)
 
     const int len = audioFrames * 2 * (int)sizeof(int16_t);
 
-    // overflows the queue). Measure the real push rate over a rolling window and
-    // feed the delta into the stream's frequency ratio: the queue then drains at
-    // exactly the push rate and the pitch shift stays under 1%.
-    const Uint64 nowNs = SDL_GetTicksNS();
+    if (!s_FbneoAudioTrace.loaded)
+    {
+        s_FbneoAudioTrace.loaded = true;
+        const char* env = std::getenv("RMGK_FBNEO_AUDIO_TRACE");
+        s_FbneoAudioTrace.enabled =
+            env == nullptr || std::strcmp(env, "0") != 0;
+        if (s_FbneoAudioTrace.enabled)
+        {
+            FbneoAudioTraceOpen();
+            s_FbneoAudioTrace.windowStartNs = nowNs;
+        }
+    }
+    if (s_FbneoAudioTrace.enabled)
+    {
+        s_FbneoAudioTrace.windowPushes += 1;
+        s_FbneoAudioTrace.windowSamples += audioFrames;
+    }
     if (s_windowStartNs == 0)
     {
         s_windowStartNs = nowNs;
@@ -1803,9 +1916,15 @@ static void FbneoPushAudio(const int16_t* audio, int audioFrames)
     if (SDL_GetAudioStreamQueued(s_FbneoAudioStream) > len * 8)
     {
         SDL_ClearAudioStream(s_FbneoAudioStream);
+        if (s_FbneoAudioTrace.enabled)
+        {
+            s_FbneoAudioTrace.clears += 1;
+        }
     }
 
     SDL_PutAudioStreamData(s_FbneoAudioStream, audio, len);
+
+    FbneoAudioTraceTick(SDL_GetTicksNS());
 }
 
 // Reads the aspect ratio the user selected in the video plugin configuration
