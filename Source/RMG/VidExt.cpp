@@ -1076,18 +1076,31 @@ static SDL_AudioStream* s_FbneoAudioStream = nullptr;
 // overflow guard cleared the queue that second and the stream's frequency
 // ratio. The repeat/glitch reports only happen netplay-side, so the trace
 // names whether the queue starves, overflows or the ratio calibration is inert.
+struct FbneoAudioPushRecord
+{
+    Uint64  seq = 0;
+    Uint32  hash = 0;
+    Uint64  gapNs = 0;
+};
+
 struct FbneoAudioTraceState
 {
     bool          enabled = false;
     bool          loaded  = false;
-    SDL_IOStream* out     = nullptr;
+    std::ofstream out;
     Uint64        windowStartNs = 0;
     Uint64        windowPushes  = 0;
     Sint64        windowSamples = 0;
     Sint64        clears        = 0;
     Sint64        lastClears    = 0;
-    Uint64        peakQueue     = 0;
-    Sint64        peakWindowSamples = 0;
+    FbneoAudioPushRecord recent[8];
+    int           next    = 0;
+    Uint64        pushSeq = 0;
+    Uint64        maxGapNs = 0;
+    Uint64        lastPushNs = 0;
+    Uint64        repeats = 0;
+    Uint64        lastRepeats = 0;
+    Uint32        lastHash = 0;
 };
 
 static FbneoAudioTraceState s_FbneoAudioTrace;
@@ -1111,34 +1124,51 @@ static void FbneoAudioTraceTick(const Uint64 nowNs)
     const double pushesPerSec =
         static_cast<double>(s_FbneoAudioTrace.windowPushes) *
         1e9 / static_cast<double>(windowNs);
-    const double samplesPerSec =
-        static_cast<double>(s_FbneoAudioTrace.windowSamples) *
-        1e9 / static_cast<double>(windowNs);
-    const Uint64 queueBytes =
-        s_FbneoAudioStream != nullptr
-            ? SDL_GetAudioStreamQueued(s_FbneoAudioStream)
-            : 0;
     const Sint64 newClears =
         s_FbneoAudioTrace.clears - s_FbneoAudioTrace.lastClears;
+    const Sint64 newRepeats =
+        s_FbneoAudioTrace.repeats - s_FbneoAudioTrace.lastRepeats;
+    const double maxGapMs =
+        static_cast<double>(s_FbneoAudioTrace.maxGapNs) / 1e6;
 
-    if (s_FbneoAudioTrace.out != nullptr)
+    if (s_FbneoAudioTrace.out.is_open())
     {
-        char line[224];
+        char hashStr[193];
+        size_t used = 0;
+        for (int i = 0; i < 8; i++)
+        {
+            const FbneoAudioPushRecord& rec =
+                s_FbneoAudioTrace.recent[(s_FbneoAudioTrace.next +
+                7 - i + 8) % 8];
+            if (rec.seq == 0)
+            {
+                break;
+            }
+            used += (size_t)SDL_snprintf(hashStr + used,
+                sizeof(hashStr) - used, " %llu:%08x",
+                static_cast<unsigned long long>(rec.seq),
+                static_cast<unsigned int>(rec.hash));
+        }
+        char line[448];
         SDL_snprintf(line, sizeof(line),
-            "t_ns=%llu fps=%d samples_s=%lld queue=%llu clears=%lld samples_win=%lld ratio=%.4f\n",
+            "t_ns=%llu fps=%d samples_s=%lld queue=%llu clears=%lld repeats=%lld gapmax=%.1f ratio=%.4f hash=%s\n",
             static_cast<unsigned long long>(nowNs),
             static_cast<int>(pushesPerSec + 0.5),
             s_FbneoAudioTrace.windowSamples,
             static_cast<unsigned long long>(queueBytes),
             newClears,
-            s_FbneoAudioTrace.windowSamples,
-            static_cast<double>(s_ratio));
-        SDL_IOprintf(s_FbneoAudioTrace.out, "%s", line);
-        SDL_FlushIO(s_FbneoAudioTrace.out);
+            newRepeats,
+            maxGapMs,
+            static_cast<double>(s_ratio),
+            used > 0 ? hashStr + 1 : hashStr);
+        s_FbneoAudioTrace.out << line;
+        s_FbneoAudioTrace.out.flush();
     }
 
     s_FbneoAudioTrace.windowStartNs = nowNs;
     s_FbneoAudioTrace.lastClears = s_FbneoAudioTrace.clears;
+    s_FbneoAudioTrace.lastRepeats = s_FbneoAudioTrace.repeats;
+    s_FbneoAudioTrace.maxGapNs = 0;
     s_FbneoAudioTrace.windowPushes = 0;
     s_FbneoAudioTrace.windowSamples = 0;
 }
@@ -1162,11 +1192,11 @@ static void FbneoAudioTraceOpen()
     {
         path = prefix + "_audio_trace.log";
     }
-    s_FbneoAudioTrace.out = SDL_IOFromFile(path.string().c_str(), "w");
-    if (s_FbneoAudioTrace.out == nullptr)
+    s_FbneoAudioTrace.out.open(path, std::ios::out | std::ios::trunc);
+    if (!s_FbneoAudioTrace.out.is_open())
     {
         fprintf(stderr, "[FBNEO-DBG] audio trace open failed: %s\n",
-            SDL_GetError());
+            path.string().c_str());
         fflush(stderr);
     }
 }
@@ -1884,8 +1914,29 @@ static void FbneoPushAudio(const int16_t* audio, int audioFrames)
     }
     if (s_FbneoAudioTrace.enabled)
     {
+        Uint32 hash = 2166136261u;
+        for (int i = 0; i + 1 < len; i += 2)
+        {
+            hash ^= static_cast<Uint32>(static_cast<uint16_t>(audio[i]));
+            hash *= 16777619u;
+        }
+        FbneoAudioPushRecord& rec = s_FbneoAudioTrace.recent[s_FbneoAudioTrace.next];
+        s_FbneoAudioTrace.next = (s_FbneoAudioTrace.next + 1) % 8;
+        rec.seq = ++s_FbneoAudioTrace.pushSeq;
+        rec.hash = hash;
+        rec.gapNs = s_FbneoAudioTrace.lastPushNs != 0 ? nowNs - s_FbneoAudioTrace.lastPushNs : 0;
+        s_FbneoAudioTrace.lastPushNs = nowNs;
+        if (rec.gapNs > s_FbneoAudioTrace.maxGapNs)
+        {
+            s_FbneoAudioTrace.maxGapNs = rec.gapNs;
+        }
         s_FbneoAudioTrace.windowPushes += 1;
         s_FbneoAudioTrace.windowSamples += audioFrames;
+        if (s_FbneoAudioTrace.lastHash != 0 && hash == s_FbneoAudioTrace.lastHash)
+        {
+            s_FbneoAudioTrace.repeats += 1;
+        }
+        s_FbneoAudioTrace.lastHash = hash;
     }
     if (s_windowStartNs == 0)
     {
