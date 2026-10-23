@@ -1088,6 +1088,13 @@ struct FbneoAudioTraceState
     bool          enabled = false;
     bool          loaded  = false;
     std::ofstream out;
+    // Lines are buffered in memory and written when the audio stream closes.
+    // Flushing one byte-line per second from inside the present callback showed
+    // up as ~38 ms disk-write spikes once per second on the present path
+    // (93 present-phase spikes in the 22:21 pacing CSV ≈ the 91 trace ticks),
+    // costing +1.3 ms/frame on average and pushing the loop to 56.6 fps —
+    // which starved the audio queue and read as repeating netplay audio.
+    std::vector<std::string> pending;
     Uint64        windowStartNs = 0;
     Uint64        windowPushes  = 0;
     Sint64        windowSamples = 0;
@@ -1131,7 +1138,7 @@ static void FbneoAudioTraceTick(const Uint64 nowNs)
     const double maxGapMs =
         static_cast<double>(s_FbneoAudioTrace.maxGapNs) / 1e6;
 
-    if (s_FbneoAudioTrace.out.is_open())
+    if (true)
     {
         char hashStr[193];
         size_t used = 0;
@@ -1161,8 +1168,9 @@ static void FbneoAudioTraceTick(const Uint64 nowNs)
             maxGapMs,
             static_cast<double>(s_ratio),
             used > 0 ? hashStr + 1 : hashStr);
-        s_FbneoAudioTrace.out << line;
-        s_FbneoAudioTrace.out.flush();
+        // Buffer only; the file write happens when the audio stream closes so
+        // the present path never touches the disk (see the struct comment).
+        s_FbneoAudioTrace.pending.push_back(line);
     }
 
     s_FbneoAudioTrace.windowStartNs = nowNs;
@@ -1173,7 +1181,7 @@ static void FbneoAudioTraceTick(const Uint64 nowNs)
     s_FbneoAudioTrace.windowSamples = 0;
 }
 
-static void FbneoAudioTraceOpen()
+static std::filesystem::path FbneoAudioTracePath()
 {
     const char* dirEnv = std::getenv("RMGK_ROLLBACK_LOG_DIR");
     std::string prefix = "fbneo_audio";
@@ -1182,23 +1190,56 @@ static void FbneoAudioTraceOpen()
     {
         prefix = prefixEnv;
     }
-    std::filesystem::path path;
     if (dirEnv != nullptr && dirEnv[0] != 0)
     {
-        path = std::filesystem::path(dirEnv) /
+        return std::filesystem::path(dirEnv) /
             (prefix + "_audio_trace.log");
     }
-    else
+    return std::filesystem::path(prefix + "_audio_trace.log");
+}
+
+// Writes the buffered trace lines in one shot. Called when the audio stream is
+// torn down, so a mid-match disk write can never spike the present path.
+static void FbneoAudioTraceFlush()
+{
+    if (!s_FbneoAudioTrace.loaded || s_FbneoAudioTrace.pending.empty())
     {
-        path = prefix + "_audio_trace.log";
+        return;
     }
-    s_FbneoAudioTrace.out.open(path, std::ios::out | std::ios::trunc);
-    if (!s_FbneoAudioTrace.out.is_open())
+    std::ofstream out(FbneoAudioTracePath(), std::ios::out | std::ios::trunc);
+    if (!out.is_open())
     {
-        fprintf(stderr, "[FBNEO-DBG] audio trace open failed: %s\n",
-            path.string().c_str());
+        fprintf(stderr, "[FBNEO-DBG] audio trace write failed: %s\n",
+            FbneoAudioTracePath().string().c_str());
         fflush(stderr);
+        return;
     }
+    for (const std::string& line : s_FbneoAudioTrace.pending)
+    {
+        out << line;
+    }
+    s_FbneoAudioTrace.pending.clear();
+
+    s_FbneoAudioTrace.windowStartNs = 0;
+    s_FbneoAudioTrace.windowPushes = 0;
+    s_FbneoAudioTrace.windowSamples = 0;
+    s_FbneoAudioTrace.windowStartNs = 0;
+    s_FbneoAudioTrace.clears = 0;
+    s_FbneoAudioTrace.lastClears = 0;
+    s_FbneoAudioTrace.repeats = 0;
+    s_FbneoAudioTrace.lastRepeats = 0;
+    s_FbneoAudioTrace.pushSeq = 0;
+    s_FbneoAudioTrace.maxGapNs = 0;
+    s_FbneoAudioTrace.lastPushNs = 0;
+    s_FbneoAudioTrace.lastHash = 0;
+    s_FbneoAudioTrace.next = 0;
+    for (FbneoAudioPushRecord& rec : s_FbneoAudioTrace.recent)
+    {
+        rec = FbneoAudioPushRecord{};
+    }
+    s_windowStartNs = 0;
+    s_windowSamples = 0;
+    s_ratio = 1.0f;
 }
 
 static GLuint s_FbneoProgram = 0;
@@ -1908,7 +1949,6 @@ static void FbneoPushAudio(const int16_t* audio, int audioFrames)
             env == nullptr || std::strcmp(env, "0") != 0;
         if (s_FbneoAudioTrace.enabled)
         {
-            FbneoAudioTraceOpen();
             s_FbneoAudioTrace.windowStartNs = nowNs;
         }
     }
@@ -2300,6 +2340,8 @@ static void RMG_FbneoVideoPresent(const void* video, int width, int height, int 
 static void RMG_FbneoVideoStop(void* user)
 {
     (void)user;
+
+    FbneoAudioTraceFlush();
 
     if (s_FbneoAudioStream != nullptr)
     {
