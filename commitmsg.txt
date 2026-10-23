@@ -1,6 +1,0 @@
-﻿feat(netplay): instrument rollback snd-state snapshot/replay
-
-Add write_gekko_log diagnostics for snd_snapshot/snd_replay so test
-sessions prove whether the sound-state restore fires (gate skips,
-snapshot len, replay ok/fail/stale). Move write_gekko_log out of the
-anonymous namespace for external linkage.
