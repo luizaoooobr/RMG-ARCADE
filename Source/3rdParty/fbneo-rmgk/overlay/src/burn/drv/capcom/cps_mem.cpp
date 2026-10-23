@@ -603,3 +603,134 @@ INT32 CpsXmvVisualScan(INT32 nAction)
 
 	return CpsPalVisualScan(nAction);
 }
+
+// ============================================================================
+// RMG-K rollback sound-state snapshot ----------------------------------------
+// Rollback resims re-execute up to 8 predicted frames; sound chips re-run
+// their playback code during those frames, re-triggering voices whose first
+// rendering was already pushed to the audible stream (SFX overlap / "toca-
+// discos"). Snapshot ONLY the sound-chip state before a resim load and restore
+// it on the next audible frame so the stream stays monotonic while video/logic
+// keep the corrected (resimmed) state.
+// ============================================================================
+static UINT8* rmgkSndBuf    = nullptr;
+static INT32  rmgkSndCap    = 0;
+static INT32  rmgkSndLen    = 0;
+static INT32  rmgkSndCursor = 0;
+static bool   rmgkSndBad    = false;
+
+static UINT32 rmgkSndHash(const char* s)
+{
+	UINT32 h = 0xc0ffee;
+	for (INT32 i = 0; s[i]; i++) {
+		h = (h ^ s[i]) + ((h << 0x1a) + (h >> 0x06));
+	}
+	return h;
+}
+
+static void rmgkSndReserve(INT32 extra)
+{
+	if (rmgkSndLen + extra <= rmgkSndCap) return;
+	INT32 nc = rmgkSndCap ? rmgkSndCap : 0x10000;
+	while (rmgkSndLen + extra > nc) nc *= 2;
+	UINT8* nb = (UINT8*)realloc(rmgkSndBuf, (size_t)nc);
+	if (nb == NULL) return;
+	rmgkSndBuf = nb;
+	rmgkSndCap = nc;
+}
+
+static INT32 __cdecl rmgkSndSaveAcb(struct BurnArea* pba)
+{
+	if (rmgkSndBuf == nullptr) return 1;
+	UINT32 h = rmgkSndHash(pba->szName);
+	INT32 need = (INT32)(sizeof(UINT32) * 2 + pba->nLen);
+	rmgkSndReserve(need);
+	if (rmgkSndBuf == nullptr || rmgkSndLen + need > rmgkSndCap) return 1;
+
+	memcpy(rmgkSndBuf + rmgkSndLen, &h, sizeof(h));
+	rmgkSndLen += sizeof(h);
+	memcpy(rmgkSndBuf + rmgkSndLen, &pba->nLen, sizeof(UINT32));
+	rmgkSndLen += sizeof(UINT32);
+	memcpy(rmgkSndBuf + rmgkSndLen, pba->Data, pba->nLen);
+	rmgkSndLen += (INT32)pba->nLen;
+	return 0;
+}
+
+static INT32 __cdecl rmgkSndLoadAcb(struct BurnArea* pba)
+{
+	if (rmgkSndBad || rmgkSndBuf == nullptr) return 0;
+	if (rmgkSndCursor + (INT32)(sizeof(UINT32) * 2) > rmgkSndLen) {
+		rmgkSndBad = true;
+		return 0;
+	}
+	UINT32 h = 0, l = 0;
+	memcpy(&h, rmgkSndBuf + rmgkSndCursor, sizeof(h));
+	rmgkSndCursor += (INT32)sizeof(h);
+	memcpy(&l, rmgkSndBuf + rmgkSndCursor, sizeof(l));
+	rmgkSndCursor += (INT32)sizeof(l);
+	if (h != rmgkSndHash(pba->szName) || l != pba->nLen ||
+		rmgkSndCursor + (INT32)pba->nLen > rmgkSndLen) {
+		rmgkSndBad = true;   // walk out of sync: abort the whole restore (fail-safe)
+		return 0;
+	}
+	memcpy(pba->Data, rmgkSndBuf + rmgkSndCursor, pba->nLen);
+	rmgkSndCursor += (INT32)pba->nLen;
+	return 0;
+}
+
+// Capture the sound-chip state (save; blob kept internally). Returns the blob
+// size in bytes, or < 0 when this driver family is unsupported / capture failed.
+INT32 RMGK_FBNEO_SndStateSnapshot()
+{
+	if (CpsMem == NULL) return -1;
+
+	rmgkSndLen    = 0;
+	rmgkSndCursor = 0;
+	rmgkSndBad    = false;
+
+	INT32 (__cdecl* oldAcb)(struct BurnArea*) = BurnAcb;
+	BurnAcb = rmgkSndSaveAcb;
+	INT32 pnMinDummy = 0;
+	INT32 r = 0;
+	if (((Cps == 2) && !Cps2DisableQSnd) || Cps1Qs == 1) {
+		r = QsndScan(ACB_DRIVER_DATA | ACB_READ);
+	} else if ((Cps & 1) && !Cps1DisablePSnd) {
+		r = PsndScan(ACB_DRIVER_DATA | ACB_READ, &pnMinDummy);
+	} else {
+		r = 1;
+	}
+	BurnAcb = oldAcb;
+
+	if (r != 0 || rmgkSndLen <= 0) {
+		rmgkSndLen = 0;
+		return -1;
+	}
+	return rmgkSndLen;
+}
+
+// Restore the last captured sound-chip state (load). Returns 0 on success.
+INT32 RMGK_FBNEO_SndStateReplay()
+{
+	if (CpsMem == NULL || rmgkSndLen <= 0 || rmgkSndBuf == nullptr) return -1;
+
+	rmgkSndCursor = 0;
+	rmgkSndBad    = false;
+
+	INT32 (__cdecl* oldAcb)(struct BurnArea*) = BurnAcb;
+	BurnAcb = rmgkSndLoadAcb;
+	INT32 pnMinDummy = 0;
+	INT32 r = 0;
+	if (((Cps == 2) && !Cps2DisableQSnd) || Cps1Qs == 1) {
+		r = QsndScan(ACB_DRIVER_DATA | ACB_WRITE);
+	} else if ((Cps & 1) && !Cps1DisablePSnd) {
+		r = PsndScan(ACB_DRIVER_DATA | ACB_WRITE, &pnMinDummy);
+	} else {
+		r = 2;
+	}
+	BurnAcb = oldAcb;
+
+	if (r != 0 || rmgkSndBad) {
+		return -2;
+	}
+	return 0;
+}

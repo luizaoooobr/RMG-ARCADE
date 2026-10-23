@@ -47,6 +47,47 @@ extern "C" {
 extern INT32 BurnStateCompress(UINT8** pDef, INT32* pnDefLen, INT32 bAll);
 extern INT32 BurnStateDecompress(UINT8* Def, INT32 nDefLen, INT32 bAll);
 
+// Sound-only state snapshot for rollback (defined in the FBNeo overlay,
+// capcom/cps_mem.cpp; C++ linkage like the rest of the lib symbols). Capture
+// saves ONLY the sound-chip state (Z80 + YM2151/OKI/QSound + timer + latches);
+// replay restores it. Used so rollback resims do not re-trigger already
+// audible voices (SFX overlap "toca-discos" on netplay).
+extern INT32 RMGK_FBNEO_SndStateSnapshot();
+extern INT32 RMGK_FBNEO_SndStateReplay();
+
+static int      rmgkSndAudioFramesEmitted = 0;   // audible-history depth (gates the snapshot)
+static bool     rmgkSndPending            = false;
+static long long rmgkSndPendingUs         = 0;
+static int      rmgkSndRestores           = 0;
+
+static bool rmgkSndArm()
+{
+    // Only arm once ~0.75s of audible history has passed so startup savestate
+    // loads never replay garbage/pre-init chip state.
+    if (rmgkSndAudioFramesEmitted < 45) return false;
+    if (RMGK_FBNEO_SndStateSnapshot() > 0)
+    {
+        const auto now = std::chrono::steady_clock::now().time_since_epoch();
+        rmgkSndPendingUs = (long long)std::chrono::duration_cast<std::chrono::microseconds>(now).count();
+        return true;
+    }
+    return false;
+}
+
+static void rmgkSndMaybeReplay()
+{
+    if (!rmgkSndPending) return;
+    rmgkSndPending = false;
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const long long nowUs = (long long)std::chrono::duration_cast<std::chrono::microseconds>(now).count();
+    // A stale snapshot (e.g. captured at session teardown then re-arm never
+    // happened) must not replay on an unrelated session: snapshots only stay
+    // valid for one rollback batch (a few ms), allow a generous 2s.
+    if (nowUs - rmgkSndPendingUs > 2000000LL) return;    // drop stale
+    RMGK_FBNEO_SndStateReplay();
+    rmgkSndRestores++;
+}
+
 // Global variable at global scope: the Itanium ABI does not mangle these, so the
 // symbol is literally "nRMGKNetgameMode" on both sides (no extern "C" needed).
 // Defined in FBNeo's src/burner/rmgk/frontend.cpp; backing storage for
@@ -1251,6 +1292,14 @@ bool LoadState(const unsigned char* buffer, int len)
 {
     if (!g_driverInited || !buffer || len <= 0) return false;
     std::lock_guard<std::mutex> lock(g_frameMutex);
+    // Rollback resim loads re-run already-audible frames and the sound chips
+    // re-trigger. Snapshot ONLY the sound state before the load restores the
+    // pre-rollback emu state; the next audible frame replays it (video/logic
+    // keep the corrected state).
+    if (!rmgkSndPending)
+    {
+        rmgkSndPending = rmgkSndArm();
+    }
     return BurnStateDecompress((UINT8*)buffer, len, 1) == 0;
 }
 
@@ -1313,6 +1362,15 @@ bool RunFrame(int flags)
             memset(g_soundBuffer.data(), 0, std::min(bytes, g_soundBuffer.size() * sizeof(int16_t)));
         }
         return true;
+    }
+
+    const bool audioOutput = (flags & Output_Audio) != 0;
+    // First audible frame after a rollback resim batch: put the sound chips
+    // back on the audible timeline so resim-retriggered voices are dropped.
+    if (audioOutput)
+    {
+        rmgkSndMaybeReplay();
+        rmgkSndAudioFramesEmitted++;
     }
 
     apply_latched_input();
