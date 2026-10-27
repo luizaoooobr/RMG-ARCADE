@@ -298,6 +298,14 @@ int g_GekkoDesyncDumpFrame = -1;   // first target frame, -1 = nothing pending
 int g_GekkoDesyncDumpsLeft = 0;
 int g_GekkoDesyncDumpIndex = 0;
 
+// Rollback round-trip self-test (see test_state_roundtrip). Fires a few times
+// per session, well after boot, so a mismatch cannot be blamed on startup.
+constexpr int kGekkoRoundtripFirstFrame = 240;
+constexpr int kGekkoRoundtripSpacingFrames = 240;
+constexpr int kGekkoRoundtripTests = 3;
+int g_GekkoRoundtripTestsLeft = kGekkoRoundtripTests;
+int g_GekkoRoundtripNextFrame = kGekkoRoundtripFirstFrame;
+
 void request_desync_state_dump(int desyncFrame)
 {
     // Only the first mismatch of a session arms the dump. A divergence that
@@ -1035,6 +1043,8 @@ void reset_gekko_log()
     g_GekkoDesyncDumpFrame = -1;
     g_GekkoDesyncDumpsLeft = 0;
     g_GekkoDesyncDumpIndex = 0;
+    g_GekkoRoundtripTestsLeft = kGekkoRoundtripTests;
+    g_GekkoRoundtripNextFrame = kGekkoRoundtripFirstFrame;
 
     const char* logEnv = std::getenv("RMGK_GEKKO_LOG");
     g_GekkoLogEnabled = CoreSettingsGetBoolValue(SettingsID::Rollback_VerboseStats) ||
@@ -1520,7 +1530,81 @@ void log_session_events()
 // per area (length, name hash, FNV), which is enough to diff two peers offline
 // down to the exact byte.
 constexpr unsigned int kGekkoAreaBlockId = 0xa55a0001u;
+constexpr unsigned int kGekkoStateHeaderId = 0xa55a0000u;
 constexpr int kGekkoStateAreaDumpCount = 2;
+
+struct StateAreaView
+{
+    unsigned int nameHash = 0;
+    unsigned int len = 0;
+    const unsigned char* data = nullptr;
+};
+
+// Walks the block table of a BurnStateCompress() blob.
+std::vector<StateAreaView> walk_state_areas(const unsigned char* state, int len)
+{
+    std::vector<StateAreaView> areas;
+    if (state == nullptr || len <= 8)
+    {
+        return areas;
+    }
+
+    int offset = 8;
+    while (offset + 12 <= len)
+    {
+        unsigned int blockId = 0;
+        unsigned int areaLen = 0;
+        unsigned int nameHash = 0;
+        memcpy(&blockId, state + offset, 4);
+        memcpy(&areaLen, state + offset + 4, 4);
+        memcpy(&nameHash, state + offset + 8, 4);
+        if (blockId != kGekkoAreaBlockId || areaLen > static_cast<unsigned int>(len - offset - 12))
+        {
+            break;
+        }
+
+        StateAreaView view;
+        view.nameHash = nameHash;
+        view.len = areaLen;
+        view.data = state + offset + 12;
+        areas.push_back(view);
+
+        offset += 12 + static_cast<int>(areaLen);
+    }
+    return areas;
+}
+
+// FNV-1a over an area payload, same function the state checksum uses.
+unsigned int fnv1a_state_area(const unsigned char* data, unsigned int len)
+{
+    unsigned int fnv = 2166136261u;
+    for (unsigned int i = 0; i < len; i++)
+    {
+        fnv ^= data[i];
+        fnv *= 16777619u;
+    }
+    return fnv;
+}
+
+void write_state_file(const unsigned char* state, int len, int frame, int index)
+{
+    if (state == nullptr || len <= 8)
+    {
+        return;
+    }
+
+    const std::string filename = g_GekkoLogPrefix + "_state_" + std::to_string(index) +
+        "_f" + std::to_string(frame) + ".bin";
+    const std::filesystem::path path = g_GekkoLogDirectory.empty()
+        ? std::filesystem::path(filename)
+        : g_GekkoLogDirectory / filename;
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (out.is_open())
+    {
+        out.write(reinterpret_cast<const char*>(state), len);
+        out.flush();
+    }
+}
 
 void write_state_area_dump(const unsigned char* state, int len, int frame, int index)
 {
@@ -1535,52 +1619,20 @@ void write_state_area_dump(const unsigned char* state, int len, int frame, int i
         write_gekko_log(head.str());
     }
 
-    int offset = 8;
-    int area = 0;
-    while (offset + 12 <= len)
+    const std::vector<StateAreaView> areas = walk_state_areas(state, len);
+    for (std::size_t area = 0; area < areas.size(); area++)
     {
-        unsigned int blockId = 0;
-        unsigned int areaLen = 0;
-        unsigned int nameHash = 0;
-        memcpy(&blockId, state + offset, 4);
-        memcpy(&areaLen, state + offset + 4, 4);
-        memcpy(&nameHash, state + offset + 8, 4);
-        if (blockId != kGekkoAreaBlockId || areaLen > static_cast<unsigned int>(len - offset - 12))
-        {
-            break;
-        }
-
-        // FNV-1a over the area payload, same function the state checksum uses.
-        unsigned int fnv = 2166136261u;
-        for (unsigned int i = 0; i < areaLen; i++)
-        {
-            fnv ^= state[offset + 12 + i];
-            fnv *= 16777619u;
-        }
-
         std::ostringstream stream;
         stream << "state_area dump=" << index << " frame=" << frame
                << " idx=" << area
-               << " name_hash=0x" << std::hex << nameHash
-               << " len=" << std::dec << areaLen
-               << " fnv=0x" << std::hex << fnv;
+               << " name_hash=0x" << std::hex << areas[area].nameHash
+               << " len=" << std::dec << areas[area].len
+               << " fnv=0x" << std::hex
+               << fnv1a_state_area(areas[area].data, areas[area].len);
         write_gekko_log(stream.str());
-
-        offset += 12 + static_cast<int>(areaLen);
-        area++;
     }
 
-    const std::string filename = g_GekkoLogPrefix + "_state_" + std::to_string(index) +
-        "_f" + std::to_string(frame) + ".bin";
-    const std::filesystem::path path = g_GekkoLogDirectory.empty()
-        ? std::filesystem::path(filename)
-        : g_GekkoLogDirectory / filename;
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (out.is_open())
-    {
-        out.write(reinterpret_cast<const char*>(state), len);
-        out.flush();
-    }
+    write_state_file(state, len, frame, index);
 }
 
 // Frame-0 pair: enough to answer "did the two peers boot with the same content?"
@@ -1612,6 +1664,132 @@ void dump_post_desync_state(const unsigned char* state, int len, int frame)
     // Space the two dumps apart: a single pair proves the states differ, a pair
     // 300 frames later shows whether the divergence grows or stays frozen.
     g_GekkoDesyncDumpFrame = frame + kGekkoDesyncDumpSpacingFrames;
+}
+
+// ---------------------------------------------------------------------------
+// Rollback round-trip self-test.
+//
+// The whole rollback contract is "a state saved at frame N, loaded back, and
+// re-saved must produce the same bytes". If it does not, the load path does not
+// restore everything the emulation needs, and a resimulated frame silently
+// disagrees with the peer that ran that frame live - which is exactly the shape
+// of the NeoGeo desync (first report right after the first rollback, with
+// identical inputs).
+//
+// Loading and re-saving here costs two frame-length state copies, so it runs a
+// handful of times per session, only with the verbose log on, and only for
+// FBNeo blobs (BurnStateCompress header). It happens inside the save callback,
+// i.e. at a frame boundary, so the machine has nothing half-updated to lose.
+constexpr int kGekkoRoundtripMaxReportedAreas = 40;
+
+void test_state_roundtrip(const unsigned char* state, int len, int frame, int savedChecksum)
+{
+    if (g_GekkoRoundtripTestsLeft <= 0 || frame < g_GekkoRoundtripNextFrame || len <= 8)
+    {
+        return;
+    }
+
+    unsigned int headerId = 0;
+    memcpy(&headerId, state, 4);
+    if (headerId != kGekkoStateHeaderId)
+    {
+        // Not a BurnStateCompress blob (N64 and other cores use their own path).
+        return;
+    }
+
+    --g_GekkoRoundtripTestsLeft;
+    g_GekkoRoundtripNextFrame = frame + kGekkoRoundtripSpacingFrames;
+
+    CoreRollbackState loaded;
+    loaded.buffer = const_cast<unsigned char*>(state);
+    loaded.len = len;
+    loaded.checksum = savedChecksum;
+    loaded.frame = frame;
+    if (!CoreRollbackLoadGameState(loaded))
+    {
+        std::ostringstream stream;
+        stream << "state_roundtrip frame=" << frame << " result=load_fail";
+        write_gekko_log(stream.str());
+        return;
+    }
+
+    std::vector<unsigned char> resaved(static_cast<std::size_t>(kGekkoStateCapacity));
+    CoreRollbackState result;
+    if (!CoreRollbackSaveGameStateInto(result, resaved.data(), static_cast<int>(kGekkoStateCapacity), frame))
+    {
+        std::ostringstream stream;
+        stream << "state_roundtrip frame=" << frame << " result=save_fail";
+        write_gekko_log(stream.str());
+        return;
+    }
+
+    const std::vector<StateAreaView> before = walk_state_areas(state, len);
+    const std::vector<StateAreaView> after = walk_state_areas(resaved.data(), result.len);
+
+    int differingAreas = 0;
+    int reportedAreas = 0;
+    const std::size_t areaCount = std::max(before.size(), after.size());
+    for (std::size_t area = 0; area < areaCount; area++)
+    {
+        bool differs = area >= before.size() || area >= after.size();
+        if (!differs)
+        {
+            const StateAreaView& a = before[area];
+            const StateAreaView& b = after[area];
+            differs = a.nameHash != b.nameHash || a.len != b.len ||
+                      memcmp(a.data, b.data, a.len) != 0;
+        }
+        if (!differs)
+        {
+            continue;
+        }
+
+        differingAreas++;
+        if (reportedAreas >= kGekkoRoundtripMaxReportedAreas)
+        {
+            continue;
+        }
+        reportedAreas++;
+
+        std::ostringstream stream;
+        stream << "state_roundtrip_area frame=" << frame << " idx=" << area;
+        if (area < before.size())
+        {
+            stream << " name_hash=0x" << std::hex << before[area].nameHash
+                   << std::dec << " len_a=" << before[area].len;
+        }
+        if (area < after.size())
+        {
+            stream << " name_hash_b=0x" << std::hex << after[area].nameHash
+                   << std::dec << " len_b=" << after[area].len;
+        }
+        if (area < before.size() && area < after.size() &&
+            before[area].len == after[area].len)
+        {
+            stream << " fnv_a=0x" << std::hex
+                   << fnv1a_state_area(before[area].data, before[area].len)
+                   << " fnv_b=0x"
+                   << fnv1a_state_area(after[area].data, after[area].len);
+        }
+        write_gekko_log(stream.str());
+    }
+
+    {
+        std::ostringstream stream;
+        stream << "state_roundtrip frame=" << frame << " result="
+               << (differingAreas == 0 ? "ok" : "mismatch")
+               << " len=" << len << " len_resaved=" << result.len
+               << " checksum=" << savedChecksum
+               << " checksum_resaved=" << result.checksum
+               << " areas=" << before.size()
+               << " differing=" << differingAreas;
+        write_gekko_log(stream.str());
+    }
+
+    // Keep both blobs: state_diff.py can then show the exact bytes of every area
+    // the load path failed to restore.
+    write_state_file(state, len, frame, 20);
+    write_state_file(resaved.data(), result.len, frame, 21);
 }
 
 bool save_gekko_state(const PendingGekkoSave& save)
@@ -1699,6 +1877,9 @@ bool save_gekko_state(const PendingGekkoSave& save)
                          static_cast<int>(state.len), save.frame);
         dump_post_desync_state(static_cast<const unsigned char*>(save.state),
                                static_cast<int>(state.len), save.frame);
+        test_state_roundtrip(static_cast<const unsigned char*>(save.state),
+                             static_cast<int>(state.len), save.frame,
+                             state.checksum);
     }
 
     // Spectate keyframe: when the UI asked for one and we aren't already holding a snapshot,
