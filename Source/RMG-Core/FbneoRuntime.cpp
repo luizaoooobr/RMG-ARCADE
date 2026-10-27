@@ -48,97 +48,16 @@ extern "C" {
 extern INT32 BurnStateCompress(UINT8** pDef, INT32* pnDefLen, INT32 bAll);
 extern INT32 BurnStateDecompress(UINT8* Def, INT32 nDefLen, INT32 bAll);
 
-// Sound-only state snapshot for rollback (defined in the FBNeo overlay,
-// capcom/cps_mem.cpp; C++ linkage like the rest of the lib symbols). Capture
-// saves ONLY the sound-chip state (Z80 + YM2151/OKI/QSound + timer + latches);
-// replay restores it. Used so rollback resims do not re-trigger already
-// audible voices (SFX overlap "toca-discos" on netplay).
-extern INT32 RMGK_FBNEO_SndStateSnapshot();
-extern INT32 RMGK_FBNEO_SndStateReplay();
-extern void  RMGK_FBNEO_SndStateShadowCapture();
-extern void  RMGK_FBNEO_SndStateMarkLoad();
-extern INT32 RMGK_FBNEO_SndStateShadowLength();
-extern int   RMGK_FBNEO_SndStateShadowUsed();
-// Diagnostics sink (rmgk_gekko.cpp): one line per snapshot/replay so a test
-// session proves whether the rollback audio patch actually fired.
+// Diagnostics sink (rmgk_gekko.cpp): one line per audible frame so a captured
+// session can be compared frame-by-frame against the peer's log (an RMS
+// mismatch means the audio stream diverged even if the game state did not).
 extern void write_gekko_log(const std::string& message);
 
-static int      rmgkSndAudioFramesEmitted = 0;   // audible-history depth (gates the snapshot)
-static bool     rmgkSndPending            = false;
-static long long rmgkSndPendingUs         = 0;
-static int      rmgkSndRestores           = 0;
-static int      rmgkSndSnapshots          = 0;
-static int      rmgkSndSnapshotFails      = 0;
-static int      rmgkSndReplayFails        = 0;
-static int      rmgkSndGateSkips          = 0;
-static bool     rmgkSndGateLogged         = false;
-static bool     rmgkSndReplayedThisFrame  = false;
-static int      rmgkSndFrameIndex         = 0;
+static int rmgkSndFrameIndex = 0;
 
 static void rmgkSndLog(const std::string& message)
 {
     write_gekko_log("rmgk " + message);
-}
-
-static bool rmgkSndArm()
-{
-    // Only arm once ~0.75s of audible history has passed so startup savestate
-    // loads never replay garbage/pre-init chip state.
-    if (rmgkSndAudioFramesEmitted < 45)
-    {
-        rmgkSndGateSkips++;
-        if (!rmgkSndGateLogged)
-        {
-            rmgkSndGateLogged = true;
-            rmgkSndLog("snd_snapshot skip gate frames=" +
-                       std::to_string(rmgkSndAudioFramesEmitted));
-        }
-        return false;
-    }
-    const INT32 snap = RMGK_FBNEO_SndStateSnapshot();
-    if (snap > 0)
-    {
-        rmgkSndSnapshots++;
-        rmgkSndLog("snd_snapshot result=ok len=" + std::to_string((long long)snap));
-        const auto now = std::chrono::steady_clock::now().time_since_epoch();
-        rmgkSndPendingUs = (long long)std::chrono::duration_cast<std::chrono::microseconds>(now).count();
-        return true;
-    }
-    rmgkSndSnapshotFails++;
-    rmgkSndLog("snd_snapshot result=fail code=" + std::to_string((long long)snap));
-    return false;
-}
-
-static void rmgkSndMaybeReplay()
-{
-    if (!rmgkSndPending) return;
-    rmgkSndPending = false;
-    rmgkSndReplayedThisFrame = true;
-    const auto now = std::chrono::steady_clock::now().time_since_epoch();
-    const long long nowUs = (long long)std::chrono::duration_cast<std::chrono::microseconds>(now).count();
-    // A stale snapshot (e.g. captured at session teardown then re-arm never
-    // happened) must not replay on an unrelated session: snapshots only stay
-    // valid for one rollback batch (a few ms), allow a generous 2s.
-    if (nowUs - rmgkSndPendingUs > 2000000LL)
-    {
-        rmgkSndLog("snd_replay result=drop_stale");
-        return;    // drop stale
-    }
-    const INT32 shadowLen = RMGK_FBNEO_SndStateShadowLength();
-    const bool  useShadow = RMGK_FBNEO_SndStateShadowUsed() != 0;
-    const INT32 r = RMGK_FBNEO_SndStateReplay();
-    rmgkSndRestores++;
-    if (r == 0)
-    {
-        rmgkSndLog(std::string("snd_replay result=ok via=") +
-                   (useShadow ? "shadow" : "snapshot") +
-                   " len=" + std::to_string((long long)shadowLen));
-    }
-    else
-    {
-        rmgkSndReplayFails++;
-        rmgkSndLog("snd_replay result=fail code=" + std::to_string((long long)r));
-    }
 }
 
 // Global variable at global scope: the Itanium ABI does not mangle these, so the
@@ -1345,17 +1264,9 @@ bool LoadState(const unsigned char* buffer, int len)
 {
     if (!g_driverInited || !buffer || len <= 0) return false;
     std::lock_guard<std::mutex> lock(g_frameMutex);
-    // Rollback resim loads re-run already-audible frames and the sound chips
-    // re-trigger. Snapshot ONLY the sound state before the load restores the
-    // pre-rollback emu state; the next audible frame replays it (video/logic
-    // keep the corrected state).
-    if (!rmgkSndPending)
-    {
-        rmgkSndPending = rmgkSndArm();
-    }
-    // The emu is about to rewind: the shadow (audible frontier) is now the
-    // state that must be restored after the resim batch completes.
-    RMGK_FBNEO_SndStateMarkLoad();
+    // The state blob now carries the complete sound-chip state (CPU, Z80, YM2151
+    // and MSM6295 render phase included), so a rollback load restores the audio
+    // timeline together with the game state. No separate sound shadow is needed.
     return BurnStateDecompress((UINT8*)buffer, len, 1) == 0;
 }
 
@@ -1421,16 +1332,6 @@ bool RunFrame(int flags)
     }
 
     const bool audioOutput = (flags & Output_Audio) != 0;
-    rmgkSndReplayedThisFrame = false;
-    // First audible frame after a rollback resim batch: put the sound chips
-    // back on the audible timeline so resim-retriggered voices are dropped.
-    if (audioOutput)
-    {
-        // BISECT TEST: replay of the audible-frontier sound state disabled to
-        // check whether it is the source of the looping/overlapping sound.
-        // rmgkSndMaybeReplay();
-        rmgkSndAudioFramesEmitted++;
-    }
 
     apply_latched_input();
     pBurnDraw     = (flags & Output_Video) ? g_videoBuffer.data() : nullptr;
@@ -1454,23 +1355,18 @@ bool RunFrame(int flags)
 
     auto t0 = clock_::now();
     BurnDrvFrame();
-    // Audible frames are the rollback sound frontier: keep the exact chip state
-    // they ended on. Speculative (Output_None) frames below advance the sound
-    // CPUs without rendering, so a load-time capture would be K frames ahead.
+    // One diagnostic line per audible frame: lets a captured netplay session be
+    // compared frame-by-frame against the peer's log (RMS mismatch == the audio
+    // stream diverged even when the visible game state still matched).
     if (audioOutput)
     {
-        RMGK_FBNEO_SndStateShadowCapture();
-        // One line per audible frame, 1:1 with the snd-shadow dump: lets a
-        // captured session be decoded offline to find what the quiet frames
-        // (rollback-cadence amplitude dips) have in common.
         const int n = (nBurnSoundLen > 0 ? nBurnSoundLen : 0) * 2;
         double sq = 0.0;
         const int16_t* pcm = g_soundBuffer.data();
         for (int i = 0; i < n; i++) { const double v = (double)pcm[i]; sq += v * v; }
         const int rms = n > 0 ? (int)(std::sqrt(sq / (double)n) + 0.5) : 0;
         rmgkSndLog("snd_f f=" + std::to_string(rmgkSndFrameIndex) + " rms=" +
-                   std::to_string(rms) + " rep=" +
-                   std::to_string(rmgkSndReplayedThisFrame ? 1 : 0));
+                   std::to_string(rms));
         rmgkSndFrameIndex++;
     }
     g_stats = {};

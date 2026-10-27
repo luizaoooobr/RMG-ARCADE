@@ -47,8 +47,6 @@ INT32 Hkittymp = 0;
 INT32 Ssf2tb = 0;
 INT32 Dinohunt = 0;
 INT32 Port6SoundWrite = 0;
-int g_sndCmdN = 0, g_sndFadeN = 0;
-unsigned char g_sndCmdLast = 0, g_sndFadeLast = 0;
 INT32 CpsBootlegEEPROM = 0;
 INT32 Cps2Turbo = 0;
 INT32 Jurassic99 = 0;
@@ -385,7 +383,6 @@ void CpsWritePort(const UINT32 ia, UINT8 d)
 				PsndSyncZ80((INT64)SekTotalCycles() * nCpsZ80Cycles / nCpsCycles);
 
 				PsndCode = d;
-				g_sndCmdN++; g_sndCmdLast = d;
 				return;
 			}
 
@@ -394,7 +391,6 @@ void CpsWritePort(const UINT32 ia, UINT8 d)
 				PsndSyncZ80((INT64)SekTotalCycles() * nCpsZ80Cycles / nCpsCycles);
 
 				PsndFade = d;
-				g_sndFadeN++; g_sndFadeLast = d;
 				return;
 			}
 		} else {
