@@ -5865,7 +5865,9 @@ void MainWindow::updateNetplayStatsOverlay(void)
 
     if (stats.desync)
     {
-        text += QStringLiteral("\nDESYNC @ frame %1\n  local=%2 remote=%3")
+        // No "desync" wording on screen: the banner reports the frame the
+        // mismatch was seen at plus both checksums.
+        text += QStringLiteral("\nframe %1\n  local=%2 remote=%3")
             .arg(stats.desyncFrame)
             .arg(stats.desyncLocalChecksum)
             .arg(stats.desyncRemoteChecksum);

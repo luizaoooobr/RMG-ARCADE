@@ -263,10 +263,54 @@ long long g_GekkoLastPendingSaveUs = 0;
 // Checksum desync reported by GekkoNet for this session (config.desync_detection
 // is on). Surfaced through get_live_stats() so the frontend can warn the player,
 // instead of the event being silently dropped.
-bool g_GekkoDesyncDetected = false;
-int  g_GekkoDesyncFrame = -1;
-unsigned int g_GekkoDesyncLocalChecksum = 0;
-unsigned int g_GekkoDesyncRemoteChecksum = 0;
+//
+// GekkoNet has no "desync repaired" event: when rollback re-simulates the
+// divergent frame and the checksums agree again the reports simply stop. The
+// warning therefore has to expire on its own, so every report is stamped with
+// the visible-frame counter here and get_live_stats() runs a small episode
+// state machine on top of it (see kGekkoDesyncOverlayHoldFrames).
+std::atomic_bool g_GekkoDesyncDetected{false};
+std::atomic<int>  g_GekkoDesyncFrame{-1};
+std::atomic<unsigned int> g_GekkoDesyncLocalChecksum{0};
+std::atomic<unsigned int> g_GekkoDesyncRemoteChecksum{0};
+std::atomic<uint64_t> g_GekkoDesyncSeenAtVisibleFrame{0};
+// How long the warning stays on screen once an episode starts. ~2.5 s at 60 fps:
+// long enough to read, short enough that a divergence which rollback already
+// repaired does not leave a stale banner behind.
+constexpr uint64_t kGekkoDesyncOverlayHoldFrames = 150;
+// A quiet stretch this long (no further reports) means the episode is over and
+// the next report is a *new* one, which is allowed to raise the banner again.
+constexpr uint64_t kGekkoDesyncRearmFrames = 300;
+
+// How many state dumps the per-area diagnostic has written for the current
+// session (see dump_state_areas). Reset on session start so back-to-back tests
+// keep producing a comparable pair of dumps.
+int g_GekkoStateAreaDumps = 0;
+
+// Post-desync dump. A checksum mismatch is reported a few frames after the frame
+// that actually diverged, and at a different local frame on each peer (the
+// report travels with the remote input batch). Both peers therefore target the
+// same absolute frame - report + lead - so the two dumps line up area by area.
+constexpr int kGekkoDesyncDumpLeadFrames = 60;
+constexpr int kGekkoDesyncDumpSpacingFrames = 300;
+constexpr int kGekkoDesyncDumpCount = 2;
+int g_GekkoDesyncDumpFrame = -1;   // first target frame, -1 = nothing pending
+int g_GekkoDesyncDumpsLeft = 0;
+int g_GekkoDesyncDumpIndex = 0;
+
+void request_desync_state_dump(int desyncFrame)
+{
+    // Only the first mismatch of a session arms the dump. A divergence that
+    // rollback never repairs keeps reporting every frame; re-arming on each
+    // report would overwrite the first (most useful) pair with later ones.
+    if (g_GekkoDesyncDumpFrame >= 0)
+    {
+        return;
+    }
+    g_GekkoDesyncDumpFrame = desyncFrame + kGekkoDesyncDumpLeadFrames;
+    g_GekkoDesyncDumpsLeft = kGekkoDesyncDumpCount;
+    g_GekkoDesyncDumpIndex = 0;
+}
 
 // Rollback/"jitter" telemetry for the on-screen stats overlay. Updated on the
 // emulation thread each frame (apply_gekko_frame_pacing) and sampled by the
@@ -987,6 +1031,10 @@ void reset_gekko_log()
     reset_rollback_log_session();
     rmgk_pacing_trace_reset();
     reset_rollback_present_pacer();
+    g_GekkoStateAreaDumps = 0;
+    g_GekkoDesyncDumpFrame = -1;
+    g_GekkoDesyncDumpsLeft = 0;
+    g_GekkoDesyncDumpIndex = 0;
 
     const char* logEnv = std::getenv("RMGK_GEKKO_LOG");
     g_GekkoLogEnabled = CoreSettingsGetBoolValue(SettingsID::Rollback_VerboseStats) ||
@@ -1411,10 +1459,16 @@ void log_session_events()
         // to warn the player, so it must not depend on the verbose log switch.
         if (event->type == GekkoDesyncDetected)
         {
-            g_GekkoDesyncDetected = true;
-            g_GekkoDesyncFrame = event->data.desynced.frame;
-            g_GekkoDesyncLocalChecksum = event->data.desynced.local_checksum;
-            g_GekkoDesyncRemoteChecksum = event->data.desynced.remote_checksum;
+            g_GekkoDesyncDetected.store(true, std::memory_order_relaxed);
+            g_GekkoDesyncFrame.store(event->data.desynced.frame, std::memory_order_relaxed);
+            g_GekkoDesyncLocalChecksum.store(event->data.desynced.local_checksum, std::memory_order_relaxed);
+            g_GekkoDesyncRemoteChecksum.store(event->data.desynced.remote_checksum, std::memory_order_relaxed);
+            // Timestamp the report against the visible-frame clock. A repaired
+            // divergence stops reporting, so the UI can let the warning expire.
+            g_GekkoDesyncSeenAtVisibleFrame.store(
+                g_GekkoVisibleFrameCount.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            request_desync_state_dump(event->data.desynced.frame);
         }
 
         if (!g_GekkoLogEnabled)
@@ -1448,6 +1502,116 @@ void log_session_events()
         }
         write_gekko_log(stream.str());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Netplay state-area diagnostic.
+//
+// GekkoNet reduces the whole emulated machine to a single FNV-1a over the state
+// blob, so a desync report says "the bytes differ" but never *where*. That is
+// fine for the transient kind (rollback repairs it), but a divergence that
+// reports on every frame from frame 0 means the two peers booted with
+// different content and the log has to be bisected by hand.
+//
+// BurnStateCompress() writes a plain, uncompressed sequence of
+//     [u32 0xa55a0001][u32 len][u32 name-hash][len bytes]
+// after an 8-byte header, so the block table can be walked here. The first
+// states of a session are dumped next to the gekko log together with one line
+// per area (length, name hash, FNV), which is enough to diff two peers offline
+// down to the exact byte.
+constexpr unsigned int kGekkoAreaBlockId = 0xa55a0001u;
+constexpr int kGekkoStateAreaDumpCount = 2;
+
+void write_state_area_dump(const unsigned char* state, int len, int frame, int index)
+{
+    if (state == nullptr || len <= 8)
+    {
+        return;
+    }
+
+    {
+        std::ostringstream head;
+        head << "state_dump index=" << index << " frame=" << frame << " len=" << len;
+        write_gekko_log(head.str());
+    }
+
+    int offset = 8;
+    int area = 0;
+    while (offset + 12 <= len)
+    {
+        unsigned int blockId = 0;
+        unsigned int areaLen = 0;
+        unsigned int nameHash = 0;
+        memcpy(&blockId, state + offset, 4);
+        memcpy(&areaLen, state + offset + 4, 4);
+        memcpy(&nameHash, state + offset + 8, 4);
+        if (blockId != kGekkoAreaBlockId || areaLen > static_cast<unsigned int>(len - offset - 12))
+        {
+            break;
+        }
+
+        // FNV-1a over the area payload, same function the state checksum uses.
+        unsigned int fnv = 2166136261u;
+        for (unsigned int i = 0; i < areaLen; i++)
+        {
+            fnv ^= state[offset + 12 + i];
+            fnv *= 16777619u;
+        }
+
+        std::ostringstream stream;
+        stream << "state_area dump=" << index << " frame=" << frame
+               << " idx=" << area
+               << " name_hash=0x" << std::hex << nameHash
+               << " len=" << std::dec << areaLen
+               << " fnv=0x" << std::hex << fnv;
+        write_gekko_log(stream.str());
+
+        offset += 12 + static_cast<int>(areaLen);
+        area++;
+    }
+
+    const std::string filename = g_GekkoLogPrefix + "_state_" + std::to_string(index) +
+        "_f" + std::to_string(frame) + ".bin";
+    const std::filesystem::path path = g_GekkoLogDirectory.empty()
+        ? std::filesystem::path(filename)
+        : g_GekkoLogDirectory / filename;
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (out.is_open())
+    {
+        out.write(reinterpret_cast<const char*>(state), len);
+        out.flush();
+    }
+}
+
+// Frame-0 pair: enough to answer "did the two peers boot with the same content?"
+// without filling the log directory.
+void dump_state_areas(const unsigned char* state, int len, int frame)
+{
+    if (g_GekkoStateAreaDumps >= kGekkoStateAreaDumpCount)
+    {
+        return;
+    }
+    write_state_area_dump(state, len, frame, g_GekkoStateAreaDumps++);
+}
+
+// A checksum mismatch is reported a few frames after the frame that diverged, so
+// each peer sees the event at a different local frame. The target frame for the
+// post-desync dump is fixed in request_desync_state_dump(), which makes the
+// host's and the client's files directly comparable: same frame index, same area
+// table, same order.
+void dump_post_desync_state(const unsigned char* state, int len, int frame)
+{
+    if (g_GekkoDesyncDumpsLeft <= 0 || frame < g_GekkoDesyncDumpFrame)
+    {
+        return;
+    }
+    // 10+ keeps these files apart from the frame-0 pair (0 and 1).
+    write_state_area_dump(state, len, frame, 10 + g_GekkoDesyncDumpIndex);
+    g_GekkoDesyncDumpIndex++;
+    g_GekkoDesyncDumpsLeft--;
+    // Space the two dumps apart: a single pair proves the states differ, a pair
+    // 300 frames later shows whether the divergence grows or stays frozen.
+    g_GekkoDesyncDumpFrame = frame + kGekkoDesyncDumpSpacingFrames;
 }
 
 bool save_gekko_state(const PendingGekkoSave& save)
@@ -1526,6 +1690,15 @@ bool save_gekko_state(const PendingGekkoSave& save)
                << " checksum=" << static_cast<unsigned int>(state.checksum)
                << " elapsed_us=" << g_GekkoLastSaveStateUs;
         write_gekko_log(stream.str());
+    }
+
+    // Per-area diagnostic for the first states of a session (see above).
+    if (g_GekkoLogEnabled)
+    {
+        dump_state_areas(static_cast<const unsigned char*>(save.state),
+                         static_cast<int>(state.len), save.frame);
+        dump_post_desync_state(static_cast<const unsigned char*>(save.state),
+                               static_cast<int>(state.len), save.frame);
     }
 
     // Spectate keyframe: when the UI asked for one and we aren't already holding a snapshot,
@@ -3363,10 +3536,11 @@ void rmgk_gekko::close_session()
     g_GekkoExecuting.store(false, std::memory_order_relaxed);
     g_GekkoPendingSaves.clear();
     // Reset the checksum-desync report so a new session starts clean.
-    g_GekkoDesyncDetected = false;
-    g_GekkoDesyncFrame = -1;
-    g_GekkoDesyncLocalChecksum = 0;
-    g_GekkoDesyncRemoteChecksum = 0;
+    g_GekkoDesyncDetected.store(false, std::memory_order_relaxed);
+    g_GekkoDesyncFrame.store(-1, std::memory_order_relaxed);
+    g_GekkoDesyncLocalChecksum.store(0, std::memory_order_relaxed);
+    g_GekkoDesyncRemoteChecksum.store(0, std::memory_order_relaxed);
+    g_GekkoDesyncSeenAtVisibleFrame.store(0, std::memory_order_relaxed);
     // Reset rollback/"jitter" telemetry for the on-screen stats overlay.
     g_GekkoFramesAhead = 0.0f;
     g_GekkoJitterMs = 0;
@@ -3520,10 +3694,53 @@ GekkoLiveStats rmgk_gekko::get_live_stats()
     }
     out.fps = s_smoothedFps;
 
-    out.desync = g_GekkoDesyncDetected;
-    out.desyncFrame = g_GekkoDesyncFrame;
-    out.desyncLocalChecksum = g_GekkoDesyncLocalChecksum;
-    out.desyncRemoteChecksum = g_GekkoDesyncRemoteChecksum;
+    // Desync warning: shown as a short episode instead of "while reported".
+    // GekkoNet keeps reporting a mismatch every frame for as long as the two
+    // peers disagree, and a real divergence is never repaired on its own - so
+    // tying the banner to "is it still reporting" would pin it on screen
+    // forever. Instead an episode opens with the first report, stays visible
+    // for kGekkoDesyncOverlayHoldFrames, and closes once reports have been
+    // quiet for kGekkoDesyncRearmFrames; a later report then opens a new one.
+    //
+    // The three statics live on the reading (UI) thread only.
+    static uint64_t s_desyncEpisodeStart = 0;   // visible frame the banner went up
+    static uint64_t s_desyncEpisodeReport = 0;  // newest report already accounted for
+
+    const uint64_t nowFrame = frameCount;
+    const uint64_t desyncSeenAt =
+        g_GekkoDesyncSeenAtVisibleFrame.load(std::memory_order_relaxed);
+    const bool desyncReported =
+        g_GekkoDesyncDetected.load(std::memory_order_relaxed) && desyncSeenAt != 0;
+
+    if (!desyncReported)
+    {
+        s_desyncEpisodeStart = 0;
+        s_desyncEpisodeReport = 0;
+    }
+    else if (s_desyncEpisodeStart == 0)
+    {
+        // Only a report we have not shown yet can raise a new banner.
+        if (desyncSeenAt != s_desyncEpisodeReport)
+        {
+            s_desyncEpisodeStart = desyncSeenAt;
+        }
+    }
+    else if (nowFrame >= desyncSeenAt &&
+             (nowFrame - desyncSeenAt) > kGekkoDesyncRearmFrames)
+    {
+        // Reports stopped long enough that rollback repaired the divergence.
+        s_desyncEpisodeStart = 0;
+        s_desyncEpisodeReport = desyncSeenAt;
+    }
+
+    const bool desyncFresh =
+        desyncReported && s_desyncEpisodeStart != 0 &&
+        nowFrame >= s_desyncEpisodeStart &&
+        (nowFrame - s_desyncEpisodeStart) <= kGekkoDesyncOverlayHoldFrames;
+    out.desync = desyncFresh;
+    out.desyncFrame = desyncFresh ? g_GekkoDesyncFrame.load(std::memory_order_relaxed) : -1;
+    out.desyncLocalChecksum = desyncFresh ? g_GekkoDesyncLocalChecksum.load(std::memory_order_relaxed) : 0u;
+    out.desyncRemoteChecksum = desyncFresh ? g_GekkoDesyncRemoteChecksum.load(std::memory_order_relaxed) : 0u;
 
     // Rollback/"jitter" telemetry for the on-screen stats overlay.
     out.framesAhead = g_GekkoFramesAhead;
