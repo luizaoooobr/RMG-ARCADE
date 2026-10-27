@@ -1275,23 +1275,24 @@ static void FbneoAudioDumpWriteWav()
     const unsigned int dataLen =
         static_cast<unsigned int>(s_FbneoAudioTrace.dumpPcm.size()) * 2u;
     unsigned char hdr[44];
-    hdr[0] = 'R';  hdr[1] = 'I';  hdr[2] = 'F';  hdr[3] = 'F';
+    memcpy(hdr + 0, "RIFF", 4);
     Uint32 riff = 36u + dataLen;
     memcpy(hdr + 4, &riff, 4);
-    memcpy(hdr + 8, "WAVEfmt ", 8);
+    memcpy(hdr + 8, "WAVE", 4);
+    memcpy(hdr + 12, "fmt ", 4);
     Uint32 fmtLen = 16u;
-    memcpy(hdr + 12, &fmtLen, 4);
+    memcpy(hdr + 16, &fmtLen, 4);
     unsigned short fmtPcm = 1u;
-    memcpy(hdr + 16, &fmtPcm, 2);
-    memcpy(hdr + 18, &channels, 2);
-    memcpy(hdr + 20, &sampleRate, 4);
+    memcpy(hdr + 20, &fmtPcm, 2);
+    memcpy(hdr + 22, &channels, 2);
+    memcpy(hdr + 24, &sampleRate, 4);
     Uint32 byteRate = sampleRate * channels * (bitsPerSample / 8);
-    memcpy(hdr + 24, &byteRate, 4);
+    memcpy(hdr + 28, &byteRate, 4);
     unsigned short blockAlign = channels * (bitsPerSample / 8);
-    memcpy(hdr + 28, &blockAlign, 2);
-    memcpy(hdr + 30, &bitsPerSample, 2);
-    memcpy(hdr + 34, "data", 4);
-    memcpy(hdr + 36, &dataLen, 4);
+    memcpy(hdr + 32, &blockAlign, 2);
+    memcpy(hdr + 34, &bitsPerSample, 2);
+    memcpy(hdr + 36, "data", 4);
+    memcpy(hdr + 40, &dataLen, 4);
     out.write(reinterpret_cast<const char*>(hdr), 44);
     out.write(reinterpret_cast<const char*>(s_FbneoAudioTrace.dumpPcm.data()),
         static_cast<std::streamsize>(s_FbneoAudioTrace.dumpPcm.size() * 2));
@@ -1315,7 +1316,7 @@ static void FbneoAudioDumpWriteWav()
 // torn down, so a mid-match disk write can never spike the present path.
 static void FbneoAudioTraceFlush()
 {
-    if (!s_FbneoAudioTrace.loaded || s_FbneoAudioTrace.pending.empty())
+    if (!s_FbneoAudioTrace.loaded)
     {
         return;
     }
@@ -2022,6 +2023,22 @@ static void FbneoPushAudio(const int16_t* audio, int audioFrames)
         return;
     }
 
+    // Netplay on a single PC runs two instances at once; both render the same
+    // sound, so the second window must not open an audio device (it would be
+    // heard as a ~30 ms slapback of every sound). RMGK_FBNEO_MUTE=1 disables
+    // only the device output: tracing/dumps keep working.
+    static const bool s_fbneoMuted = []()
+    {
+        const char* env = std::getenv("RMGK_FBNEO_MUTE");
+        if (env == nullptr || env[0] == 0 || std::strcmp(env, "0") == 0)
+        {
+            return false;
+        }
+        fprintf(stderr, "[FBNEO-DBG] audio: muted by RMGK_FBNEO_MUTE\n");
+        fflush(stderr);
+        return true;
+    }();
+
     // The netcode paces visible frames at the timesync scale (0.99..1.01), so the
     // number of samples pushed per real second is not exactly the declared 48000
     // (e.g. 805 samples/frame at 59.0 fps = 47.5k/s starves the device and makes
@@ -2030,7 +2047,7 @@ static void FbneoPushAudio(const int16_t* audio, int audioFrames)
     // feed the delta into the stream's frequency ratio: the queue then drains at
     // exactly the push rate and the pitch shift stays under 1%.
     const Uint64 nowNs = SDL_GetTicksNS();
-    if (s_FbneoAudioStream == nullptr)
+    if (s_FbneoAudioStream == nullptr && !s_fbneoMuted)
     {
         if (!SDL_InitSubSystem(SDL_INIT_AUDIO))
         {
@@ -2188,6 +2205,8 @@ static void FbneoPushAudio(const int16_t* audio, int audioFrames)
         }
         s_FbneoAudioTrace.lastHash = hash;
     }
+    if (!s_fbneoMuted)
+    {
     if (s_windowStartNs == 0)
     {
         s_windowStartNs = nowNs;
@@ -2224,6 +2243,7 @@ static void FbneoPushAudio(const int16_t* audio, int audioFrames)
     }
 
     SDL_PutAudioStreamData(s_FbneoAudioStream, audio, len);
+    }
 
     FbneoAudioTraceTick(SDL_GetTicksNS());
 }

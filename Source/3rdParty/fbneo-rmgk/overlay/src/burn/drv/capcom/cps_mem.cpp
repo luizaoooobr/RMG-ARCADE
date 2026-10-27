@@ -870,6 +870,7 @@ static INT32  rmgkSndShadowCap   = 0;
 static INT32  rmgkSndShadowLen   = 0;
 static bool   rmgkSndShadowValid = false;
 static bool   rmgkSndShadowStale = false;
+static INT32  rmgkSndShadowFrames = 0;
 
 // Load-time capture (kept as the fallback when no shadow exists yet, e.g. the
 // first rollback right after the gate opens).
@@ -884,6 +885,30 @@ void RMGK_FBNEO_SndStateShadowCapture()
 	const INT32 r = rmgkSndCaptureTo(&rmgkSndShadowBuf, &rmgkSndShadowCap, &rmgkSndShadowLen);
 	rmgkSndShadowValid = (r > 0);
 	rmgkSndShadowStale = false;
+
+	// Debug aid: write the per-frame sound state next to the session logs
+	// (<prefix>_snd_shadow.bin) so the rollback audio analysis can decode the
+	// chip state of every audible frame offline. Format: [u32 len][blob]...
+	if (rmgkSndShadowValid && ++rmgkSndShadowFrames <= 3000) {
+		static FILE* fp = nullptr;
+		static bool tried = false;
+		if (!tried) {
+			tried = true;
+			const char* dir = getenv("RMGK_ROLLBACK_LOG_DIR");
+			const char* pre = getenv("RMGK_ROLLBACK_LOG_PREFIX");
+			if (dir != NULL && *dir != 0) {
+				char path[1024];
+				snprintf(path, sizeof(path), "%s/%s_snd_shadow.bin",
+					dir, (pre != NULL && *pre != 0) ? pre : "fbneo");
+				fp = fopen(path, "wb");
+			}
+		}
+		if (fp != NULL) {
+			UINT32 l = (UINT32)rmgkSndShadowLen;
+			fwrite(&l, 4, 1, fp);
+			fwrite(rmgkSndShadowBuf, 1, (size_t)rmgkSndShadowLen, fp);
+		}
+	}
 }
 
 // A rollback load rewound the emu: from now on the shadow is the frontier.

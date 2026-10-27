@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -71,6 +72,8 @@ static int      rmgkSndSnapshotFails      = 0;
 static int      rmgkSndReplayFails        = 0;
 static int      rmgkSndGateSkips          = 0;
 static bool     rmgkSndGateLogged         = false;
+static bool     rmgkSndReplayedThisFrame  = false;
+static int      rmgkSndFrameIndex         = 0;
 
 static void rmgkSndLog(const std::string& message)
 {
@@ -110,6 +113,7 @@ static void rmgkSndMaybeReplay()
 {
     if (!rmgkSndPending) return;
     rmgkSndPending = false;
+    rmgkSndReplayedThisFrame = true;
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
     const long long nowUs = (long long)std::chrono::duration_cast<std::chrono::microseconds>(now).count();
     // A stale snapshot (e.g. captured at session teardown then re-arm never
@@ -1417,23 +1421,33 @@ bool RunFrame(int flags)
     }
 
     const bool audioOutput = (flags & Output_Audio) != 0;
+    rmgkSndReplayedThisFrame = false;
     // First audible frame after a rollback resim batch: put the sound chips
     // back on the audible timeline so resim-retriggered voices are dropped.
     if (audioOutput)
     {
-        rmgkSndMaybeReplay();
+        // BISECT TEST: replay of the audible-frontier sound state disabled to
+        // check whether it is the source of the looping/overlapping sound.
+        // rmgkSndMaybeReplay();
         rmgkSndAudioFramesEmitted++;
     }
 
     apply_latched_input();
     pBurnDraw     = (flags & Output_Video) ? g_videoBuffer.data() : nullptr;
-    pBurnSoundOut = (flags & Output_Audio) ? g_soundBuffer.data() : nullptr;
+    // Audio is part of the emulated state, not just an output: the sound DSPs
+    // only advance when pBurnSoundOut is set (e.g. qs.cpp does
+    // `if (pBurnSoundOut) QscUpdate(...)` in QsndEndFrame). Leaving it null on
+    // speculative rollback frames makes the sound-chip state depend on each
+    // peer's rollback history, which shows up as a GekkoNet checksum desync and
+    // as divergent/repeated audio. Render into the scratch buffer on every
+    // frame; only audible frames hand it to the presenter.
+    pBurnSoundOut = g_soundBuffer.data();
 
     // The sound cores accumulate into pBurnSoundOut instead of overwriting it,
     // so the buffer has to be zeroed before each frame -- otherwise the samples
     // pile up frame after frame and eventually overflow. (Every other FBNeo
     // frontend does this; omitting it made replayed frames diverge.)
-    if (flags & Output_Audio) {
+    {
         const size_t bytes = (size_t)(nBurnSoundLen > 0 ? nBurnSoundLen : 0) * 2 * sizeof(int16_t);
         memset(g_soundBuffer.data(), 0, std::min(bytes, g_soundBuffer.size() * sizeof(int16_t)));
     }
@@ -1446,6 +1460,18 @@ bool RunFrame(int flags)
     if (audioOutput)
     {
         RMGK_FBNEO_SndStateShadowCapture();
+        // One line per audible frame, 1:1 with the snd-shadow dump: lets a
+        // captured session be decoded offline to find what the quiet frames
+        // (rollback-cadence amplitude dips) have in common.
+        const int n = (nBurnSoundLen > 0 ? nBurnSoundLen : 0) * 2;
+        double sq = 0.0;
+        const int16_t* pcm = g_soundBuffer.data();
+        for (int i = 0; i < n; i++) { const double v = (double)pcm[i]; sq += v * v; }
+        const int rms = n > 0 ? (int)(std::sqrt(sq / (double)n) + 0.5) : 0;
+        rmgkSndLog("snd_f f=" + std::to_string(rmgkSndFrameIndex) + " rms=" +
+                   std::to_string(rms) + " rep=" +
+                   std::to_string(rmgkSndReplayedThisFrame ? 1 : 0));
+        rmgkSndFrameIndex++;
     }
     g_stats = {};
     g_stats.total_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(

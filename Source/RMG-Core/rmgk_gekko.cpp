@@ -2727,14 +2727,13 @@ bool rmgk_gekko::start_p2p_session(const char* gameName, int players, int inputS
     config.input_prediction_window = static_cast<unsigned char>(clampedPredictionWindow);
     config.input_size = static_cast<unsigned int>(inputSize);
     config.state_size = kGekkoStateCapacity;
-    // Limited saving keeps GekkoNet's state ring at 2 buffers instead of
-    // (input_prediction_window + 2) == 9, and stops it from saving the full
-    // emulator state every frame and every re-simulated frame. With the FBNeo
-    // state buffer sized at kGekkoStateCapacity that removes a full
-    // BurnStateCompress (scan + malloc + copy) per frame, which is what was
-    // cutting the frame rate and ballooning memory during netplay.
-    // GekkoNet disables desync detection when limited saving is on.
-    config.limited_saving = true;
+    // BISECT: restore the first-commit rollback cadence. With limited_saving
+    // the ring keeps only 2 states and saves once per prediction window, so a
+    // rewind re-simulates a much longer span; for FBNeo that span re-renders
+    // the sound chips and shows up as repeated/looping audio. Saving every
+    // frame (as before 142e3c1) rewinds exactly. The 2 MB capacity is kept so
+    // the 9 buffers stay ~18 MB instead of the original ~216 MB.
+    config.limited_saving = false;
     config.desync_detection = true;
     config.check_distance = 10;
     gekko_start(g_GekkoSession, &config);
@@ -2981,14 +2980,13 @@ bool rmgk_gekko::start_lobby_session(const char* gameName, int players, int inpu
     config.input_prediction_window = static_cast<unsigned char>(clampedPredictionWindow);
     config.input_size = static_cast<unsigned int>(inputSize);
     config.state_size = kGekkoStateCapacity;
-    // Limited saving keeps GekkoNet's state ring at 2 buffers instead of
-    // (input_prediction_window + 2) == 9, and stops it from saving the full
-    // emulator state every frame and every re-simulated frame. With the FBNeo
-    // state buffer sized at kGekkoStateCapacity that removes a full
-    // BurnStateCompress (scan + malloc + copy) per frame, which is what was
-    // cutting the frame rate and ballooning memory during netplay.
-    // GekkoNet disables desync detection when limited saving is on.
-    config.limited_saving = true;
+    // BISECT: restore the first-commit rollback cadence. With limited_saving
+    // the ring keeps only 2 states and saves once per prediction window, so a
+    // rewind re-simulates a much longer span; for FBNeo that span re-renders
+    // the sound chips and shows up as repeated/looping audio. Saving every
+    // frame (as before 142e3c1) rewinds exactly. The 2 MB capacity is kept so
+    // the 9 buffers stay ~18 MB instead of the original ~216 MB.
+    config.limited_saving = false;
     config.desync_detection = true;
     config.check_distance = 10;
     gekko_start(g_GekkoSession, &config);
@@ -3217,14 +3215,13 @@ bool rmgk_gekko::start_local_session(const char* gameName, int players, int inpu
     config.input_prediction_window = static_cast<unsigned char>(predictionWindow);
     config.input_size = static_cast<unsigned int>(inputSize);
     config.state_size = kGekkoStateCapacity;
-    // Limited saving keeps GekkoNet's state ring at 2 buffers instead of
-    // (input_prediction_window + 2) == 9, and stops it from saving the full
-    // emulator state every frame and every re-simulated frame. With the FBNeo
-    // state buffer sized at kGekkoStateCapacity that removes a full
-    // BurnStateCompress (scan + malloc + copy) per frame, which is what was
-    // cutting the frame rate and ballooning memory during netplay.
-    // GekkoNet disables desync detection when limited saving is on.
-    config.limited_saving = true;
+    // BISECT: restore the first-commit rollback cadence. With limited_saving
+    // the ring keeps only 2 states and saves once per prediction window, so a
+    // rewind re-simulates a much longer span; for FBNeo that span re-renders
+    // the sound chips and shows up as repeated/looping audio. Saving every
+    // frame (as before 142e3c1) rewinds exactly. The 2 MB capacity is kept so
+    // the 9 buffers stay ~18 MB instead of the original ~216 MB.
+    config.limited_saving = false;
     config.desync_detection = true;
     config.check_distance = 10;
     gekko_start(g_GekkoSession, &config);
