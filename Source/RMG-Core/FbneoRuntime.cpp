@@ -1334,7 +1334,23 @@ bool RunFrame(int flags)
     const bool audioOutput = (flags & Output_Audio) != 0;
 
     apply_latched_input();
-    pBurnDraw     = (flags & Output_Video) ? g_videoBuffer.data() : nullptr;
+
+    // Video, like audio, is part of the emulated state and not just an output.
+    // Several drivers derive *saved* values inside their draw routines: the
+    // CPS-2 renderer, for instance, advances the sprite Z buffer and its
+    // offsets (nZOffset / nMaxZValue / nMaxZMask) and recomputes the effective
+    // palette from CpsDraw(), and all of that is in the CPS-2 savestate. A
+    // rollback resim runs with Output_None, so leaving pBurnDraw null on
+    // speculative frames made the state a peer saved for frame N depend on
+    // whether *that* peer had rolled back into N: GekkoNet then reports a
+    // checksum desync against the peer that ran N normally (reproduced with
+    // ssf2t/CPS-2 -- a single-frame desync right after a rollback, with
+    // identical audio and no visible divergence). Render every frame into the
+    // framebuffer, exactly like pBurnSoundOut below; only frames with
+    // Output_Video reach the presenter, and the next visible frame repaints
+    // the whole buffer.
+    pBurnDraw = g_videoBuffer.data();
+
     // Audio is part of the emulated state, not just an output: the sound DSPs
     // only advance when pBurnSoundOut is set (e.g. qs.cpp does
     // `if (pBurnSoundOut) QscUpdate(...)` in QsndEndFrame). Leaving it null on
