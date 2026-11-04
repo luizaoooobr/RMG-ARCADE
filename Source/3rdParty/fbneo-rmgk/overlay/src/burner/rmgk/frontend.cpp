@@ -13,6 +13,25 @@
 #include "burner.h"
 #include "burnint.h"
 
+// dr_mp3 implementation (needed by snes/msu1_backend.cpp in the lib build)
+#define DR_MP3_IMPLEMENTATION
+#include "../../dep/libs/dr_libs/dr_mp3.h"
+
+// Stubs for symbols defined in burner-only code (cdlist.cpp) / burn_hdd.cpp that
+// the core references but the lib frontend does not link.
+struct BurnHDD;
+void PceCDInfo_Exit() { }
+void NeoCDInfo_Exit() { }
+BurnHDD* BurnHDDOpen(INT32 nIndex) { (void)nIndex; return nullptr; }
+void BurnHDDClose(BurnHDD* pDisk) { (void)pDisk; }
+INT32 BurnHDDFlush(BurnHDD* pDisk) { (void)pDisk; return 1; }
+UINT32 BurnHDDGetSectorSize(BurnHDD* pDisk) { (void)pDisk; return 0; }
+UINT32 BurnHDDGetSectorCount(BurnHDD* pDisk) { (void)pDisk; return 0; }
+INT32 BurnHDDGetGeometry(BurnHDD* pDisk, INT32* pnCylinders, INT32* pnHeads, INT32* pnSectors) { (void)pDisk; (void)pnCylinders; (void)pnHeads; (void)pnSectors; return 1; }
+INT32 BurnHDDRead(BurnHDD* pDisk, UINT32 nLba, UINT32 nCount, void* pDest) { (void)pDisk; (void)nLba; (void)nCount; (void)pDest; return 1; }
+INT32 BurnHDDWrite(BurnHDD* pDisk, UINT32 nLba, UINT32 nCount, const void* pSrc) { (void)pDisk; (void)nLba; (void)nCount; (void)pSrc; return 1; }
+void BurnHDDDiscardWrites(BurnHDD* pDisk) { (void)pDisk; }
+
 // ---------------------------------------------------------------------------
 // Application search paths (normally set up by support_paths.cpp)
 // ---------------------------------------------------------------------------

@@ -2,14 +2,18 @@
 #ifdef _UNICODE
 //TODO: bah
 #include <wchar.h>
+#ifndef __TEXT
 #define __TEXT(q)    L ## q
+#endif
 
 typedef wchar_t   TCHAR;
 typedef wchar_t   _TCHAR;
 
 #else
 
+#ifndef __TEXT
 #define __TEXT(q)    q
+#endif
 
 #ifndef RC_INVOKED
 typedef char   TCHAR;

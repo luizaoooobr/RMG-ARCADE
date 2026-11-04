@@ -2044,3 +2044,9 @@ extern "C" void state_save_register_double(const char* module, INT32 instance, c
 {
 	BurnStateRegister(module, instance, name, (void*)val, size * sizeof(double));
 }
+
+// RMG-K: BurnRumble (upstream added rumble support; lib frontend stub)
+void BurnRumble(INT32 nPlayer, INT32 nStrong, INT32 nWeak)
+{
+	(void)nPlayer; (void)nStrong; (void)nWeak;
+}

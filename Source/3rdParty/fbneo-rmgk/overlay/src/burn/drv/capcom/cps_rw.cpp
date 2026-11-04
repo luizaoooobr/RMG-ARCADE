@@ -1,4 +1,6 @@
 #include "cps.h"
+
+CpsRwGetInpCallback CpsRwGetInpCallbackFunction = NULL;
 #include "xmvsf3v3.h"
 // CPS - Read/Write
 
@@ -489,7 +491,7 @@ INT32 CpsXmvSixInit(INT32 bWide)
 	CpsXmvSixEnabled = 1;
 
 	memset(CpsXmvSixButtons, 0, sizeof(CpsXmvSixButtons));
-	CpsXmvSixReset();
+	/* CpsXmvSixReset(); */
 
 	return 0;
 }
@@ -531,7 +533,7 @@ INT32 CpsXmvSixScan(INT32 nAction, INT32* /*pnMin*/)
 		if (nAction & ACB_WRITE) {
 			if (CpsXmvSixState.abi != XMV6_VERSION || CpsXmvSixState.count > XMV6_DEPTH) {
 				// not a state of this board
-				CpsXmvSixReset();
+				/* CpsXmvSixReset(); */
 				return 1;
 			}
 		}

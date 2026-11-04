@@ -1,4 +1,22 @@
 #include "cps.h"
+
+INT32 bCpsUseParentBlend = 1;
+Cps2ObjTileCallback Cps2ObjTileCallbackFunction = NULL;
+Cps2ObjGetCallback Cps2ObjGetCallbackFunction = NULL;
+Cps2ObjPaletteCallback Cps2ObjPaletteCallbackFunction = NULL;
+INT32 nCpsObjExtraLen = 0;
+static INT32 nObjMemLen = 0;
+
+#ifndef Cps2Turbo
+#define Cps2Turbo 0
+#endif
+#ifndef CpsXmvSixEnabled
+#define CpsXmvSixEnabled 0
+#endif
+#ifndef CpsXmvWide
+#define CpsXmvWide 0
+#endif
+
 #include "xmvsf3v3.h"
 // CPS Objs (sprites)
 
@@ -943,4 +961,43 @@ INT32 CpsObjVisualScan(INT32 nAction)
 	}
 
 	return 0;
+}
+
+INT32 CpsObjScan(INT32 nAction, char* szName)
+{
+	if (!(nAction & ACB_DRIVER_DATA)) return 0;
+
+	struct BurnArea ba;
+	memset(&ba, 0, sizeof(ba));
+	ba.Data = ObjMem;
+	ba.nLen = nObjMemLen;
+	ba.szName = szName;
+	BurnAcb(&ba);
+
+	SCAN_VAR(nGetNext);
+	for (INT32 i = 0; i < nFrameCount; i++) {
+		SCAN_VAR(of[i].nShiftX);
+		SCAN_VAR(of[i].nShiftY);
+		SCAN_VAR(of[i].nCount);
+	}
+
+	if (nAction & ACB_WRITE) {
+		if (nGetNext < 0 || nGetNext >= nFrameCount) return 1;
+		for (INT32 i = 0; i < nFrameCount; i++) {
+			if (of[i].nCount < 0 || of[i].nCount > nMax) return 1;
+		}
+	}
+
+	return 0;
+}
+
+void CpsObjReset()
+{
+	if (ObjMem == NULL) return;
+	memset(ObjMem, 0, nObjMemLen);
+	for (INT32 i = 0; i < nFrameCount; i++) {
+		of[i].nCount = 0;
+		of[i].nShiftX = of[i].nShiftY = 0;
+	}
+	nGetNext = 0;
 }

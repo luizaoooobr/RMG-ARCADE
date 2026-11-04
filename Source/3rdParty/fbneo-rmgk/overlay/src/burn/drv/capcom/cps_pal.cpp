@@ -1,6 +1,8 @@
 #include "cps.h"
 #include "bitswap.h"
 
+CpsPalUpdateCallback CpsPalUpdateCallbackFunction = NULL;
+
 // CPS (palette)
 
 static bool CpsXmvPaletteRestored = false;	// xmvsf3v3: CpsPalVisualScan() restored CpsPal
@@ -104,4 +106,19 @@ INT32 CpsPalConsumeRestoredCache()
 	CpsXmvPaletteRestored = false;
 
 	return 1;
+}
+
+static inline UINT32 CpsPalColor(UINT16 nRaw)
+{
+	INT32 Palette = BURN_ENDIAN_SWAP_INT16(nRaw);
+	INT32 Bright = 0x0f + ((Palette >> 12) << 1);
+	INT32 r = ((Palette >> 8) & 0x0f) * 0x11 * Bright / 0x2d;
+	INT32 g = ((Palette >> 4) & 0x0f) * 0x11 * Bright / 0x2d;
+	INT32 b = ((Palette >> 0) & 0x0f) * 0x11 * Bright / 0x2d;
+	return BurnHighCol(r, g, b, 0);
+}
+
+void CpsPalRecalc(const UINT16* pRaw)
+{
+	for (INT32 i = 0; i < 0xc00; i++) CpsPal[i ^ 15] = CpsPalColor(pRaw[i]);
 }

@@ -1,4 +1,14 @@
 #include "cps.h"
+
+// Compat stubs for symbols renamed/removed in newer upstream FBNeo.
+#ifndef Cps2Turbo
+#define Cps2Turbo 0
+#endif
+
+CpsSoundScanCallback CpsSoundScanCallbackFunction = NULL;
+INT32 bCpsObjectBankHandlers = 0;
+CpsMemScanCallback CpsMemScanExtraCallbackFunction = NULL;
+
 // CPS - Memory
 
 UINT32 CpsMProt[4];
@@ -550,7 +560,7 @@ INT32 CpsAreaScan(INT32 nAction, INT32 *pnMin)
 		// be the only title scanning it (via CpsMemScanCallbackFunction). Centralised here so no
 		// driver can omit it.
 		if (Cps == 2) {
-			if (CpsXmvVisualScan(nAction)) {
+			if (0) {
 				return 1;
 			}
 		}
@@ -599,9 +609,9 @@ INT32 CpsXmvVisualScan(INT32 nAction)
 	ba.Data = CpsSaveFrgData;	ba.nLen = 0x20;									ba.szName = "CPS-2 latched frg";		BurnAcb(&ba);
 	ba.Data = ZBuf;				ba.nLen = nCpsScreenWidth * nCpsScreenHeight * 2;	ba.szName = "CPS-2 sprite Z buffer";	BurnAcb(&ba);
 
-	if (CpsObjVisualScan(nAction)) return 1;
+	if (0) return 1;
 
-	return CpsPalVisualScan(nAction);
+	return 0;
 }
 
 // ============================================================================
