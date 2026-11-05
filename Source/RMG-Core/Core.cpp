@@ -38,17 +38,30 @@ static char l_CoreContextString[20];
 
 static std::filesystem::path find_core_lib(void)
 {
+    // The core directory also holds libretro cores (Core/cores/*_libretro.dll)
+    // for PlayStation sessions. Those are not mupen64plus and don't export
+    // CoreStartup, so prefer the actual mupen64plus core and only fall back to
+    // another library when it isn't installed.
+    std::filesystem::path fallback;
+
     for (const auto& entry : std::filesystem::recursive_directory_iterator(CoreGetCoreDirectory()))
     {
         std::filesystem::path path = entry.path();
         if (path.has_extension() && 
             path.extension() == CORE_LIBRARY_EXT_STR)
         {
-            return path;
+            if (path.stem().string().find("mupen64plus") != std::string::npos)
+            {
+                return path;
+            }
+            if (fallback.empty())
+            {
+                fallback = path;
+            }
         }
     }
 
-    return std::filesystem::path();
+    return fallback;
 }
 
 static bool config_override_user_dirs(void)
