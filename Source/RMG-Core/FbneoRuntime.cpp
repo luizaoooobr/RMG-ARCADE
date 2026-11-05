@@ -130,6 +130,9 @@ std::mutex g_playerInputMapMutex;
 // may run on the search thread while a game is running) are pure reads.
 std::mutex                                 g_driverNameMutex;
 std::unordered_map<std::string, std::string> g_driverNameCache;
+// Driver short-name -> parent short name (empty when the driver has no parent).
+// Filled by the same driver-table walk as g_driverNameCache.
+std::unordered_map<std::string, std::string> g_driverParentCache;
 
 // FBNeo's BurnLibInit() calls BurnLibExit() internally, and BurnLibExit() (via
 // BurnGameListExit) frees the driver-name tables without nulling the pointers.
@@ -969,8 +972,17 @@ static bool driver_lookup(const char* gameName, std::string* outFull)
             const char* shortName = BurnDrvGetTextA(DRV_NAME);
             const char* full      = BurnDrvGetTextA(DRV_FULLNAME);
             if (shortName && *shortName)
-                g_driverNameCache[basename_lower(shortName)] =
+            {
+                const std::string key = basename_lower(shortName);
+                g_driverNameCache[key] =
                     (full && *full) ? std::string(full) : std::string(shortName);
+
+                const char* parent = BurnDrvGetTextA(DRV_PARENT);
+                const std::string parentKey =
+                    (parent && *parent) ? basename_lower(parent) : std::string();
+                // Parent drivers point at themselves; only real clones have one.
+                g_driverParentCache[key] = (parentKey == key) ? std::string() : parentKey;
+            }
         }
         nBurnDrvActive = oldActive;
     }
@@ -995,6 +1007,20 @@ bool DriverRomId(const char* gameName, std::string& outHex)
 {
     if (!gameName || !*gameName) return false;
     outHex = driver_rom_id(basename_lower(gameName));
+    return true;
+}
+
+bool DriverParent(const char* gameName, std::string& outName)
+{
+    if (!gameName || !*gameName) return false;
+
+    // Make sure the caches are populated (driver_lookup fills both).
+    if (!driver_lookup(gameName, nullptr)) return false;
+
+    std::lock_guard<std::mutex> lock(g_driverNameMutex);
+    auto it = g_driverParentCache.find(basename_lower(gameName));
+    if (it == g_driverParentCache.end() || it->second.empty()) return false;
+    outName = it->second;
     return true;
 }
 

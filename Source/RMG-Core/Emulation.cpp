@@ -815,13 +815,41 @@ static std::vector<std::string> fbneo_rom_archives(const std::filesystem::path& 
         archives.push_back(rom.string());
     }
 
+    const std::filesystem::path dir = rom.parent_path();
+
+    // FBNeo frontends open the parent set next to a clone, and clone romsets may
+    // keep part of their data there (e.g. usf2u expects sfx.12m, which ships in
+    // ssf2t.zip). The ROM loader matches every entry by CRC across all opened
+    // archives, so making the parent zip available is enough.
+    std::string parent = rom.stem().string();
+    for (int depth = 0; depth < 8; depth++)
+    {
+        std::string parentName;
+        if (!fbneo_rt::DriverParent(parent.c_str(), parentName))
+        {
+            break;
+        }
+
+        static const char* const kArchiveExts[] = { ".zip", ".7z" };
+        for (const char* ext : kArchiveExts)
+        {
+            const std::filesystem::path candidate = dir / (parentName + ext);
+            if (std::filesystem::is_regular_file(candidate, ec))
+            {
+                archives.push_back(candidate.string());
+                break;
+            }
+        }
+
+        parent = parentName;
+    }
+
     static const char* const kBiosArchives[] = {
         "neogeo.zip", // NeoGeo MVS/AES BIOS
         "pgm.zip",    // IGS PGM BIOS
         "skns.zip",   // Super Kaneko Nova System BIOS
     };
 
-    const std::filesystem::path dir = rom.parent_path();
     for (const char* bios : kBiosArchives)
     {
         const std::filesystem::path candidate = dir / bios;

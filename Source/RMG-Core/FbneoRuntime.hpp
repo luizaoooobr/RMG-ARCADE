@@ -71,6 +71,11 @@ namespace fbneo_rt
     // lookups on: arcade sets are identified by driver, so both peers agree, and
     // FBNeo itself verifies the actual rom data by CRC when loading.
     bool DriverRomId(const char* gameName, std::string& outHex);
+    // Parent driver short name (e.g. "ssf2t" for "usf2u"), or false when the
+    // driver has no parent. FBNeo's own frontends also open the parent set, so
+    // clone romsets may keep part of their data there (e.g. usf2u needs
+    // sfx.12m from ssf2t.zip).
+    bool DriverParent(const char* gameName, std::string& outName);
 
     // Driver info.
     int PlayerCount();
