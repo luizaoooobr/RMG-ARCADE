@@ -5470,7 +5470,9 @@ void MainWindow::on_Lobby_RotationRestartPending(void)
     this->ui_LobbyRotationParked = true;
     if (this->ui_LobbyRotationParkTimerId != 0)
         this->killTimer(this->ui_LobbyRotationParkTimerId);
-    this->ui_LobbyRotationParkTimerId = this->startTimer(12000);
+    // Kept generous (30s) so a slow first boot doesn't abort the transparent
+    // restart prematurely.
+    this->ui_LobbyRotationParkTimerId = this->startTimer(30000);
     CoreAddCallbackMessage(CoreDebugMessageType::Info,
         "Rotation: keeping the game window parked for the next match");
     OnScreenDisplaySetMessage("Next match starting...");
