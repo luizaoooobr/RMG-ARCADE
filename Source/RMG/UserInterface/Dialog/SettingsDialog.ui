@@ -1146,6 +1146,78 @@
                    </layout>
                   </item>
                   <item>
+                   <layout class="QHBoxLayout" name="horizontalLayout_netplayPassP1">
+                    <item>
+                     <widget class="QLabel" name="label_netplayPassP1">
+                      <property name="text">
+                       <string>Pass Turn (P1)</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item>
+                     <widget class="KeybindButton" name="netplayPassTurnP1KeyButton">
+                      <property name="text">
+                       <string/>
+                      </property>
+                     </widget>
+                    </item>
+                   </layout>
+                  </item>
+                  <item>
+                   <layout class="QHBoxLayout" name="horizontalLayout_netplayPassP2">
+                    <item>
+                     <widget class="QLabel" name="label_netplayPassP2">
+                      <property name="text">
+                       <string>Pass Turn (P2)</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item>
+                     <widget class="KeybindButton" name="netplayPassTurnP2KeyButton">
+                      <property name="text">
+                       <string/>
+                      </property>
+                     </widget>
+                    </item>
+                   </layout>
+                  </item>
+                  <item>
+                   <layout class="QHBoxLayout" name="horizontalLayout_netplayPassP3">
+                    <item>
+                     <widget class="QLabel" name="label_netplayPassP3">
+                      <property name="text">
+                       <string>Pass Turn (P3)</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item>
+                     <widget class="KeybindButton" name="netplayPassTurnP3KeyButton">
+                      <property name="text">
+                       <string/>
+                      </property>
+                     </widget>
+                    </item>
+                   </layout>
+                  </item>
+                  <item>
+                   <layout class="QHBoxLayout" name="horizontalLayout_netplayPassP4">
+                    <item>
+                     <widget class="QLabel" name="label_netplayPassP4">
+                      <property name="text">
+                       <string>Pass Turn (P4)</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item>
+                     <widget class="KeybindButton" name="netplayPassTurnP4KeyButton">
+                      <property name="text">
+                       <string/>
+                      </property>
+                     </widget>
+                    </item>
+                   </layout>
+                  </item>
+                  <item>
                    <layout class="QHBoxLayout" name="horizontalLayout_80">
                     <item>
                      <widget class="QLabel" name="label_77">

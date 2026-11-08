@@ -599,6 +599,10 @@ enum class SettingsID
     // the middle shifts every later enumerator and breaks already-built
     // plugins with a std::bad_variant_access at startup.
     KeyBinding_NetplayPassTurn,
+    KeyBinding_NetplayPassTurnP1,
+    KeyBinding_NetplayPassTurnP2,
+    KeyBinding_NetplayPassTurnP3,
+    KeyBinding_NetplayPassTurnP4,
 
     Invalid
 };

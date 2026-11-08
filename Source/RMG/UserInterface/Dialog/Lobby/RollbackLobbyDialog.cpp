@@ -4095,6 +4095,72 @@ bool RollbackLobbyDialog::requestPassTurn()
     return true;
 }
 
+bool RollbackLobbyDialog::requestPassTurnForSlot(int slot)
+{
+    if (!m_client || m_currentRoomId == 0)
+        return false;
+    if (!rotationIsHost())
+        return false;
+    if (m_currentRoomState != "in_game")
+        return false;
+    if (!m_emulationActive && !m_awaitingEmulationStart)
+        return false;
+    if (!m_rotationEnabled)
+    {
+        appendChatSystemLine(CHANNEL_ROOM,
+            "Rotation is off — the host can enable it in the lobby.");
+        return false;
+    }
+
+    if (slot == 0)
+    {
+        const quint64 selfId = m_client->selfUserId();
+        for (int i = 0; i < 4; ++i)
+        {
+            if (m_seats[i].userId == selfId)
+            {
+                slot = i + 1;
+                break;
+            }
+        }
+    }
+    if (slot < 1 || slot > 4)
+        return false;
+
+    const quint64 targetUserId = m_seats[slot - 1].userId;
+    if (targetUserId == 0)
+    {
+        appendChatSystemLine(CHANNEL_ROOM,
+            QString("P%1 is empty.").arg(slot));
+        return false;
+    }
+
+    if (rotationIndexForUser(targetUserId) >= m_rotationActiveSeats)
+    {
+        appendChatSystemLine(CHANNEL_ROOM,
+            QString("P%1 is on the bench.").arg(slot));
+        return false;
+    }
+
+    const bool isSelf = (targetUserId == m_client->selfUserId());
+
+    m_client->sendChat(CHANNEL_ROOM,
+        QString::fromLatin1(kRotationPassMarker) + QString::number(slot));
+
+    beginRotationForUser(targetUserId);
+
+    if (!isSelf && (m_emulationActive || m_awaitingEmulationStart))
+    {
+        m_rotationAnnounced = true;
+        emit rotationRestartPending();
+    }
+
+    if (isSelf)
+        emit closeMatchRequested();
+
+    return true;
+}
+
 bool RollbackLobbyDialog::rotationIsHost() const
 {
     return m_client && m_currentRoomId != 0 && m_currentRoomHostId != 0 &&
@@ -4158,27 +4224,43 @@ void RollbackLobbyDialog::handleRotationControlChat(const QString& message,
 
     if (message.startsWith(QString::fromLatin1(kRotationPassMarker)))
     {
-        // Any seated player may pass. The host validates the seat and applies
-        // the queue move once the match has ended.
-        if (rotationIndexForUser(fromUserId) < 0 && !fromSelf)
+        // Parse an optional target slot from markers like "[RMGK-PASS]2"
+        // (host passing a specific player). A bare "[RMGK-PASS]" means the
+        // sender passes themselves (legacy / self-pass).
+        int targetSlot = -1;
+        const QString payload = message.mid(int(std::strlen(kRotationPassMarker)));
+        if (!payload.isEmpty())
+            targetSlot = payload.toInt();
+        quint64 targetUserId = fromUserId;
+        if (targetSlot >= 1 && targetSlot <= 4 && m_seats[targetSlot - 1].userId != 0)
+            targetUserId = m_seats[targetSlot - 1].userId;
+
+        // Target must be a seated player.
+        if (rotationIndexForUser(targetUserId) < 0)
             return;
 
+        const bool isPasser = (targetUserId == m_client->selfUserId());
+
         // Non-passers stay in the match and park their window for the
-        // transparent restart. The passer (fromSelf) is moving to the bench
-        // and follows the normal match-end path, so it must NOT park.
-        if (!fromSelf)
+        // transparent restart. The passer is moving to the bench and follows
+        // the normal match-end path, so it must NOT park.
+        if (!isPasser)
         {
             m_rotationAnnounced = true;
             emit rotationRestartPending();
         }
 
+        // The passer stops their own emulation (host-triggered or self).
+        if (isPasser && (m_emulationActive || m_awaitingEmulationStart))
+            emit closeMatchRequested();
+
         QString who = fromUsername;
         if (who.isEmpty())
         {
             const auto& users = m_client->users();
-            const auto it = users.constFind(fromUserId);
+            const auto it = users.constFind(targetUserId);
             who = (it != users.constEnd() && !it->username.isEmpty())
-                ? it->username : QString::number(fromUserId);
+                ? it->username : QString::number(targetUserId);
         }
 
         if (rotationIsHost())
@@ -4189,7 +4271,7 @@ void RollbackLobbyDialog::handleRotationControlChat(const QString& message,
                     QString("%1 passed, but rotation is off — the match ends here.").arg(who));
                 return;
             }
-            beginRotationForUser(fromUserId);
+            beginRotationForUser(targetUserId);
         }
         else
         {

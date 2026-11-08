@@ -80,6 +80,12 @@ public:
     // queue so the next bench player takes the seat for the next match.
     // Returns true when a pass was actually requested.
     bool requestPassTurn();
+    // Host only: send the player in the given seat (1-4, or 0 for the host's
+    // own seat) to the end of the rotation queue. Returns true on success.
+    bool requestPassTurnForSlot(int slot);
+
+    // True when this client is the room host (drives the in-game pass hotkeys).
+    bool rotationIsHost() const;
 
     // MainWindow calls this when a spectate playback session ends (emulation
     // stopped) so the server can drop us from the broadcast. Idempotent.
@@ -373,7 +379,6 @@ private:
     // ── Rotation ("pass turn") queue ──
     // The host owns the setting; every client mirrors the host's control chat
     // so the in-game hotkey knows whether a pass will be honored.
-    bool rotationIsHost() const;
     QList<int> occupiedSeats() const;
     int  rotationIndexForUser(quint64 userId) const;
     void setRotationSettings(bool enabled, int activeSeats);

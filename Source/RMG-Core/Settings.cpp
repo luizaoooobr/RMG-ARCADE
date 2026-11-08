@@ -684,6 +684,18 @@ static l_Setting get_setting(SettingsID settingId)
     case SettingsID::KeyBinding_NetplayPassTurn:
         setting = {SETTING_SECTION_KEYBIND, "NetplayPassTurn", std::string("I")};
         break;
+    case SettingsID::KeyBinding_NetplayPassTurnP1:
+        setting = {SETTING_SECTION_KEYBIND, "NetplayPassTurnP1", std::string("1")};
+        break;
+    case SettingsID::KeyBinding_NetplayPassTurnP2:
+        setting = {SETTING_SECTION_KEYBIND, "NetplayPassTurnP2", std::string("2")};
+        break;
+    case SettingsID::KeyBinding_NetplayPassTurnP3:
+        setting = {SETTING_SECTION_KEYBIND, "NetplayPassTurnP3", std::string("3")};
+        break;
+    case SettingsID::KeyBinding_NetplayPassTurnP4:
+        setting = {SETTING_SECTION_KEYBIND, "NetplayPassTurnP4", std::string("4")};
+        break;
     case SettingsID::KeyBinding_SaveStateSlot0:
         setting = {SETTING_SECTION_KEYBIND, "SaveStateSlot0", std::string("Ctrl+0")};
         break;

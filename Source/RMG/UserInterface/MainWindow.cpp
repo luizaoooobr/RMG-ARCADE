@@ -5803,26 +5803,45 @@ bool MainWindow::handleNetplayPassTurnKeyPress(QKeyEvent *event)
         return false;
     }
 
-    const QString keyBinding = QString::fromStdString(
-        CoreSettingsGetStringValue(SettingsID::KeyBinding_NetplayPassTurn));
-    if (keyBinding.isEmpty())
+    // Only the host may pass players.
+    if (!this->rollbackLobbyDialog->rotationIsHost())
     {
         return false;
     }
 
-    QKeySequence expected(keyBinding);
-    QKeySequence pressed(event->key() | event->modifiers());
-    if (expected.matches(pressed) != QKeySequence::ExactMatch)
+    struct Cand { SettingsID id; int slot; };
+    std::vector<Cand> cands = {
+        { SettingsID::KeyBinding_NetplayPassTurn,  0 },
+        { SettingsID::KeyBinding_NetplayPassTurnP1, 1 },
+        { SettingsID::KeyBinding_NetplayPassTurnP2, 2 },
+        { SettingsID::KeyBinding_NetplayPassTurnP3, 3 },
+        { SettingsID::KeyBinding_NetplayPassTurnP4, 4 },
+    };
+
+    int chosenSlot = -1;
+    const QKeySequence pressed(event->key() | event->modifiers());
+    for (const auto& c : cands)
+    {
+        const QString kb = QString::fromStdString(
+            CoreSettingsGetStringValue(c.id));
+        if (kb.isEmpty())
+            continue;
+        if (QKeySequence(kb).matches(pressed) == QKeySequence::ExactMatch)
+        {
+            chosenSlot = c.slot;
+            break;
+        }
+    }
+    if (chosenSlot < 0)
+        return false;
+
+    if (!this->rollbackLobbyDialog->requestPassTurnForSlot(chosenSlot))
     {
         return false;
     }
 
-    if (!this->rollbackLobbyDialog->requestPassTurn())
-    {
-        return false;
-    }
-
-    OnScreenDisplaySetMessage("Pass turn requested - you will spectate the next match.");
+    OnScreenDisplaySetMessage(QString("Pass turn (P%1) requested.")
+                                 .arg(chosenSlot == 0 ? 1 : chosenSlot).toStdString());
     return true;
 }
 
