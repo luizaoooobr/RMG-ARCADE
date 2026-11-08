@@ -3566,6 +3566,12 @@ void RollbackLobbyDialog::onRoomStateChanged(const QJsonObject& roomState)
     {
         // New match is up — nothing to park for any more.
         m_rotationAnnounced = false;
+        // Release a parked passer now that the next match has started.
+        if (m_iAmPasser)
+        {
+            m_iAmPasser = false;
+            emit rotationRestartAborted();
+        }
     }
 
     if (prevState == "in_game" && state != "in_game" &&
@@ -4111,6 +4117,10 @@ bool RollbackLobbyDialog::requestPassTurn()
             m_currentMatchId = 0;
         }
     }
+    // Passer parks so the window doesn't close abruptly; released when the
+    // next match starts.
+    m_rotationAnnounced = true;
+    emit rotationRestartPending();
     emit closeMatchRequested();
     return true;
 }
@@ -4185,7 +4195,7 @@ bool RollbackLobbyDialog::requestPassTurnForSlot(int slot)
         m_currentMatchId = 0;
     }
 
-    if (!isSelf && (m_emulationActive || m_awaitingEmulationStart))
+    if (m_emulationActive || m_awaitingEmulationStart)
     {
         m_rotationAnnounced = true;
         emit rotationRestartPending();
@@ -4301,6 +4311,14 @@ void RollbackLobbyDialog::handleRotationControlChat(const QString& message,
         // The passer stops their own emulation (host-triggered or self).
         if (isPasser && (m_emulationActive || m_awaitingEmulationStart))
             emit closeMatchRequested();
+
+        // The passer also parks its window so it doesn't "close" abruptly; it
+        // is released when the next match starts (see onRoomStateChanged in_game).
+        if (isPasser)
+        {
+            m_rotationAnnounced = true;
+            emit rotationRestartPending();
+        }
 
         QString who = fromUsername;
         if (who.isEmpty())
