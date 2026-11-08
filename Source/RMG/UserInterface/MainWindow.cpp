@@ -2388,7 +2388,7 @@ void MainWindow::updateUI(bool inEmulation, bool isPaused)
         }
         else
         {
-            this->ui_Widgets->setCurrentWidget(this->ui_Widget_Dummy);
+            // Do not switch widgets during teardown (heap-corruption risk).
             return;
         }
     }
