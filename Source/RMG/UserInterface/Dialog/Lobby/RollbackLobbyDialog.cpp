@@ -3989,10 +3989,9 @@ void RollbackLobbyDialog::notifyEmulationFinished()
             (unsigned long long)matchId);
         CoreAddCallbackMessage(CoreDebugMessageType::Info, buf);
     }
-    const bool shouldReport = m_hostReportPending || !m_iAmPasser;
+    const bool suppressReport = m_iAmPasser;
     m_iAmPasser = false;
-    m_hostReportPending = false;
-    if (matchId != 0 && shouldReport)
+    if (matchId != 0 && !suppressReport)
         m_client->reportMatchFinished(matchId);
     m_currentMatchId = 0;
     emit liveReplayViewerCountCleared();
@@ -4113,7 +4112,11 @@ bool RollbackLobbyDialog::requestPassTurn()
     if (rotationIsHost())
     {
         beginRotationForUser(selfId);
-        m_hostReportPending = true;
+        if (m_currentMatchId != 0)
+        {
+            m_client->reportMatchFinished(m_currentMatchId);
+            m_currentMatchId = 0;
+        }
     }
     // Passer parks so the window doesn't close abruptly; released when the
     // next match starts.
@@ -4185,8 +4188,13 @@ bool RollbackLobbyDialog::requestPassTurnForSlot(int slot)
 
     beginRotationForUser(targetUserId);
 
-    // Defer the MATCH_FINISHED report to notifyEmulationFinished.
-    m_hostReportPending = true;
+    // Host ends the match (reportMatchFinished) so the server transitions to
+    // waiting; peers suppress their own report to avoid being dropped.
+    if (m_currentMatchId != 0)
+    {
+        m_client->reportMatchFinished(m_currentMatchId);
+        m_currentMatchId = 0;
+    }
 
     if (m_emulationActive || m_awaitingEmulationStart)
     {
