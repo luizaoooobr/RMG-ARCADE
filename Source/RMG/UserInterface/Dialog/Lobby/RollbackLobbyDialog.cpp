@@ -3351,6 +3351,7 @@ void RollbackLobbyDialog::enterRoom(quint64 roomId, const QString& greetingChatL
     // Fresh room: no rotation is in flight. The settings themselves persist.
     m_rotationPending = false;
     m_rotationAnnounced = false;
+    m_iAmPasser = false;
     m_rotationDeparting.clear();
     m_rotationSwapping = false;
     m_rotationSwapFailures = 0;
@@ -3981,7 +3982,9 @@ void RollbackLobbyDialog::notifyEmulationFinished()
             (unsigned long long)matchId);
         CoreAddCallbackMessage(CoreDebugMessageType::Info, buf);
     }
-    if (matchId != 0)
+    const bool suppressReport = m_iAmPasser;
+    m_iAmPasser = false;
+    if (matchId != 0 && !suppressReport)
         m_client->reportMatchFinished(matchId);
     m_currentMatchId = 0;
     emit liveReplayViewerCountCleared();
@@ -4093,7 +4096,14 @@ bool RollbackLobbyDialog::requestPassTurn()
     // follows the normal match-end path. Everyone else parks when they receive
     // the marker (see handleRotationControlChat).
     if (rotationIsHost())
+    {
         beginRotationForUser(selfId);
+        if (m_currentMatchId != 0)
+        {
+            m_client->reportMatchFinished(m_currentMatchId);
+            m_currentMatchId = 0;
+        }
+    }
     emit closeMatchRequested();
     return true;
 }
@@ -4151,6 +4161,14 @@ bool RollbackLobbyDialog::requestPassTurnForSlot(int slot)
         QString::fromLatin1(kRotationPassMarker) + QString::number(slot));
 
     beginRotationForUser(targetUserId);
+
+    // Host ends the match (reportMatchFinished) so peers don't report early
+    // and get dropped from the room.
+    if (m_currentMatchId != 0)
+    {
+        m_client->reportMatchFinished(m_currentMatchId);
+        m_currentMatchId = 0;
+    }
 
     if (!isSelf && (m_emulationActive || m_awaitingEmulationStart))
     {
@@ -4257,6 +4275,12 @@ void RollbackLobbyDialog::handleRotationControlChat(const QString& message,
         {
             m_rotationAnnounced = true;
             emit rotationRestartPending();
+        }
+        else
+        {
+            // Remember we are the passer so notifyEmulationFinished does not
+            // report MATCH_FINISHED early (the host ends the match instead).
+            m_iAmPasser = true;
         }
 
         // The passer stops their own emulation (host-triggered or self).
@@ -4501,6 +4525,7 @@ void RollbackLobbyDialog::cancelRotation(const QString& reason)
     const bool wasPending = m_rotationPending;
     m_rotationPending = false;
     m_rotationAnnounced = false;
+    m_iAmPasser = false;
     m_rotationDeparting.clear();
     m_rotationSwapping = false;
     m_rotationSwapFailures = 0;
@@ -4845,6 +4870,7 @@ void RollbackLobbyDialog::onRoomLeft(const QString& reason)
     m_currentMatchId = 0;
     m_rotationPending = false;
     m_rotationAnnounced = false;
+    m_iAmPasser = false;
     m_rotationDeparting.clear();
     m_rotationSwapping = false;
     m_rotationSwapFailures = 0;
