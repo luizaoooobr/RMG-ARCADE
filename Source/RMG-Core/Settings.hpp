@@ -223,7 +223,6 @@ enum class SettingsID
     KeyBinding_Cheats,
     KeyBinding_GSButton,
     KeyBinding_NetplayChat,
-    KeyBinding_NetplayPassTurn,
     KeyBinding_SaveStateSlot0,
     KeyBinding_SaveStateSlot1,
     KeyBinding_SaveStateSlot2,
@@ -594,6 +593,12 @@ enum class SettingsID
     FBNeo_DipGroups,
     FBNeo_DipSettings,
     FBNeo_DefaultsSeeded,
+
+    // Appended at the end on purpose: SettingsID values are part of the ABI
+    // shared with the plugin DLLs (RMG-Audio/RMG-Input). Inserting a value in
+    // the middle shifts every later enumerator and breaks already-built
+    // plugins with a std::bad_variant_access at startup.
+    KeyBinding_NetplayPassTurn,
 
     Invalid
 };
