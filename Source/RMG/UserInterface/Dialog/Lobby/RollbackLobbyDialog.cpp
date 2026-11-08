@@ -4086,10 +4086,9 @@ bool RollbackLobbyDialog::requestPassTurn()
     }
 
     m_client->sendChat(CHANNEL_ROOM, QString::fromLatin1(kRotationPassMarker));
-    // Park this window right away: the emulation is about to stop and the next
-    // match will boot from the same game surface (no ROM-browser flash).
-    m_rotationAnnounced = true;
-    emit rotationRestartPending();
+    // The passer is moving to the bench, so this window does NOT park: it
+    // follows the normal match-end path. Everyone else parks when they receive
+    // the marker (see handleRotationControlChat).
     if (rotationIsHost())
         beginRotationForUser(selfId);
     emit closeMatchRequested();
@@ -4164,12 +4163,14 @@ void RollbackLobbyDialog::handleRotationControlChat(const QString& message,
         if (rotationIndexForUser(fromUserId) < 0 && !fromSelf)
             return;
 
-        // Remember that this match ends by a pass so the in_game -> waiting
-        // transition parks the game window (the host owns the queue, but every
-        // client needs to know a new match is coming).
-        m_rotationAnnounced = true;
-        if (!rotationIsHost() && !fromSelf)
+        // Non-passers stay in the match and park their window for the
+        // transparent restart. The passer (fromSelf) is moving to the bench
+        // and follows the normal match-end path, so it must NOT park.
+        if (!fromSelf)
+        {
+            m_rotationAnnounced = true;
             emit rotationRestartPending();
+        }
 
         QString who = fromUsername;
         if (who.isEmpty())
