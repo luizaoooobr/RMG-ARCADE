@@ -5455,6 +5455,18 @@ void MainWindow::on_Lobby_SessionRequested(QString gameName, QString romFile, QS
     // Kaillera and direct-rollback paths set the labels the same way, but this
     // lobby path was missing it — so port labels never appeared in lobby matches.
     OnScreenDisplaySetKailleraPortLabels(seatCount, GetLiveKailleraPortLabelNames());
+    {
+        auto names = GetLiveKailleraPortLabelNames();
+        std::string label;
+        for (int i = 0; i < seatCount && i < 4; ++i)
+        {
+            if (i > 0)
+                label += (seatCount == 2) ? "  vs  " : "   ";
+            if (!names[static_cast<size_t>(i)].empty())
+                label += names[static_cast<size_t>(i)];
+        }
+        OnScreenDisplaySetTopMatchLabel(label);
+    }
 #endif
 
     this->emulationThread->SetLobbyNetplay(remotePeers, localPort, localPlayer, frameDelay, predictionWindow);
@@ -5605,6 +5617,7 @@ void MainWindow::on_Kaillera_GameEnded(void)
 
     OnScreenDisplaySetKailleraChatMessage("");
     OnScreenDisplayClearKailleraPortLabels();
+    OnScreenDisplaySetTopMatchLabel("");
 #ifdef NETPLAY
     this->ui_PendingLocalChatEchoes.clear();
     this->closeNetplayChatPrompt();
@@ -6100,6 +6113,7 @@ void MainWindow::on_Emulation_Finished(bool ret, QString error)
         this->rollbackLobbyDialog->notifyEmulationFinished();
     }
     OnScreenDisplayClearKailleraPortLabels();
+    OnScreenDisplaySetTopMatchLabel("");
 #endif // NETPLAY
 
     if (!ret)

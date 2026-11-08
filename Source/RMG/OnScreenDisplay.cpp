@@ -75,6 +75,7 @@ static constexpr std::array<float, 4> l_KailleraPortLabelCenterOffset720p = { 19
 // Big centered banner (e.g. "Stream is buffering...") drawn over everything while
 // a spectator fast-forwards toward a broadcast's live edge. Empty = hidden.
 static std::string l_CenterMessage;
+static std::string l_TopMatchLabel;
 // Persistent audience badge for broadcasters and spectators. Unlike ordinary
 // system messages, it remains visible until explicitly cleared.
 static bool l_LiveReplayStatusEnabled = false;
@@ -332,6 +333,41 @@ static void OnScreenDisplayRenderCenterMessage(void)
         ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoFocusOnAppearing);
     ImGui::SetWindowFontScale(fontScale);
     ImGui::Text("%s", l_CenterMessage.c_str());
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::End();
+
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+}
+
+static void OnScreenDisplayRenderTopMatchLabel(void)
+{
+    if (l_TopMatchLabel.empty())
+    {
+        return;
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    float contentHeight = io.DisplaySize.y;
+    if (io.DisplaySize.x <= io.DisplaySize.y * (4.0f / 3.0f))
+        contentHeight = io.DisplaySize.x * (3.0f / 4.0f);
+    const float baseScale = std::max(1.0f, contentHeight / 240.0f);
+    const float fontScale = (baseScale * 7.0f) / (l_BaseFontSize * std::max(l_MessageScale, 0.1f));
+    const ImVec2 padding(12.0f * baseScale, 6.0f * baseScale);
+
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.55f));
+    ImGui::PushStyleColor(ImGuiCol_Text,     ImVec4(l_TextRed, l_TextGreen, l_TextBlue, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, padding);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f * baseScale);
+
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 8.0f * baseScale),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::Begin("Top Match Label", nullptr,
+        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::SetWindowFontScale(fontScale);
+    ImGui::Text("%s", l_TopMatchLabel.c_str());
     ImGui::SetWindowFontScale(1.0f);
     ImGui::End();
 
@@ -613,6 +649,11 @@ void OnScreenDisplayClearKailleraPortLabels(void)
 void OnScreenDisplaySetCenterMessage(const std::string& message)
 {
     l_CenterMessage = message;
+}
+
+void OnScreenDisplaySetTopMatchLabel(const std::string& message)
+{
+    l_TopMatchLabel = message;
 }
 
 void OnScreenDisplaySetLiveReplayStatus(const std::string& message)
@@ -909,6 +950,7 @@ void OnScreenDisplayRender(void)
 
     OnScreenDisplayRenderKailleraPortLabels();
     OnScreenDisplayRenderCenterMessage();
+    OnScreenDisplayRenderTopMatchLabel();
 
     ImGui::Render();
 

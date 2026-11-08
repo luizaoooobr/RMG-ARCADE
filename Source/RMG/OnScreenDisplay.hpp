@@ -54,6 +54,9 @@ void OnScreenDisplayClearKailleraPortLabels(void);
 // spectate "Stream is buffering..." banner). Pass an empty string to hide it.
 void OnScreenDisplaySetCenterMessage(const std::string& message);
 
+// Persistent top-of-screen label for the current match (e.g. "P1 vs P2").
+void OnScreenDisplaySetTopMatchLabel(const std::string& message);
+
 // Sets persistent live-replay audience text in the normal OSD message stack.
 // Pass an empty string to hide it.
 void OnScreenDisplaySetLiveReplayStatus(const std::string& message);
