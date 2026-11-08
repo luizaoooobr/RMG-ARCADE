@@ -2375,6 +2375,24 @@ void MainWindow::rememberInputPluginPreference(void)
 
 void MainWindow::updateUI(bool inEmulation, bool isPaused)
 {
+    if (this->ui_LobbyRotationParked)
+    {
+        if (inEmulation)
+        {
+            this->ui_LobbyRotationParked = false;
+            if (this->ui_LobbyRotationParkTimerId != 0)
+            {
+                this->killTimer(this->ui_LobbyRotationParkTimerId);
+                this->ui_LobbyRotationParkTimerId = 0;
+            }
+        }
+        else
+        {
+            this->ui_Widgets->setCurrentWidget(this->ui_Widget_Dummy);
+            return;
+        }
+    }
+
     if (!this->ui_NoSwitchToRomBrowser)
     {
         this->updateActions(inEmulation, isPaused);
@@ -2578,6 +2596,16 @@ void MainWindow::launchEmulationThread(QString cartRom, QString address, int por
 
 void MainWindow::launchEmulationThread(QString cartRom, QString diskRom, bool refreshRomListAfterEmulation, int slot, bool netplay, bool dragdrop)
 {
+    if (this->ui_LobbyRotationParked)
+    {
+        this->ui_LobbyRotationParked = false;
+        if (this->ui_LobbyRotationParkTimerId != 0)
+        {
+            this->killTimer(this->ui_LobbyRotationParkTimerId);
+            this->ui_LobbyRotationParkTimerId = 0;
+        }
+    }
+
 #ifdef NETPLAY
     if (this->netplaySessionDialog != nullptr && !netplay)
     {
@@ -3395,7 +3423,23 @@ void MainWindow::timerEvent(QTimerEvent *event)
 {
     int timerId = event->timerId();
 
-    if (timerId == this->ui_ResetStatusBarTimerId)
+    if (timerId == this->ui_LobbyRotationParkTimerId)
+    {
+        this->killTimer(this->ui_LobbyRotationParkTimerId);
+        this->ui_LobbyRotationParkTimerId = 0;
+        if (this->ui_LobbyRotationParked)
+        {
+            this->ui_LobbyRotationParked = false;
+            CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                "Rotation: next match did not start in time — returning to the ROM browser");
+            if (this->emulationThread == nullptr || !this->emulationThread->isRunning())
+            {
+                this->ui_NoSwitchToRomBrowser = false;
+                this->updateUI(false, false);
+            }
+        }
+    }
+    else if (timerId == this->ui_ResetStatusBarTimerId)
     {
         this->killTimer(this->ui_ResetStatusBarTimerId);
         this->ui_ResetStatusBarTimerId = 0;
@@ -5132,6 +5176,10 @@ void MainWindow::ensureRollbackLobbyDialog()
                 if (this->emulationThread && this->emulationThread->isRunning())
                     CoreStopEmulation();
             });
+    connect(this->rollbackLobbyDialog, &Dialog::RollbackLobbyDialog::rotationRestartPending,
+            this, &MainWindow::on_Lobby_RotationRestartPending);
+    connect(this->rollbackLobbyDialog, &Dialog::RollbackLobbyDialog::rotationRestartAborted,
+            this, &MainWindow::on_Lobby_RotationRestartAborted);
     connect(this->rollbackLobbyDialog, &Dialog::RollbackLobbyDialog::matchServerConnectionLost,
             this, [this](const QString& message) {
                 if (this->emulationThread && this->emulationThread->isRunning())
@@ -5409,6 +5457,36 @@ void MainWindow::on_Lobby_SessionRequested(QString gameName, QString romFile, QS
 
     this->emulationThread->SetLobbyNetplay(remotePeers, localPort, localPlayer, frameDelay, predictionWindow);
     this->launchEmulationThread(romFile, "", false, -1, true);
+}
+
+void MainWindow::on_Lobby_RotationRestartPending(void)
+{
+    if (this->emulationThread == nullptr || !this->emulationThread->isRunning())
+        return;
+    if (this->ui_LobbyRotationParked)
+        return;
+    this->ui_LobbyRotationParked = true;
+    if (this->ui_LobbyRotationParkTimerId != 0)
+        this->killTimer(this->ui_LobbyRotationParkTimerId);
+    this->ui_LobbyRotationParkTimerId = this->startTimer(12000);
+    CoreAddCallbackMessage(CoreDebugMessageType::Info,
+        "Rotation: keeping the game window parked for the next match");
+}
+
+void MainWindow::on_Lobby_RotationRestartAborted(void)
+{
+    if (!this->ui_LobbyRotationParked)
+        return;
+    this->ui_LobbyRotationParked = false;
+    if (this->ui_LobbyRotationParkTimerId != 0)
+    {
+        this->killTimer(this->ui_LobbyRotationParkTimerId);
+        this->ui_LobbyRotationParkTimerId = 0;
+    }
+    if (this->emulationThread != nullptr && this->emulationThread->isRunning())
+        return;
+    this->ui_NoSwitchToRomBrowser = false;
+    this->updateUI(false, false);
 }
 
 void MainWindow::on_Kaillera_ChatReceived(QString nickname, QString message)

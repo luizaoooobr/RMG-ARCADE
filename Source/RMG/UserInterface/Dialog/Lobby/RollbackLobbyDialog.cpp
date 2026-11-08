@@ -3350,6 +3350,7 @@ void RollbackLobbyDialog::enterRoom(quint64 roomId, const QString& greetingChatL
 
     // Fresh room: no rotation is in flight. The settings themselves persist.
     m_rotationPending = false;
+    m_rotationAnnounced = false;
     m_rotationDeparting.clear();
     m_rotationSwapping = false;
     m_rotationSwapFailures = 0;
@@ -3546,6 +3547,26 @@ void RollbackLobbyDialog::onRoomStateChanged(const QJsonObject& roomState)
     // still had a live local match (host dropped it for everyone).
     const QString prevState = m_currentRoomState;
     m_currentRoomState = state;
+
+    // Rotation handoff: when a *passed* match ends, tell the main window to
+    // keep the game surface parked instead of bouncing through the ROM
+    // browser while the host reorders seats and counts down the next match.
+    // Armed only for an actual pass — a normal end of match still returns to
+    // the browser like before.
+    if (prevState == "in_game" && state == "waiting")
+    {
+        if (m_rotationPending || (m_rotationEnabled && m_rotationAnnounced))
+        {
+            m_rotationAnnounced = false;
+            emit rotationRestartPending();
+        }
+    }
+    else if (state == "in_game")
+    {
+        // New match is up — nothing to park for any more.
+        m_rotationAnnounced = false;
+    }
+
     if (prevState == "in_game" && state != "in_game" &&
         (m_emulationActive || m_awaitingEmulationStart))
     {
@@ -4065,6 +4086,10 @@ bool RollbackLobbyDialog::requestPassTurn()
     }
 
     m_client->sendChat(CHANNEL_ROOM, QString::fromLatin1(kRotationPassMarker));
+    // Park this window right away: the emulation is about to stop and the next
+    // match will boot from the same game surface (no ROM-browser flash).
+    m_rotationAnnounced = true;
+    emit rotationRestartPending();
     if (rotationIsHost())
         beginRotationForUser(selfId);
     emit closeMatchRequested();
@@ -4138,6 +4163,13 @@ void RollbackLobbyDialog::handleRotationControlChat(const QString& message,
         // the queue move once the match has ended.
         if (rotationIndexForUser(fromUserId) < 0 && !fromSelf)
             return;
+
+        // Remember that this match ends by a pass so the in_game -> waiting
+        // transition parks the game window (the host owns the queue, but every
+        // client needs to know a new match is coming).
+        m_rotationAnnounced = true;
+        if (!rotationIsHost() && !fromSelf)
+            emit rotationRestartPending();
 
         QString who = fromUsername;
         if (who.isEmpty())
@@ -4376,6 +4408,7 @@ void RollbackLobbyDialog::cancelRotation(const QString& reason)
 
     const bool wasPending = m_rotationPending;
     m_rotationPending = false;
+    m_rotationAnnounced = false;
     m_rotationDeparting.clear();
     m_rotationSwapping = false;
     m_rotationSwapFailures = 0;
@@ -4383,6 +4416,10 @@ void RollbackLobbyDialog::cancelRotation(const QString& reason)
 
     if (wasPending && !reason.isEmpty())
         appendChatSystemLine(CHANNEL_ROOM, reason);
+
+    // No new match is coming from this rotation — let the parked window fall
+    // back to the ROM browser (no-op when nothing is parked).
+    emit rotationRestartAborted();
 }
 
 void RollbackLobbyDialog::updateRotationControls()
@@ -4715,12 +4752,15 @@ void RollbackLobbyDialog::onRoomLeft(const QString& reason)
     m_currentRoomHostId = 0;
     m_currentMatchId = 0;
     m_rotationPending = false;
+    m_rotationAnnounced = false;
     m_rotationDeparting.clear();
     m_rotationSwapping = false;
     m_rotationSwapFailures = 0;
     m_rotationAdvanceQueued = false;
     if (m_rotationSwapTimer) m_rotationSwapTimer->stop();
     if (m_rotationCountdownTimer) m_rotationCountdownTimer->stop();
+    // Leaving the room kills any pending handoff; release a parked window.
+    emit rotationRestartAborted();
     emit liveReplayViewerCountCleared();
     m_iceWaitingMatchId = 0;
     m_iceMatchDeadlineMs = 0;

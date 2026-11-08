@@ -104,6 +104,15 @@ signals:
     // Fired when the user clicks "Close Game" mid-match or when a peer drops.
     void closeMatchRequested();
 
+    // Rotation handoff. The match that was running has just ended because a
+    // player passed, and the host will move seats and auto-start the next one.
+    // The main window keeps the game surface parked (instead of bouncing
+    // through the ROM browser) until that next match boots.
+    void rotationRestartPending();
+    // Rotation will not produce a new match (no bench, cancelled, host left,
+    // room left): drop the parked window back to the ROM browser.
+    void rotationRestartAborted();
+
     // Non-modal in-game warning: lobby-backed services (including chat) are
     // offline, but the established peer-to-peer match transport is intact.
     void matchServerConnectionLost(QString message);
@@ -466,6 +475,10 @@ private:
     // time (adjacent swaps) until each sits at the end of the queue, then a
     // short countdown restarts the match.
     bool       m_rotationPending      = false;
+    // A pass marker was seen (or sent) for the match that just ended, so the
+    // in_game -> waiting transition should park the game window even on clients
+    // that don't own the host-side queue.
+    bool       m_rotationAnnounced    = false;
     QList<quint64> m_rotationDeparting;
     bool       m_rotationSwapping     = false;
     int        m_rotationSwapFailures = 0;

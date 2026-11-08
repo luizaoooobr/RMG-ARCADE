@@ -107,6 +107,11 @@ class MainWindow : public QMainWindow, private Ui::MainWindow
     bool applyExclusiveFullscreen(void);
 #endif
     bool ui_NoSwitchToRomBrowser = false;
+    // Rotation handoff: keep the game window on screen (neutral dummy surface)
+    // while the host reorders seats and boots the next match, instead of
+    // bouncing back to the ROM browser between matches.
+    bool ui_LobbyRotationParked = false;
+    int  ui_LobbyRotationParkTimerId = 0;
     bool ui_VidExtForceSetMode   = false;
     bool ui_LaunchInFullscreen   = false;
     bool ui_QuitAfterEmulation   = false;
@@ -367,6 +372,8 @@ class MainWindow : public QMainWindow, private Ui::MainWindow
     void on_Lobby_SpectateKeyframe(int frame, QByteArray savestate);
     void on_Lobby_SpectateClosed(QString reason);
     void on_Lobby_LiveReplayViewerCountChanged(int viewerCount, bool isSpectator);
+    void on_Lobby_RotationRestartPending(void);
+    void on_Lobby_RotationRestartAborted(void);
     void on_RomBrowser_RomListRefreshFinished(bool canceled);
 #endif
 
