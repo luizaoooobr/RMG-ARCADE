@@ -59,6 +59,7 @@
 #include <QComboBox>
 #include <QCompleter>
 #include <QCheckBox>
+#include <QSpinBox>
 #include <QSettings>
 #include <QMessageBox>
 #include <QInputDialog>
@@ -149,6 +150,14 @@ namespace
 
     // MIME type carrying the dragged seat's slot during a host reorder drag.
     const char* const kSeatMime = "application/x-rmgk-seat-slot";
+
+    // Rotation control protocol. The lobby server has no rotation concept, so
+    // these travel as room-chat lines and are suppressed from the rendered
+    // chat. Sender rules: PASS may come from any seated player, the other two
+    // are honored only when sent by the current room host.
+    const char* const kRotationPassMarker   = "[RMGK-PASS]";
+    const char* const kRotationConfigPrefix = "[RMGK-ROT]";
+    const char* const kRotationCountPrefix  = "[RMGK-COUNT]";
 
     constexpr int MARGIN_OUTER       = 8;   // dialog/column outside padding
     constexpr int MARGIN_GROUP       = 10;  // banner / accent-frame content inset
@@ -713,6 +722,19 @@ RollbackLobbyDialog::RollbackLobbyDialog(QWidget* parent)
     m_pingProbeTimer->setInterval(3'000);
     connect(m_pingProbeTimer, &QTimer::timeout, this, &RollbackLobbyDialog::onPingProbeTick);
 
+    // Host-side rotation timers: a swap watchdog (the server rebroadcasts
+    // ROOM_STATE after each accepted swap) and the 1 Hz restart countdown.
+    m_rotationSwapTimer = new QTimer(this);
+    m_rotationSwapTimer->setSingleShot(true);
+    m_rotationSwapTimer->setInterval(3'000);
+    connect(m_rotationSwapTimer, &QTimer::timeout,
+            this, &RollbackLobbyDialog::onRotationSwapTimeout);
+
+    m_rotationCountdownTimer = new QTimer(this);
+    m_rotationCountdownTimer->setInterval(1'000);
+    connect(m_rotationCountdownTimer, &QTimer::timeout,
+            this, &RollbackLobbyDialog::onRotationCountdownTick);
+
     // The lobby shell is visible before a connection exists, so initialize its
     // controls and status without waiting for a state-change signal.
     onClientStateChanged(LobbyClient::ConnectionState::Disconnected);
@@ -1260,6 +1282,66 @@ QWidget* RollbackLobbyDialog::buildInRoomView()
     updateRecordingControls();
 
     lay->addLayout(toggleRow);
+
+    // ── Rotation ("pass turn") ──
+    // Kept on its own row so the toggles above can stay narrow. Seat order is
+    // the queue: the first N occupied seats play, the rest wait on the bench.
+    // The host owns both values; everyone else mirrors them from control chat.
+    {
+        QSettings settings("RMG-K", "n02");
+        m_rotationEnabled = settings.value("RollbackLobby/RotationEnabled", false).toBool();
+        m_rotationActiveSeats = std::clamp(
+            settings.value("RollbackLobby/RotationActiveSeats", 2).toInt(), 1, 4);
+    }
+
+    auto* rotationRow = new QHBoxLayout;
+    rotationRow->setContentsMargins(0, 0, 0, 0);
+    rotationRow->setSpacing(SPACING_DEFAULT);
+
+    m_rotationCheck = new QCheckBox("Rotation", this);
+    m_rotationCheck->setChecked(m_rotationEnabled);
+    m_rotationCheck->setToolTip(QStringLiteral(
+        "Fighting-game rotation (host only).\n"
+        "The player who presses Pass Turn leaves the match and moves to the end\n"
+        "of the queue; the next player on the bench takes their seat when the\n"
+        "next match starts automatically."));
+    connect(m_rotationCheck, &QCheckBox::toggled, this, [this](bool checked) {
+        if (m_suppressRotationSignal) return;
+        setRotationSettings(checked,
+            m_rotationActiveSpin ? m_rotationActiveSpin->value() : m_rotationActiveSeats);
+        if (m_currentRoomId != 0 && rotationIsHost())
+        {
+            QSettings settings("RMG-K", "n02");
+            settings.setValue("RollbackLobby/RotationEnabled", m_rotationEnabled);
+            broadcastRotationSettings();
+        }
+    });
+    rotationRow->addWidget(m_rotationCheck);
+
+    auto* activeSeatsLbl = new QLabel("Active seats:", this);
+    m_rotationActiveSpin = new QSpinBox(this);
+    m_rotationActiveSpin->setRange(1, 4);
+    m_rotationActiveSpin->setValue(m_rotationActiveSeats);
+    m_rotationActiveSpin->setSuffix(" play");
+    m_rotationActiveSpin->setToolTip(QStringLiteral(
+        "How many of the occupied seats are playing.\n"
+        "The remaining seats form the bench / rotation queue."));
+    connect(m_rotationActiveSpin, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, [this](int value) {
+        if (m_suppressRotationSignal) return;
+        setRotationSettings(m_rotationCheck && m_rotationCheck->isChecked(), value);
+        if (m_currentRoomId != 0 && rotationIsHost())
+        {
+            QSettings settings("RMG-K", "n02");
+            settings.setValue("RollbackLobby/RotationActiveSeats", m_rotationActiveSeats);
+            broadcastRotationSettings();
+        }
+    });
+    rotationRow->addWidget(activeSeatsLbl);
+    rotationRow->addWidget(m_rotationActiveSpin);
+    rotationRow->addStretch(1);
+    lay->addLayout(rotationRow);
+    updateRotationControls();
 
     // Delay is local to each player and is published for the seat display.
     auto applyDelay = [this]() {
@@ -3266,6 +3348,15 @@ void RollbackLobbyDialog::enterRoom(quint64 roomId, const QString& greetingChatL
     m_quickMatchActive = false;
     if (m_quickMatchBtn) m_quickMatchBtn->setText("⚡  Quick Match");
 
+    // Fresh room: no rotation is in flight. The settings themselves persist.
+    m_rotationPending = false;
+    m_rotationDeparting.clear();
+    m_rotationSwapping = false;
+    m_rotationSwapFailures = 0;
+    m_rotationAdvanceQueued = false;
+    if (m_rotationSwapTimer) m_rotationSwapTimer->stop();
+    if (m_rotationCountdownTimer) m_rotationCountdownTimer->stop();
+
     // Restore only our selected mode/value, never an Auto calculation or a
     // remote player's delay. With remembering disabled, each room uses Auto.
     int preferredDelay = -1;
@@ -3462,6 +3553,54 @@ void RollbackLobbyDialog::onRoomStateChanged(const QJsonObject& roomState)
         emit closeMatchRequested();
     }
 
+    // ── Rotation queue (host) ──
+    // A pass ends the match; once the room is back in "waiting" the host
+    // bubbles each departing player to the end of the queue, one adjacent swap
+    // at a time (the server rebroadcasts ROOM_STATE after each), then restarts
+    // the match after a short countdown.
+    //
+    // Re-publish the settings whenever the room settles back into "waiting":
+    // a player who joined mid-match never saw the join-time broadcast, so
+    // their Pass Turn hotkey would otherwise think rotation is off.
+    if (rotationIsHost() && state == "waiting" && prevState != "waiting" &&
+        !m_rotationPending)
+        broadcastRotationSettings();
+    if (m_rotationPending && !rotationIsHost())
+        cancelRotation(QString());
+    if (rotationIsHost() && m_rotationPending)
+    {
+        if (state == "waiting" && m_rotationSwapping)
+        {
+            m_rotationSwapping = false;
+            if (m_rotationSwapTimer) m_rotationSwapTimer->stop();
+            // Any ROOM_STATE ack for the in-flight swap means the server
+            // accepted it; the seat array is updated below in this handler and
+            // advanceRotation (deferred) will work from the fresh layout.
+            m_rotationSwapFailures = 0;
+        }
+        if (state == "waiting")
+        {
+            if (!m_rotationSwapping && !m_rotationAdvanceQueued &&
+                !(m_rotationCountdownTimer && m_rotationCountdownTimer->isActive()))
+            {
+                m_rotationAdvanceQueued = true;
+                QTimer::singleShot(0, this, [this]() {
+                    m_rotationAdvanceQueued = false;
+                    advanceRotation();
+                });
+            }
+        }
+        else if (state == "in_game")
+        {
+            // The next match began — rotation complete.
+            m_rotationPending = false;
+            m_rotationDeparting.clear();
+            m_rotationSwapping = false;
+            m_rotationSwapFailures = 0;
+            if (m_rotationCountdownTimer) m_rotationCountdownTimer->stop();
+        }
+    }
+
     if (m_dropBtn)
     {
         m_dropBtn->setEnabled(state == "in_game" &&
@@ -3625,6 +3764,10 @@ void RollbackLobbyDialog::onRoomStateChanged(const QJsonObject& roomState)
         // already here, so they don't count as joins.
         if (m_roomSeatsSeen && sawNewPeer)
             notifyPlayerJoined();
+        // A player who just joined needs the host's rotation settings so their
+        // in-game Pass Turn hotkey knows whether a pass will be honored.
+        if (sawNewPeer && rotationIsHost() && state == "waiting")
+            broadcastRotationSettings();
         m_knownSeatedUsers = currentSeated;
         m_roomSeatsSeen = true;
     }
@@ -3635,6 +3778,7 @@ void RollbackLobbyDialog::onRoomStateChanged(const QJsonObject& roomState)
     // Publish a restored fixed choice once the initial room state has arrived.
     if (m_delayAuto || !m_localDelayPublished)
         applyLocalFrameDelay(false);
+    updateRotationControls();
     refreshStartButton();
 }
 
@@ -3678,6 +3822,34 @@ void RollbackLobbyDialog::updateRecordingControls()
         m_broadcastCheck->setToolTip(
             QStringLiteral("Let others in the lobby watch this match live.\n"
                            "A local replay is saved only if Record locally is checked."));
+    }
+
+    // Rotation is host-owned and can only change while the room is waiting.
+    if (m_rotationCheck)
+    {
+        m_rotationCheck->setEnabled(iAmHost && editable);
+        if (!iAmHost)
+        {
+            m_rotationCheck->setToolTip(m_rotationEnabled
+                ? QStringLiteral("The room host enabled rotation: the player who\n"
+                                 "passes moves to the end of the queue and the next\n"
+                                 "bench player takes their seat.")
+                : QStringLiteral("The room host has rotation turned off."));
+        }
+        else if (!editable)
+        {
+            m_rotationCheck->setToolTip(
+                QStringLiteral("Rotation is locked while a match is running."));
+        }
+    }
+    if (m_rotationActiveSpin)
+    {
+        m_rotationActiveSpin->setEnabled(
+            iAmHost && editable && m_rotationCheck && m_rotationCheck->isChecked());
+        m_rotationActiveSpin->setToolTip(iAmHost
+            ? QStringLiteral("How many of the occupied seats are playing.\n"
+                             "The remaining seats form the bench / rotation queue.")
+            : QStringLiteral("Set by the room host."));
     }
 }
 
@@ -3846,6 +4018,395 @@ void RollbackLobbyDialog::onStartGameClicked()
     // TODO: server-side ROOM_START handler not yet implemented; this currently
     // sends the request but won't do anything until we wire MATCH_BEGIN.
     m_client->startRoom();
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//  Rotation ("pass turn")
+// ──────────────────────────────────────────────────────────────────────
+
+// Called by the in-game hotkey. The marker travels over room chat so it
+// reaches the host before MATCH_FINISHED flips the room back to "waiting".
+bool RollbackLobbyDialog::requestPassTurn()
+{
+    if (!m_client || m_currentRoomId == 0)
+        return false;
+    if (m_currentRoomState != "in_game")
+        return false;
+    if (!m_emulationActive && !m_awaitingEmulationStart)
+        return false;
+
+    const quint64 selfId = m_client->selfUserId();
+    bool seated = false;
+    for (const auto& s : m_seats)
+    {
+        if (s.userId == selfId)
+        {
+            seated = true;
+            break;
+        }
+    }
+    if (!seated)
+        return false;
+
+    // Only an active seat can end the match; bench players are already
+    // spectating and waiting for their turn.
+    if (rotationIndexForUser(selfId) >= m_rotationActiveSeats)
+    {
+        appendChatSystemLine(CHANNEL_ROOM,
+            "You're on the bench — you'll take a seat when your turn comes.");
+        return false;
+    }
+
+    if (!m_rotationEnabled)
+    {
+        appendChatSystemLine(CHANNEL_ROOM,
+            "Rotation is off — the host can enable it in the lobby.");
+        return false;
+    }
+
+    m_client->sendChat(CHANNEL_ROOM, QString::fromLatin1(kRotationPassMarker));
+    if (rotationIsHost())
+        beginRotationForUser(selfId);
+    emit closeMatchRequested();
+    return true;
+}
+
+bool RollbackLobbyDialog::rotationIsHost() const
+{
+    return m_client && m_currentRoomId != 0 && m_currentRoomHostId != 0 &&
+           m_currentRoomHostId == m_client->selfUserId();
+}
+
+QList<int> RollbackLobbyDialog::occupiedSeats() const
+{
+    QList<int> seatSlots;
+    for (int i = 0; i < 4; ++i)
+    {
+        if (m_seats[i].userId != 0)
+            seatSlots.append(i + 1);
+    }
+    return seatSlots;
+}
+
+int RollbackLobbyDialog::rotationIndexForUser(quint64 userId) const
+{
+    const QList<int> seatSlots = occupiedSeats();
+    for (int i = 0; i < seatSlots.size(); ++i)
+    {
+        if (m_seats[seatSlots[i] - 1].userId == userId)
+            return i;
+    }
+    return -1;
+}
+
+void RollbackLobbyDialog::setRotationSettings(bool enabled, int activeSeats)
+{
+    const int clamped = std::clamp(activeSeats, 1, 4);
+    const bool changed = (enabled != m_rotationEnabled) ||
+                         (clamped != m_rotationActiveSeats);
+    m_rotationEnabled = enabled;
+    m_rotationActiveSeats = clamped;
+    updateRotationControls();
+    if (changed && !m_rotationEnabled)
+        cancelRotation(QString());
+}
+
+void RollbackLobbyDialog::broadcastRotationSettings()
+{
+    if (!m_client || m_currentRoomId == 0 || !rotationIsHost())
+        return;
+    m_client->sendChat(CHANNEL_ROOM,
+        QString("%1%2:%3")
+            .arg(QString::fromLatin1(kRotationConfigPrefix))
+            .arg(m_rotationEnabled ? 1 : 0)
+            .arg(m_rotationActiveSeats));
+}
+
+void RollbackLobbyDialog::handleRotationControlChat(const QString& message,
+                                                    quint64 fromUserId,
+                                                    const QString& fromUsername)
+{
+    if (!m_client)
+        return;
+
+    const bool fromSelf = (fromUserId == m_client->selfUserId());
+    const bool fromHost = (fromUserId != 0 && fromUserId == m_currentRoomHostId);
+
+    if (message.startsWith(QString::fromLatin1(kRotationPassMarker)))
+    {
+        // Any seated player may pass. The host validates the seat and applies
+        // the queue move once the match has ended.
+        if (rotationIndexForUser(fromUserId) < 0 && !fromSelf)
+            return;
+
+        QString who = fromUsername;
+        if (who.isEmpty())
+        {
+            const auto& users = m_client->users();
+            const auto it = users.constFind(fromUserId);
+            who = (it != users.constEnd() && !it->username.isEmpty())
+                ? it->username : QString::number(fromUserId);
+        }
+
+        if (rotationIsHost())
+        {
+            if (!m_rotationEnabled)
+            {
+                appendChatSystemLine(CHANNEL_ROOM,
+                    QString("%1 passed, but rotation is off — the match ends here.").arg(who));
+                return;
+            }
+            beginRotationForUser(fromUserId);
+        }
+        else
+        {
+            appendChatSystemLine(CHANNEL_ROOM, m_rotationEnabled
+                ? QString("%1 passed — rotating after this match.").arg(who)
+                : QString("%1 passed.").arg(who));
+        }
+        return;
+    }
+
+    if (message.startsWith(QString::fromLatin1(kRotationConfigPrefix)))
+    {
+        // Host-authoritative. A regular user cannot silently enable queue
+        // moves for everyone by typing the marker.
+        if (!fromHost)
+            return;
+        const QString payload = message.mid(
+            int(std::strlen(kRotationConfigPrefix)));
+        const QStringList parts = payload.split(':');
+        const bool enabled = parts.value(0).toInt() != 0;
+        const int active = std::clamp(parts.value(1, "2").toInt(), 1, 4);
+        const bool changed = (enabled != m_rotationEnabled) ||
+                             (active != m_rotationActiveSeats);
+        setRotationSettings(enabled, active);
+        if (changed && !fromSelf)
+        {
+            appendChatSystemLine(CHANNEL_ROOM, enabled
+                ? QString("Host enabled rotation (%1 active seat(s)).").arg(active)
+                : QStringLiteral("Host disabled rotation."));
+        }
+        return;
+    }
+
+    if (message.startsWith(QString::fromLatin1(kRotationCountPrefix)))
+    {
+        if (!fromHost)
+            return;
+        const int seconds = message.mid(
+            int(std::strlen(kRotationCountPrefix))).toInt();
+        if (seconds > 0)
+            appendChatSystemLine(CHANNEL_ROOM,
+                QString("Next match starts in %1…").arg(seconds));
+        else
+            appendChatSystemLine(CHANNEL_ROOM, "Starting next match…");
+        return;
+    }
+}
+
+void RollbackLobbyDialog::beginRotationForUser(quint64 userId)
+{
+    if (!rotationIsHost() || !m_rotationEnabled || !m_client)
+        return;
+    if (m_currentRoomId == 0)
+        return;
+
+    const bool alreadyQueued = m_rotationDeparting.contains(userId);
+    if (!alreadyQueued)
+        m_rotationDeparting.append(userId);
+    m_rotationPending = true;
+
+    if (!alreadyQueued)
+    {
+        QString who;
+        const auto& users = m_client->users();
+        const auto it = users.constFind(userId);
+        if (it != users.constEnd() && !it->username.isEmpty())
+            who = it->username;
+        else
+            who = QString::number(userId);
+        appendChatSystemLine(CHANNEL_ROOM,
+            QString("%1 passed — moving to the end of the queue.").arg(who));
+    }
+
+    // If the match already ended (marker arrived late, or we are the host and
+    // our own stop finished first), advance right away.
+    if (m_currentRoomState == "waiting" && !m_rotationSwapping &&
+        !(m_rotationCountdownTimer && m_rotationCountdownTimer->isActive()) &&
+        !m_rotationAdvanceQueued)
+    {
+        m_rotationAdvanceQueued = true;
+        QTimer::singleShot(0, this, [this]() {
+            m_rotationAdvanceQueued = false;
+            advanceRotation();
+        });
+    }
+}
+
+// Host-only. Moves the first departing player one seat toward the end of the
+// queue, then waits for the server's ROOM_STATE ack before the next swap.
+void RollbackLobbyDialog::advanceRotation()
+{
+    if (!rotationIsHost() || !m_rotationPending)
+        return;
+    if (!m_client || m_currentRoomId == 0 || m_currentRoomState != "waiting")
+        return;
+    if (m_rotationCountdownTimer && m_rotationCountdownTimer->isActive())
+        return;
+
+    // Forget players who left the room or gave up their seat while waiting.
+    for (int i = m_rotationDeparting.size() - 1; i >= 0; --i)
+    {
+        if (rotationIndexForUser(m_rotationDeparting[i]) < 0)
+            m_rotationDeparting.removeAt(i);
+    }
+
+    const QList<int> seatSlots = occupiedSeats();
+    if (m_rotationDeparting.isEmpty())
+    {
+        startRotationCountdown();
+        return;
+    }
+    if (seatSlots.size() <= m_rotationActiveSeats)
+    {
+        cancelRotation(QStringLiteral(
+            "Rotation skipped: no one is on the bench, so the match ended."));
+        return;
+    }
+
+    const quint64 user = m_rotationDeparting.first();
+    const int idx = rotationIndexForUser(user);
+    if (idx < 0 || idx >= seatSlots.size() - 1)
+    {
+        m_rotationDeparting.removeFirst();
+        m_rotationSwapFailures = 0;
+        QTimer::singleShot(0, this, &RollbackLobbyDialog::advanceRotation);
+        return;
+    }
+    if (m_rotationSwapFailures >= 3)
+    {
+        cancelRotation(QStringLiteral(
+            "Rotation stopped: the server kept refusing the seat swap."));
+        return;
+    }
+
+    m_rotationSwapping = true;
+    m_rotationSwapUserId = user;
+    m_rotationSwapFromIndex = idx;
+    m_client->swapSeats(seatSlots[idx], seatSlots[idx + 1]);
+    if (m_rotationSwapTimer)
+        m_rotationSwapTimer->start();
+}
+
+void RollbackLobbyDialog::onRotationSwapTimeout()
+{
+    if (!m_rotationSwapping)
+        return;
+    m_rotationSwapping = false;
+    ++m_rotationSwapFailures;
+    if (rotationIsHost() && m_rotationPending)
+        QTimer::singleShot(0, this, &RollbackLobbyDialog::advanceRotation);
+}
+
+void RollbackLobbyDialog::startRotationCountdown()
+{
+    if (!rotationIsHost() || !m_rotationPending || !m_client)
+        return;
+    if (m_rotationCountdownTimer && m_rotationCountdownTimer->isActive())
+        return;
+    if (occupiedSeats().size() < 2)
+    {
+        cancelRotation(QStringLiteral("Rotation cancelled: not enough players."));
+        return;
+    }
+
+    m_rotationCountdownLeft = 3;
+    if (m_rotationCountdownTimer)
+        m_rotationCountdownTimer->start();
+    m_client->sendChat(CHANNEL_ROOM,
+        QString("%1%2")
+            .arg(QString::fromLatin1(kRotationCountPrefix))
+            .arg(m_rotationCountdownLeft));
+}
+
+void RollbackLobbyDialog::onRotationCountdownTick()
+{
+    if (!rotationIsHost() || !m_rotationPending || !m_client)
+    {
+        if (m_rotationCountdownTimer)
+            m_rotationCountdownTimer->stop();
+        return;
+    }
+
+    --m_rotationCountdownLeft;
+    if (m_rotationCountdownLeft > 0)
+    {
+        m_client->sendChat(CHANNEL_ROOM,
+            QString("%1%2")
+                .arg(QString::fromLatin1(kRotationCountPrefix))
+                .arg(m_rotationCountdownLeft));
+        return;
+    }
+
+    if (m_rotationCountdownTimer)
+        m_rotationCountdownTimer->stop();
+
+    if (m_currentRoomState != "waiting" || occupiedSeats().size() < 2)
+    {
+        cancelRotation(QStringLiteral("Rotation cancelled: the room is no longer ready."));
+        return;
+    }
+
+    m_rotationPending = false;
+    m_rotationDeparting.clear();
+    m_rotationSwapping = false;
+    m_rotationSwapFailures = 0;
+    m_client->sendChat(CHANNEL_ROOM,
+        QString::fromLatin1(kRotationCountPrefix) + QStringLiteral("0"));
+    m_client->startRoom();
+}
+
+void RollbackLobbyDialog::cancelRotation(const QString& reason)
+{
+    if (m_rotationSwapTimer)
+        m_rotationSwapTimer->stop();
+    if (m_rotationCountdownTimer)
+        m_rotationCountdownTimer->stop();
+
+    const bool wasPending = m_rotationPending;
+    m_rotationPending = false;
+    m_rotationDeparting.clear();
+    m_rotationSwapping = false;
+    m_rotationSwapFailures = 0;
+    m_rotationAdvanceQueued = false;
+
+    if (wasPending && !reason.isEmpty())
+        appendChatSystemLine(CHANNEL_ROOM, reason);
+}
+
+void RollbackLobbyDialog::updateRotationControls()
+{
+    m_suppressRotationSignal = true;
+    if (m_rotationCheck)
+        m_rotationCheck->setChecked(m_rotationEnabled);
+    if (m_rotationActiveSpin)
+        m_rotationActiveSpin->setValue(m_rotationActiveSeats);
+    m_suppressRotationSignal = false;
+
+    updateRecordingControls();
+
+    // Bench markers depend on the active-seat count, which can change without
+    // a ROOM_STATE (host editing the spinbox).
+    const QList<int> occ = occupiedSeats();
+    for (int i = 0; i < occ.size(); ++i)
+    {
+        SeatRow& seat = m_seats[occ[i] - 1];
+        if (seat.row)
+            seat.row->setToolTip(i < m_rotationActiveSeats
+                ? QStringLiteral("Playing seat")
+                : QStringLiteral("Bench — next in the rotation queue"));
+    }
 }
 
 void RollbackLobbyDialog::onPingProbeTick()
@@ -4153,6 +4714,13 @@ void RollbackLobbyDialog::onRoomLeft(const QString& reason)
     m_currentRoomPacing = 0;
     m_currentRoomHostId = 0;
     m_currentMatchId = 0;
+    m_rotationPending = false;
+    m_rotationDeparting.clear();
+    m_rotationSwapping = false;
+    m_rotationSwapFailures = 0;
+    m_rotationAdvanceQueued = false;
+    if (m_rotationSwapTimer) m_rotationSwapTimer->stop();
+    if (m_rotationCountdownTimer) m_rotationCountdownTimer->stop();
     emit liveReplayViewerCountCleared();
     m_iceWaitingMatchId = 0;
     m_iceMatchDeadlineMs = 0;
@@ -4230,6 +4798,15 @@ void RollbackLobbyDialog::onChatMessageReceived(const LobbyClient::ChatMessage& 
         if (m_chatTabs->currentIndex() != kChatTabSpectators)
             m_chatTabs->setTabText(kChatTabSpectators, "Spectators •");
         emit spectatorChatReceived(msg.fromUsername, msg.message);
+        return;
+    }
+
+    // Rotation control lines travel as room chat (the server has no rotation
+    // concept). Handle and suppress them so they never reach the chat view or
+    // the in-game overlay as raw protocol text.
+    if (msg.channel == CHANNEL_ROOM && msg.message.startsWith(QStringLiteral("[RMGK-")))
+    {
+        handleRotationControlChat(msg.message, msg.fromUserId, msg.fromUsername);
         return;
     }
 

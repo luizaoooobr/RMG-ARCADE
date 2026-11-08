@@ -287,6 +287,7 @@ class MainWindow : public QMainWindow, private Ui::MainWindow
 
 #ifdef NETPLAY
     bool handleNetplayChatKeyPress(QKeyEvent *event);
+    bool handleNetplayPassTurnKeyPress(QKeyEvent *event);
     void updateNetplayChatPrompt(void);
     void closeNetplayChatPrompt(void);
 #endif // NETPLAY

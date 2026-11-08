@@ -223,6 +223,7 @@ enum class SettingsID
     KeyBinding_Cheats,
     KeyBinding_GSButton,
     KeyBinding_NetplayChat,
+    KeyBinding_NetplayPassTurn,
     KeyBinding_SaveStateSlot0,
     KeyBinding_SaveStateSlot1,
     KeyBinding_SaveStateSlot2,

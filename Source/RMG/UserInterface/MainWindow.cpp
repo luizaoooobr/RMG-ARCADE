@@ -3697,6 +3697,11 @@ void MainWindow::on_EventFilter_KeyPressed(QKeyEvent *event)
     {
         return;
     }
+
+    if (this->handleNetplayPassTurnKeyPress(event))
+    {
+        return;
+    }
 #endif // NETPLAY
 
     if (!CoreIsEmulationRunning())
@@ -5694,6 +5699,49 @@ bool MainWindow::handleNetplayChatKeyPress(QKeyEvent *event)
     }
 
     return false;
+}
+
+// Lobby rotation hotkey. Checked before the key reaches the core so a keyboard
+// player bound to the same key doesn't also see it as game input. Only the
+// lobby path exposes the rotation queue; it is a no-op elsewhere.
+bool MainWindow::handleNetplayPassTurnKeyPress(QKeyEvent *event)
+{
+    if (!CoreIsEmulationRunning() || this->ui_NetplayChatInputActive)
+    {
+        return false;
+    }
+
+    if (!this->ui_LobbyNetplaySession || this->rollbackLobbyDialog == nullptr)
+    {
+        return false;
+    }
+
+    if (event->isAutoRepeat())
+    {
+        return false;
+    }
+
+    const QString keyBinding = QString::fromStdString(
+        CoreSettingsGetStringValue(SettingsID::KeyBinding_NetplayPassTurn));
+    if (keyBinding.isEmpty())
+    {
+        return false;
+    }
+
+    QKeySequence expected(keyBinding);
+    QKeySequence pressed(event->key() | event->modifiers());
+    if (expected.matches(pressed) != QKeySequence::ExactMatch)
+    {
+        return false;
+    }
+
+    if (!this->rollbackLobbyDialog->requestPassTurn())
+    {
+        return false;
+    }
+
+    OnScreenDisplaySetMessage("Pass turn requested - you will spectate the next match.");
+    return true;
 }
 
 void MainWindow::updateNetplayChatPrompt(void)

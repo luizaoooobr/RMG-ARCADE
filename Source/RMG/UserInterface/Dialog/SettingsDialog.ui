@@ -1128,6 +1128,24 @@
                    </layout>
                   </item>
                   <item>
+                   <layout class="QHBoxLayout" name="horizontalLayout_netplayPass">
+                    <item>
+                     <widget class="QLabel" name="label_netplayPass">
+                      <property name="text">
+                       <string>Pass Turn (Lobby)</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item>
+                     <widget class="KeybindButton" name="netplayPassTurnKeyButton">
+                      <property name="text">
+                       <string/>
+                      </property>
+                     </widget>
+                    </item>
+                   </layout>
+                  </item>
+                  <item>
                    <layout class="QHBoxLayout" name="horizontalLayout_80">
                     <item>
                      <widget class="QLabel" name="label_77">

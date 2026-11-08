@@ -15,6 +15,7 @@
 #include <QHash>
 #include <QMap>
 #include <QSet>
+#include <QList>
 #include <QStringList>
 #include <QByteArray>
 #include <QMutex>
@@ -35,6 +36,7 @@ class QStackedWidget;
 class QTabBar;
 class QComboBox;
 class QCheckBox;
+class QSpinBox;
 
 namespace UserInterface
 {
@@ -72,6 +74,12 @@ public:
     // Sends a chat line to the other viewers of the live replay being watched.
     // The match's players never receive it. No-op unless spectating.
     void sendSpectatorChat(const QString& message);
+
+    // Rotation ("pass turn"). Called from the in-game hotkey: ends this player's
+    // match and asks the room host to move them to the end of the rotation
+    // queue so the next bench player takes the seat for the next match.
+    // Returns true when a pass was actually requested.
+    bool requestPassTurn();
 
     // MainWindow calls this when a spectate playback session ends (emulation
     // stopped) so the server can drop us from the broadcast. Idempotent.
@@ -156,6 +164,8 @@ private slots:
     void onLeaveRoomClicked();
     void onDropGameClicked();
     void onStartGameClicked();
+    void onRotationCountdownTick();
+    void onRotationSwapTimeout();
 
     void onMatchPeerLeft(quint64 matchId, quint64 userId, int slot, const QString& reason);
 
@@ -351,6 +361,22 @@ private:
     void refreshStartButton();
     void updateRecordingControls();
 
+    // ── Rotation ("pass turn") queue ──
+    // The host owns the setting; every client mirrors the host's control chat
+    // so the in-game hotkey knows whether a pass will be honored.
+    bool rotationIsHost() const;
+    QList<int> occupiedSeats() const;
+    int  rotationIndexForUser(quint64 userId) const;
+    void setRotationSettings(bool enabled, int activeSeats);
+    void broadcastRotationSettings();
+    void handleRotationControlChat(const QString& message, quint64 fromUserId,
+                                   const QString& fromUsername);
+    void beginRotationForUser(quint64 userId);
+    void advanceRotation();
+    void startRotationCountdown();
+    void cancelRotation(const QString& reason);
+    void updateRotationControls();
+
     LobbyClient* m_client = nullptr;
 
     bool    m_connectPromptOpen = false;
@@ -427,6 +453,28 @@ private:
     // Wall-clock of the last savestate-keyframe request (0 = request one now). The
     // drain tick requests a keyframe at a fixed interval and polls for the result.
     qint64     m_lastKeyframeRequestMs = 0;
+
+    // ── Rotation ("pass turn") ──
+    // Host-editable settings, mirrored to every client through room chat control
+    // lines so the in-game hotkey can tell whether a pass will be honored.
+    QCheckBox* m_rotationCheck        = nullptr;
+    QSpinBox*  m_rotationActiveSpin   = nullptr;
+    bool       m_rotationEnabled      = false;
+    int        m_rotationActiveSeats  = 2;
+    bool       m_suppressRotationSignal = false;
+    // Host-only queue state. The departing players are bubbled one seat at a
+    // time (adjacent swaps) until each sits at the end of the queue, then a
+    // short countdown restarts the match.
+    bool       m_rotationPending      = false;
+    QList<quint64> m_rotationDeparting;
+    bool       m_rotationSwapping     = false;
+    int        m_rotationSwapFailures = 0;
+    int        m_rotationSwapFromIndex = -1;
+    quint64    m_rotationSwapUserId   = 0;
+    QTimer*    m_rotationSwapTimer    = nullptr;
+    QTimer*    m_rotationCountdownTimer = nullptr;
+    int        m_rotationCountdownLeft = 0;
+    bool       m_rotationAdvanceQueued = false;
 
     // Non-zero while this client is spectating a broadcast match (the match id
     // we asked the server to stream). Cleared when the spectate session ends.

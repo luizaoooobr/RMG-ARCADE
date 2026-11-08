@@ -681,6 +681,9 @@ static l_Setting get_setting(SettingsID settingId)
     case SettingsID::KeyBinding_NetplayChat:
         setting = {SETTING_SECTION_KEYBIND, "NetplayChat", std::string("Return")};
         break;
+    case SettingsID::KeyBinding_NetplayPassTurn:
+        setting = {SETTING_SECTION_KEYBIND, "NetplayPassTurn", std::string("I")};
+        break;
     case SettingsID::KeyBinding_SaveStateSlot0:
         setting = {SETTING_SECTION_KEYBIND, "SaveStateSlot0", std::string("Ctrl+0")};
         break;
