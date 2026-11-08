@@ -4051,6 +4051,9 @@ bool RollbackLobbyDialog::requestPassTurn()
 {
     if (!m_client || m_currentRoomId == 0)
         return false;
+    // Only the host may pass players.
+    if (!rotationIsHost())
+        return false;
     if (m_currentRoomState != "in_game")
         return false;
     if (!m_emulationActive && !m_awaitingEmulationStart)
@@ -4224,6 +4227,12 @@ void RollbackLobbyDialog::handleRotationControlChat(const QString& message,
 
     if (message.startsWith(QString::fromLatin1(kRotationPassMarker)))
     {
+        // Only the host may pass players (move them to the end of the queue).
+        // Ignore any marker coming from a regular client, so a client cannot
+        // trigger a pass by typing the marker in chat.
+        if (!fromHost)
+            return;
+
         // Parse an optional target slot from markers like "[RMGK-PASS]2"
         // (host passing a specific player). A bare "[RMGK-PASS]" means the
         // sender passes themselves (legacy / self-pass).
