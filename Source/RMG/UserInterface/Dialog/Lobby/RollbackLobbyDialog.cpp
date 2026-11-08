@@ -4057,6 +4057,13 @@ bool RollbackLobbyDialog::requestPassTurn()
     // Only the host may pass players.
     if (!rotationIsHost())
         return false;
+    // Rotation only makes sense with more than 2 players in the room.
+    if (occupiedSeats().size() <= 2)
+    {
+        appendChatSystemLine(CHANNEL_ROOM,
+            "Rotation needs more than 2 players in the room.");
+        return false;
+    }
     if (m_currentRoomState != "in_game")
         return false;
     if (!m_emulationActive && !m_awaitingEmulationStart)
@@ -4122,6 +4129,14 @@ bool RollbackLobbyDialog::requestPassTurnForSlot(int slot)
     {
         appendChatSystemLine(CHANNEL_ROOM,
             "Rotation is off — the host can enable it in the lobby.");
+        return false;
+    }
+
+    // Rotation only makes sense with more than 2 players in the room.
+    if (occupiedSeats().size() <= 2)
+    {
+        appendChatSystemLine(CHANNEL_ROOM,
+            "Rotation needs more than 2 players in the room.");
         return false;
     }
 
@@ -4298,6 +4313,12 @@ void RollbackLobbyDialog::handleRotationControlChat(const QString& message,
 
         if (rotationIsHost())
         {
+            if (occupiedSeats().size() <= 2)
+            {
+                appendChatSystemLine(CHANNEL_ROOM,
+                    "Rotation needs more than 2 players in the room.");
+                return;
+            }
             if (!m_rotationEnabled)
             {
                 appendChatSystemLine(CHANNEL_ROOM,
