@@ -3352,6 +3352,7 @@ void RollbackLobbyDialog::enterRoom(quint64 roomId, const QString& greetingChatL
     m_rotationPending = false;
     m_rotationAnnounced = false;
     m_iAmPasser = false;
+    m_hostReportPending = false;
     m_rotationDeparting.clear();
     m_rotationSwapping = false;
     m_rotationSwapFailures = 0;
@@ -3988,9 +3989,10 @@ void RollbackLobbyDialog::notifyEmulationFinished()
             (unsigned long long)matchId);
         CoreAddCallbackMessage(CoreDebugMessageType::Info, buf);
     }
-    const bool suppressReport = m_iAmPasser;
+    const bool shouldReport = m_hostReportPending || !m_iAmPasser;
     m_iAmPasser = false;
-    if (matchId != 0 && !suppressReport)
+    m_hostReportPending = false;
+    if (matchId != 0 && shouldReport)
         m_client->reportMatchFinished(matchId);
     m_currentMatchId = 0;
     emit liveReplayViewerCountCleared();
@@ -4111,11 +4113,7 @@ bool RollbackLobbyDialog::requestPassTurn()
     if (rotationIsHost())
     {
         beginRotationForUser(selfId);
-        if (m_currentMatchId != 0)
-        {
-            m_client->reportMatchFinished(m_currentMatchId);
-            m_currentMatchId = 0;
-        }
+        m_hostReportPending = true;
     }
     // Passer parks so the window doesn't close abruptly; released when the
     // next match starts.
@@ -4187,13 +4185,8 @@ bool RollbackLobbyDialog::requestPassTurnForSlot(int slot)
 
     beginRotationForUser(targetUserId);
 
-    // Host ends the match (reportMatchFinished) so peers don't report early
-    // and get dropped from the room.
-    if (m_currentMatchId != 0)
-    {
-        m_client->reportMatchFinished(m_currentMatchId);
-        m_currentMatchId = 0;
-    }
+    // Defer the MATCH_FINISHED report to notifyEmulationFinished.
+    m_hostReportPending = true;
 
     if (m_emulationActive || m_awaitingEmulationStart)
     {
@@ -4565,6 +4558,7 @@ void RollbackLobbyDialog::cancelRotation(const QString& reason)
     m_rotationPending = false;
     m_rotationAnnounced = false;
     m_iAmPasser = false;
+    m_hostReportPending = false;
     m_rotationDeparting.clear();
     m_rotationSwapping = false;
     m_rotationSwapFailures = 0;
@@ -4910,6 +4904,7 @@ void RollbackLobbyDialog::onRoomLeft(const QString& reason)
     m_rotationPending = false;
     m_rotationAnnounced = false;
     m_iAmPasser = false;
+    m_hostReportPending = false;
     m_rotationDeparting.clear();
     m_rotationSwapping = false;
     m_rotationSwapFailures = 0;
@@ -5641,6 +5636,9 @@ void RollbackLobbyDialog::onMatchBegin(quint64 matchId, const QList<LobbyClient:
 
     m_currentMatchId = matchId;
     m_awaitingEmulationStart = true;
+    m_rotationAnnounced = false;
+    m_iAmPasser = false;
+    m_hostReportPending = false;
     updateRecordingControls();
 
     // Disable start; enable Drop now — MATCH_BEGIN arrives *after* the

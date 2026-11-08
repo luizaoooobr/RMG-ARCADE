@@ -486,6 +486,7 @@ private:
     bool       m_rotationAnnounced    = false;
     // True when this client is the passer of the rotation currently in flight.
     bool       m_iAmPasser           = false;
+    bool       m_hostReportPending   = false;
     QList<quint64> m_rotationDeparting;
     bool       m_rotationSwapping     = false;
     int        m_rotationSwapFailures = 0;
