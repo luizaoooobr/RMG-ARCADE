@@ -1619,7 +1619,6 @@ QString NormalizeOsdKailleraChatMessage(QString message)
     return message;
 }
 
-#ifdef _WIN32
 std::array<std::string, 4> GetLiveKailleraPortLabelNames()
 {
     std::array<std::string, 4> playerNames;
@@ -1629,7 +1628,6 @@ std::array<std::string, 4> GetLiveKailleraPortLabelNames()
     }
     return playerNames;
 }
-#endif // _WIN32
 #endif // NETPLAY
 } // namespace
 
@@ -4638,7 +4636,6 @@ void MainWindow::on_Lobby_SpectateData(QByteArray bytes, int liveFrame, qint64 o
     n02::playbackAppendBytes(bytes.constData(), static_cast<int>(bytes.size()));
     this->ui_SpectateExpectedOffset += bytes.size();
 
-#ifdef _WIN32
     // The krec header carries the slot-ordered player names; once it has been
     // parsed (synchronously, in playbackAppendBytes above), label the OSD ports
     // from it exactly like a live match does. Names ride in the stream, not a
@@ -4648,7 +4645,6 @@ void MainWindow::on_Lobby_SpectateData(QByteArray bytes, int liveFrame, qint64 o
         OnScreenDisplaySetKailleraPortLabels(n02::playbackNumPlayers(), GetLiveKailleraPortLabelNames());
         this->ui_SpectateNamesShown = true;
     }
-#endif
 }
 
 void MainWindow::on_Lobby_SpectateKeyframe(int frame, QByteArray savestate)
@@ -5261,9 +5257,7 @@ void MainWindow::on_Kaillera_GameStarted(QString gameName, int playerNum, int to
     }
 
     this->emulationThread->SetNetplay("KAILLERA", 0, playerNum); // "KAILLERA" is the marker
-#ifdef _WIN32
     OnScreenDisplaySetKailleraPortLabels(totalPlayers, GetLiveKailleraPortLabelNames());
-#endif
     this->launchEmulationThread(romFile, "", false, -1, true);
 }
 
@@ -5327,9 +5321,7 @@ void MainWindow::on_Rollback_SessionRequested(QString gameName, QString remoteAd
 
     CoreAddCallbackMessage(CoreDebugMessageType::Info,
         "Lobby→Session: launching emulation thread (rollback session)");
-#ifdef _WIN32
     OnScreenDisplaySetKailleraPortLabels(2, GetLiveKailleraPortLabelNames());
-#endif
     this->emulationThread->SetGekkoNetplay(remoteAddress, localPort, remotePort, localPlayer, frameDelay, predictionWindow);
     this->launchEmulationThread(romFile, "", false, -1, true);
 }
@@ -5449,7 +5441,6 @@ void MainWindow::on_Lobby_SessionRequested(QString gameName, QString romFile, QS
                            localPlayer, seatCount);
     }
 
-#ifdef _WIN32
     // Label the OSD ports with the seated players' usernames. The lobby's
     // onMatchBegin captured them (slot-indexed) into recording_player_names; the
     // Kaillera and direct-rollback paths set the labels the same way, but this
@@ -5467,7 +5458,6 @@ void MainWindow::on_Lobby_SessionRequested(QString gameName, QString romFile, QS
         }
         OnScreenDisplaySetTopMatchLabel(label);
     }
-#endif
 
     this->emulationThread->SetLobbyNetplay(remotePeers, localPort, localPlayer, frameDelay, predictionWindow);
     this->launchEmulationThread(romFile, "", false, -1, true);
