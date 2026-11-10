@@ -131,6 +131,12 @@ std::mutex g_playerInputMapMutex;
 // frontend applies). The hotkey presses it on every frame while held.
 std::vector<UINT32> g_testInputTargets;
 std::atomic<bool>   g_testPressed(false);
+// Remaining emulated frames of a frontend-triggered test-switch tap. The tap is
+// counted in frames instead of wall-clock time on purpose: when the click lands
+// while the emulation is paused (pause-on-focus-loss) or while the emulation
+// thread is a frame behind, a timer-based release expires before the driver
+// ever samples the switch, and the game ignores the press entirely.
+std::atomic<int>    g_testPulseFrames(0);
 
 // Driver short-name -> full display name. The rom browser queries this for every
 // archive in a directory, and walking the driver table mutates the global
@@ -838,6 +844,7 @@ bool Initialize(const char* gameName, const char* const* archives, int archiveCo
     if (g_driverInited) return true;
 
     g_paused.store(false, std::memory_order_relaxed);
+    g_testPulseFrames.store(0, std::memory_order_relaxed);
     g_testPressed.store(false, std::memory_order_relaxed);
 
     if (!ensure_lib_init())
@@ -1091,6 +1098,7 @@ void Shutdown()
         g_driverInited = false;
     }
     g_paused.store(false, std::memory_order_relaxed);
+    g_testPulseFrames.store(0, std::memory_order_relaxed);
     g_testPressed.store(false, std::memory_order_relaxed);
     BurnExtLoadRom = nullptr;
     pBurnDraw      = nullptr;
@@ -1458,6 +1466,19 @@ bool RunFrame(int flags)
 
     auto t0 = clock_::now();
     BurnDrvFrame();
+
+    // Spend one frame of a frontend test-switch tap. Doing this on the emulation
+    // side (instead of with a QTimer) guarantees the driver actually samples the
+    // switch: a tap armed while the session was paused is still delivered, frame
+    // by frame, once the session runs again.
+    if (g_testPulseFrames.load(std::memory_order_relaxed) > 0)
+    {
+        if (g_testPulseFrames.fetch_sub(1, std::memory_order_relaxed) <= 1)
+        {
+            g_testPulseFrames.store(0, std::memory_order_relaxed);
+            g_testPressed.store(false, std::memory_order_relaxed);
+        }
+    }
     // One diagnostic line per audible frame: lets a captured netplay session be
     // compared frame-by-frame against the peer's log (RMS mismatch == the audio
     // stream diverged even when the visible game state still matched).
@@ -1528,13 +1549,48 @@ void SetInputCallback(int (*callback)(void* values, int size, int players))
     // A rollback/netplay session drives input through the callback: drop any
     // test switch the local hotkey was holding so the press cannot leak into
     // the synchronized stream.
+    g_testPulseFrames.store(0, std::memory_order_relaxed);
     g_testPressed.store(false, std::memory_order_relaxed);
     g_inputCallback = callback;
 }
 
 void SetTestPressed(bool pressed)
 {
-    g_testPressed.store(pressed, std::memory_order_relaxed);
+    if (pressed)
+    {
+        // A held press (controller hotkey) keeps the switch down on its own, so
+        // it supersedes any pending frame-counted tap.
+        g_testPulseFrames.store(0, std::memory_order_relaxed);
+        g_testPressed.store(true, std::memory_order_relaxed);
+        return;
+    }
+
+    // Don't cut a frame-counted tap short: it releases itself once its budget is
+    // spent, which may be after a pause that outlasted the click.
+    if (g_testPulseFrames.load(std::memory_order_relaxed) == 0)
+    {
+        g_testPressed.store(false, std::memory_order_relaxed);
+    }
+}
+
+void PulseTestButton(int frames)
+{
+    // Rollback/netplay owns the input stream; an extra unsynchronized press
+    // would desync the session.
+    if (g_inputCallback != nullptr) return;
+    if (frames < 1) frames = 1;
+    if (frames > 600) frames = 600;
+
+    // Arm the budget before the press so a frame can never observe a switch that
+    // is down with no budget left to release it.
+    g_testPulseFrames.store(frames, std::memory_order_relaxed);
+    g_testPressed.store(true, std::memory_order_relaxed);
+}
+
+bool HasTestInput()
+{
+    std::lock_guard<std::mutex> lock(g_playerInputMapMutex);
+    return !g_testInputTargets.empty();
 }
 
 void SetInputPlayers(int players)     { g_inputPlayers = players; }

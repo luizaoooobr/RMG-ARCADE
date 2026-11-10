@@ -155,6 +155,17 @@ namespace fbneo_rt
     // Ignored while a rollback/netplay input callback is active.
     void SetTestPressed(bool pressed);
 
+    // Presses the cabinet test/service switch for `frames` emulated frames. Used
+    // by the frontend's Test/Service action: unlike SetTestPressed(), the hold is
+    // counted on the emulation side, so a tap that arrives while the session is
+    // paused is still delivered to the driver once it runs again. Ignored while a
+    // rollback/netplay input callback is active.
+    void PulseTestButton(int frames);
+
+    // True when the running driver actually exposes a test ("diag"/"test") or
+    // service input, i.e. when PulseTestButton() has something to press.
+    bool HasTestInput();
+
     // Determines whether the core seeds machine-local values (NeoGeo uPD4990A RTC,
     // BurnRandom) from the wall clock or from a pinned deterministic value. Must be
     // called BEFORE Initialize(): rollback netplay / lobby / Kaillera sessions set

@@ -81,7 +81,6 @@ class MainWindow : public QMainWindow, private Ui::MainWindow
     ControllerStartupNotice controllerStartupNotice;
     QElapsedTimer controllerNoticeClock;
     QTimer* controllerNoticeTimer = nullptr;
-    int arcadeTestPulseId = 0;
     void setStatusBarMessage(const QString& message);
 
     CoreCallbacks* coreCallBacks = nullptr;

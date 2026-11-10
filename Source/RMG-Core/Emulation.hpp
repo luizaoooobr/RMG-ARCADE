@@ -88,6 +88,19 @@ void CoreGetFbneoDipOverrides(std::vector<std::pair<int, uint8_t> >& out);
 // netplay session owns the input stream.
 void CoreSetFbneoTestPressed(bool pressed);
 
+// Presses the cabinet test/service switch for `frames` emulated frames. Unlike
+// CoreSetFbneoTestPressed(), the hold is counted by the emulation thread, so a
+// tap that arrives while the session is paused is still delivered to the driver
+// once the session runs again. No-op outside an FBNeo session, while a
+// synchronized netplay session owns the input stream, or when the running
+// driver has no test/service input (see CoreHasFbneoTestInput()).
+void CorePulseFbneoTest(int frames);
+
+// True while an FBNeo arcade session runs on a driver that exposes a test
+// ("diag"/"test") or service input, i.e. when the Test/Service action can have
+// any effect in the game.
+bool CoreHasFbneoTestInput(void);
+
 // Asks the frontend to open the arcade DIP switch dialog. Used by the input
 // plugin hotkey; the frontend ignores the request unless an arcade (FBNeo)
 // session is running. Safe to call from any thread.

@@ -4535,22 +4535,21 @@ void MainWindow::on_Action_Arcade_Test(void)
     {
         return;
     }
-
-    // FBNeo samples the cabinet test switch every frame and clears it together
-    // with the other digital inputs, so hold it for a short pulse: long enough
-    // for the driver to latch the press, short enough to behave like a tap in
-    // the game's own test menu.
-    ++this->arcadeTestPulseId;
-    const int pulseId = this->arcadeTestPulseId;
-    CoreSetFbneoTestPressed(true);
-    QTimer::singleShot(500, this, [this, pulseId]()
+    if (!CoreHasFbneoTestInput())
     {
-        if (pulseId != this->arcadeTestPulseId)
-        {
-            return;
-        }
-        CoreSetFbneoTestPressed(false);
-    });
+        this->showErrorMessage(tr("Arcade Test / Service"),
+                               tr("This game has no test/service switch, so it has no built-in setup menu."));
+        return;
+    }
+
+    // FBNeo clears the digital inputs every frame and samples the cabinet test
+    // switch from that same state, so the press has to survive at least one
+    // emulated frame. The runtime counts the hold in frames (12 ~= 200 ms at
+    // 60 Hz) instead of wall-clock time, which also covers the click landing
+    // while the session is paused: a QTimer-based release would expire before
+    // the driver ever saw the switch.
+    CorePulseFbneoTest(12);
+    this->setStatusBarMessage(tr("Test / Service switch pressed."));
 }
 
 #ifdef NETPLAY

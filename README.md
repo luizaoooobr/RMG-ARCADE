@@ -105,7 +105,7 @@ Macro inputs are listed next to the normal buttons, so a single key/button can t
 `Input -> Arcade -> Set DIP Switches...` lists a driver's DIP switch groups (region, free play, difficulty, ...); select a group and change its setting. **Defaults** restores the factory settings. DIP switches are read-only during a synchronized netplay session.
 
 ### Test / service menu
-`Input -> Arcade -> Test / Service Button` briefly holds the cabinet test switch, opening the game's built-in settings menu. Drivers without a separate test switch use their service input instead. There is also an `Arcade Test/Service Button` controller hotkey (Settings -> Input -> Hotkeys -> Controller Pak). Both are available only while an arcade game is running and are disabled during synchronized netplay.
+`Input -> Arcade -> Test / Service Button` briefly holds the cabinet test switch, opening the game's built-in settings menu (the same screen the cabinet's test button shows: input test, DIP/soft-DIP settings, sound test). Drivers without a separate test switch use their service input instead, and games that expose neither report that they have no test/service switch. The press is counted in emulated frames, so it still reaches the game when the click happens while the session is paused. There is also an `Arcade Test/Service Button` controller hotkey (Settings -> Input -> Hotkeys -> Controller Pak). Both are available only while an arcade game is running and are disabled during synchronized netplay.
 
 ## Building
 

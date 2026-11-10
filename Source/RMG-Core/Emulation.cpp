@@ -1083,6 +1083,23 @@ void CoreSetFbneoTestPressed(bool pressed)
     fbneo_rt::SetTestPressed(pressed);
 }
 
+// Presses the cabinet test/service switch for a short, frame-counted hold. The
+// frontend uses this for the Test/Service action so the press is delivered to
+// the driver even when the click lands while the session is paused.
+void CorePulseFbneoTest(int frames)
+{
+    if (!s_FbneoSessionActive)
+    {
+        return;
+    }
+    fbneo_rt::PulseTestButton(frames);
+}
+
+bool CoreHasFbneoTestInput(void)
+{
+    return s_FbneoSessionActive && fbneo_rt::HasTestInput();
+}
+
 bool CoreStartEmulation(std::filesystem::path n64rom, std::filesystem::path n64ddrom,
     std::string address, int port, int player)
 {
