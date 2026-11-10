@@ -895,6 +895,24 @@
         </layout>
        </item>
        <item>
+        <layout class="QHBoxLayout" name="horizontalLayout_arcadeTest">
+         <item>
+          <widget class="QLabel" name="label_arcadeTest">
+           <property name="text">
+            <string>Arcade Test/Service Button</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="UserInterface::Widget::HotkeyButton" name="arcadeTestKeyButton">
+           <property name="text">
+            <string/>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
         <spacer name="verticalSpacer">
          <property name="orientation">
           <enum>Qt::Vertical</enum>

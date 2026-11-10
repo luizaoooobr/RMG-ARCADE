@@ -154,6 +154,7 @@ ControllerWidget::ControllerWidget(QWidget* parent, EventFilter* eventFilter) : 
         { {}, {}, {}, {}, SettingsID::Input_Hotkey_RumblePak_InputType, SettingsID::Input_Hotkey_RumblePak_Name, SettingsID::Input_Hotkey_RumblePak_Data, SettingsID::Input_Hotkey_RumblePak_ExtraData },
         { {}, {}, {}, {}, SettingsID::Input_Hotkey_NoPak_InputType, SettingsID::Input_Hotkey_NoPak_Name, SettingsID::Input_Hotkey_NoPak_Data, SettingsID::Input_Hotkey_NoPak_ExtraData },
         { {}, {}, {}, {}, SettingsID::Input_Hotkey_ArcadeDip_InputType, SettingsID::Input_Hotkey_ArcadeDip_Name, SettingsID::Input_Hotkey_ArcadeDip_Data, SettingsID::Input_Hotkey_ArcadeDip_ExtraData },
+        { {}, {}, {}, {}, SettingsID::Input_Hotkey_ArcadeTest_InputType, SettingsID::Input_Hotkey_ArcadeTest_Name, SettingsID::Input_Hotkey_ArcadeTest_Data, SettingsID::Input_Hotkey_ArcadeTest_ExtraData },
         { {}, {}, {}, {}, SettingsID::Input_Hotkey_Fullscreen_InputType, SettingsID::Input_Hotkey_Fullscreen_Name, SettingsID::Input_Hotkey_Fullscreen_Data, SettingsID::Input_Hotkey_Fullscreen_ExtraData },
     });
 

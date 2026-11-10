@@ -66,6 +66,7 @@ HotkeysDialog::HotkeysDialog(QWidget* parent, QList<HotkeySettingMapping> hotkey
         { this->rumblePakKeyButton, SettingsID::Input_Hotkey_RumblePak_InputType, SettingsID::Input_Hotkey_RumblePak_Name, SettingsID::Input_Hotkey_RumblePak_Data, SettingsID::Input_Hotkey_RumblePak_ExtraData },
         { this->noPakKeyButton, SettingsID::Input_Hotkey_NoPak_InputType, SettingsID::Input_Hotkey_NoPak_Name, SettingsID::Input_Hotkey_NoPak_Data, SettingsID::Input_Hotkey_NoPak_ExtraData },
         { this->arcadeDipKeyButton, SettingsID::Input_Hotkey_ArcadeDip_InputType, SettingsID::Input_Hotkey_ArcadeDip_Name, SettingsID::Input_Hotkey_ArcadeDip_Data, SettingsID::Input_Hotkey_ArcadeDip_ExtraData },
+        { this->arcadeTestKeyButton, SettingsID::Input_Hotkey_ArcadeTest_InputType, SettingsID::Input_Hotkey_ArcadeTest_Name, SettingsID::Input_Hotkey_ArcadeTest_Data, SettingsID::Input_Hotkey_ArcadeTest_ExtraData },
         { this->fullscreenKeyButton, SettingsID::Input_Hotkey_Fullscreen_InputType, SettingsID::Input_Hotkey_Fullscreen_Name, SettingsID::Input_Hotkey_Fullscreen_Data, SettingsID::Input_Hotkey_Fullscreen_ExtraData },
     });
 

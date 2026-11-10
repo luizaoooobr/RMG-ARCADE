@@ -81,6 +81,13 @@ void CoreResetFbneoDips(void);
 void CoreSetFbneoDipOverrides(const std::vector<std::pair<int, uint8_t> >& overrides);
 void CoreGetFbneoDipOverrides(std::vector<std::pair<int, uint8_t> >& out);
 
+// Cabinet test/service switch for arcade sessions: while `pressed` the runtime
+// holds the driver's test switch ("diag"/"test"), or its "service" input when
+// the driver has no separate test switch, which opens the game's built-in
+// settings menu. No-op outside an FBNeo session and while a synchronized
+// netplay session owns the input stream.
+void CoreSetFbneoTestPressed(bool pressed);
+
 // Asks the frontend to open the arcade DIP switch dialog. Used by the input
 // plugin hotkey; the frontend ignores the request unless an arcade (FBNeo)
 // session is running. Safe to call from any thread.

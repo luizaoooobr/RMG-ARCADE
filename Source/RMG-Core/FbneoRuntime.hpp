@@ -149,6 +149,12 @@ namespace fbneo_rt
     void SetInputCallback(int (*callback)(void* values, int size, int players));
     void SetInputPlayers(int players);
 
+    // Cabinet test/service switch: while set, the runtime presses the driver's
+    // "diag"/"test" input on every frame (or its "service" input when the driver
+    // has no separate test switch), which opens the game's settings menu.
+    // Ignored while a rollback/netplay input callback is active.
+    void SetTestPressed(bool pressed);
+
     // Determines whether the core seeds machine-local values (NeoGeo uPD4990A RTC,
     // BurnRandom) from the wall clock or from a pinned deterministic value. Must be
     // called BEFORE Initialize(): rollback netplay / lobby / Kaillera sessions set

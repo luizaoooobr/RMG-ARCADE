@@ -124,6 +124,14 @@ std::vector<PlayerInputMap> g_playerInputMap;
 // so the table is guarded by this mutex.
 std::mutex g_playerInputMapMutex;
 
+// Driver input indices behind the cabinet test switch. Built together with the
+// player input map: the "diag"/"diagnostic"/"test" input opens the game's
+// configuration menu on boards that have one, while drivers without a separate
+// test switch use the "service" input instead (the same rule the FBNeo headless
+// frontend applies). The hotkey presses it on every frame while held.
+std::vector<UINT32> g_testInputTargets;
+std::atomic<bool>   g_testPressed(false);
+
 // Driver short-name -> full display name. The rom browser queries this for every
 // archive in a directory, and walking the driver table mutates the global
 // nBurnDrvActive. So the table is built once into a cache; later lookups (which
@@ -380,6 +388,40 @@ void reset_all_digital_inputs()
     }
 }
 
+// Collects the driver inputs behind the cabinet test switch. Boards that have a
+// dedicated test input ("diag"/"diagnostic"/"test") use it to open the settings
+// menu; drivers without one fall back to their "service" input, matching what
+// the FBNeo headless frontend does for its service/test button.
+void build_test_input_targets()
+{
+    std::lock_guard<std::mutex> lock(g_playerInputMapMutex);
+    g_testInputTargets.clear();
+
+    UINT32 serviceTarget = UINT32_MAX;
+    struct BurnInputInfo bii;
+    for (UINT32 i = 0;; i++)
+    {
+        memset(&bii, 0, sizeof(bii));
+        if (BurnDrvGetInputInfo(&bii, i) != 0) break;
+        if (bii.nType != BIT_DIGITAL || bii.pVal == nullptr || bii.szInfo == nullptr) continue;
+
+        if (!strcmp(bii.szInfo, "diag") || !strcmp(bii.szInfo, "diagnostic") ||
+            !strcmp(bii.szInfo, "diagnostics") || !strcmp(bii.szInfo, "test"))
+        {
+            g_testInputTargets.push_back(i);
+        }
+        else if (!strcmp(bii.szInfo, "service"))
+        {
+            serviceTarget = i;
+        }
+    }
+
+    if (g_testInputTargets.empty() && serviceTarget != UINT32_MAX)
+    {
+        g_testInputTargets.push_back(serviceTarget);
+    }
+}
+
 void apply_input_masks(const std::vector<uint32_t>& masks)
 {
     reset_all_digital_inputs();
@@ -398,6 +440,20 @@ void apply_input_masks(const std::vector<uint32_t>& masks)
                 if (BurnDrvGetInputInfo(&bii, list[b][t]) != 0) continue;
                 if (bii.pVal) *bii.pVal = 1;
             }
+        }
+    }
+
+    // The cabinet test switch is not part of the player input map, so the reset
+    // above clears it every frame: reapply it while the hotkey is held. Skip it
+    // when rollback/netplay owns the input stream, since an unsynchronized extra
+    // press would desync the session.
+    if (g_testPressed.load(std::memory_order_relaxed) && g_inputCallback == nullptr)
+    {
+        for (size_t t = 0; t < g_testInputTargets.size(); t++)
+        {
+            memset(&bii, 0, sizeof(bii));
+            if (BurnDrvGetInputInfo(&bii, g_testInputTargets[t]) != 0) continue;
+            if (bii.pVal) *bii.pVal = 1;
         }
     }
 }
@@ -782,6 +838,7 @@ bool Initialize(const char* gameName, const char* const* archives, int archiveCo
     if (g_driverInited) return true;
 
     g_paused.store(false, std::memory_order_relaxed);
+    g_testPressed.store(false, std::memory_order_relaxed);
 
     if (!ensure_lib_init())
     {
@@ -904,6 +961,7 @@ bool Initialize(const char* gameName, const char* const* archives, int archiveCo
     pBurnSoundOut = g_soundBuffer.data();
 
     build_input_map();
+    build_test_input_targets();
 
     g_driverInited = true;
 
@@ -945,6 +1003,7 @@ static bool apply_pending_reset()
 
     BurnRecalcPal();
     apply_dip_defaults();
+    build_test_input_targets();
     g_driverInited = true;
     return true;
 }
@@ -1032,6 +1091,7 @@ void Shutdown()
         g_driverInited = false;
     }
     g_paused.store(false, std::memory_order_relaxed);
+    g_testPressed.store(false, std::memory_order_relaxed);
     BurnExtLoadRom = nullptr;
     pBurnDraw      = nullptr;
     pBurnSoundOut  = nullptr;
@@ -1041,6 +1101,7 @@ void Shutdown()
     {
         std::lock_guard<std::mutex> lock(g_playerInputMapMutex);
         g_playerInputMap.clear();
+        g_testInputTargets.clear();
     }
     {
         std::lock_guard<std::mutex> lock(g_localInputMutex);
@@ -1464,7 +1525,16 @@ bool SampleInput(void* values, int size, int players)
 
 void SetInputCallback(int (*callback)(void* values, int size, int players))
 {
+    // A rollback/netplay session drives input through the callback: drop any
+    // test switch the local hotkey was holding so the press cannot leak into
+    // the synchronized stream.
+    g_testPressed.store(false, std::memory_order_relaxed);
     g_inputCallback = callback;
+}
+
+void SetTestPressed(bool pressed)
+{
+    g_testPressed.store(pressed, std::memory_order_relaxed);
 }
 
 void SetInputPlayers(int players)     { g_inputPlayers = players; }

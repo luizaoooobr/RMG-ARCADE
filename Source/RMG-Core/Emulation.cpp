@@ -1078,6 +1078,11 @@ void CoreRequestArcadeDipSwitches(void)
     CoreInvokeStateCallback(CoreStateCallbackType::ArcadeDipRequested, 0);
 }
 
+void CoreSetFbneoTestPressed(bool pressed)
+{
+    fbneo_rt::SetTestPressed(pressed);
+}
+
 bool CoreStartEmulation(std::filesystem::path n64rom, std::filesystem::path n64ddrom,
     std::string address, int port, int player)
 {
