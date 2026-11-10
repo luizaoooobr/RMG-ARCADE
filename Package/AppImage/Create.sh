@@ -50,6 +50,7 @@ fi
 
 cp "$bin_dir/usr/share/applications/com.github.Rosalie241.RMG.desktop" "$bin_dir"
 cp "$bin_dir/usr/share/icons/hicolor/scalable/apps/com.github.Rosalie241.RMG.svg" "$bin_dir"
+cp "$toplvl_dir/Package/com.github.Rosalie241.RMG.png" "$bin_dir"
 qtpaths="$(command -v qtpaths6 || true)"
 if [[ -z "$qtpaths" && -x /usr/lib/qt6/bin/qtpaths6 ]]
 then
@@ -69,7 +70,7 @@ then
 fi
 mkdir -p "$bin_dir/usr/share/RMG/Translations"
 cp "$qtbase_translation" "$bin_dir/usr/share/RMG/Translations/"
-ln -s com.github.Rosalie241.RMG.svg "$bin_dir"/.DirIcon
+ln -s com.github.Rosalie241.RMG.png "$bin_dir"/.DirIcon
 mv "$bin_dir/usr/share" "$bin_dir/share"
 mv "$bin_dir/usr" "$bin_dir/shared"
 
