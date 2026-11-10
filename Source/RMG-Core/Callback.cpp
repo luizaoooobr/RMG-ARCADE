@@ -109,3 +109,13 @@ CORE_EXPORT void CoreAddCallbackMessage(CoreDebugMessageType type, std::string m
 {
     CoreDebugCallback(const_cast<char*>("[GUI]   "), static_cast<int>(type), message.c_str());
 }
+
+CORE_EXPORT void CoreInvokeStateCallback(CoreStateCallbackType type, int value)
+{
+    if (!l_SetupCallbacks)
+    {
+        return;
+    }
+
+    l_StateCallbackFunc(type, value);
+}

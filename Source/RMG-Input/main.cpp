@@ -177,6 +177,8 @@ struct InputProfile
     InputMapping Hotkey_RumblePak;
     bool Hotkey_NoPak_Pressed = false;
     InputMapping Hotkey_NoPak;
+    bool Hotkey_ArcadeDip_Pressed = false;
+    InputMapping Hotkey_ArcadeDip;
     bool Hotkey_Fullscreen_Pressed = false;
     InputMapping Hotkey_Fullscreen;
 };
@@ -420,6 +422,7 @@ static void load_settings(void)
         LOAD_INPUT_MAPPING(Hotkey_MemoryPak,  Input_Hotkey_MemoryPak);
         LOAD_INPUT_MAPPING(Hotkey_RumblePak,  Input_Hotkey_RumblePak);
         LOAD_INPUT_MAPPING(Hotkey_NoPak,      Input_Hotkey_NoPak);
+        LOAD_INPUT_MAPPING(Hotkey_ArcadeDip,  Input_Hotkey_ArcadeDip);
         LOAD_INPUT_MAPPING(Hotkey_Fullscreen, Input_Hotkey_Fullscreen);
 
 #undef LOAD_INPUT_MAPPING
@@ -1077,6 +1080,7 @@ static bool check_hotkeys(int Control)
     DEFINE_HOTKEY(Hotkey_MemoryPak,             Hotkey_MemoryPak_Pressed,     switch_controller_pak(profile, Control, PLUGIN_MEMPAK), );
     DEFINE_HOTKEY(Hotkey_RumblePak,             Hotkey_RumblePak_Pressed,     switch_controller_pak(profile, Control, PLUGIN_RAW), );
     DEFINE_HOTKEY(Hotkey_NoPak,                 Hotkey_NoPak_Pressed,         switch_controller_pak(profile, Control, PLUGIN_NONE), );
+    DEFINE_HOTKEY(Hotkey_ArcadeDip,             Hotkey_ArcadeDip_Pressed,     CoreRequestArcadeDipSwitches(), );
     DEFINE_HOTKEY(Hotkey_Fullscreen,            Hotkey_Fullscreen_Pressed,    CoreToggleFullscreen(), );
 
 #undef DEFINE_HOTKEY

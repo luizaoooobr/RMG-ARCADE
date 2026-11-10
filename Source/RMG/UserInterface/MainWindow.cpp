@@ -6852,6 +6852,17 @@ void MainWindow::on_Core_StateCallback(CoreStateCallbackType type, int value)
                 OnScreenDisplaySetMessage(tr("Captured screenshot.").toStdString());
             }
         } break;
+        case CoreStateCallbackType::ArcadeDipRequested:
+        {
+            if (CoreIsFbneoSessionActive())
+            {
+                this->on_Action_Arcade_Dip();
+            }
+            else
+            {
+                OnScreenDisplaySetMessage(tr("DIP switches are only available while an arcade game is running.").toStdString());
+            }
+        } break;
     }
 }
 

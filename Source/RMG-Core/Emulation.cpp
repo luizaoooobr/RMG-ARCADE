@@ -1073,6 +1073,11 @@ void CoreGetFbneoDipOverrides(std::vector<std::pair<int, uint8_t> >& out)
     fbneo_rt::GetDipOverrides(out);
 }
 
+void CoreRequestArcadeDipSwitches(void)
+{
+    CoreInvokeStateCallback(CoreStateCallbackType::ArcadeDipRequested, 0);
+}
+
 bool CoreStartEmulation(std::filesystem::path n64rom, std::filesystem::path n64ddrom,
     std::string address, int port, int player)
 {

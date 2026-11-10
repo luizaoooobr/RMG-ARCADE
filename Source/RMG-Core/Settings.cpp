@@ -1591,6 +1591,18 @@ static l_Setting get_setting(SettingsID settingId)
     case SettingsID::Input_Hotkey_NoPak_ExtraData:
         setting = {"", "Hotkey_NoPak_ExtraData" };
         break;
+    case SettingsID::Input_Hotkey_ArcadeDip_InputType:
+        setting = {"", "Hotkey_ArcadeDip_InputType" };
+        break;
+    case SettingsID::Input_Hotkey_ArcadeDip_Name:
+        setting = {"", "Hotkey_ArcadeDip_Name" };
+        break;
+    case SettingsID::Input_Hotkey_ArcadeDip_Data:
+        setting = {"", "Hotkey_ArcadeDip_Data" };
+        break;
+    case SettingsID::Input_Hotkey_ArcadeDip_ExtraData:
+        setting = {"", "Hotkey_ArcadeDip_ExtraData" };
+        break;
     case SettingsID::Input_Hotkey_Fullscreen_InputType:
         setting = {"", "Hotkey_Fullscreen_InputType" };
         break;

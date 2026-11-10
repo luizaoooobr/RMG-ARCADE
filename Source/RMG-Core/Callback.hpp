@@ -46,11 +46,16 @@ enum class CoreStateCallbackType
     SaveStateLoaded,
     SaveStateSaved,
     ScreenshotCaptured,
+    ArcadeDipRequested,
 };
 
 // attempts to setup callbacks with the provided functions
 bool CoreSetupCallbacks(std::function<void(enum CoreDebugMessageType, std::string, std::string)> debugCallbackFunc,
                         std::function<void(enum CoreStateCallbackType, int)> stateCallbackFunc);
+
+// sends a state callback to the frontend, used by plugins to request
+// frontend actions (only reaches the frontend when callbacks are set up)
+void CoreInvokeStateCallback(CoreStateCallbackType type, int value);
 
 // sets whether the debug callbacks will be printed to stdout
 void CoreSetPrintDebugCallback(bool enabled);

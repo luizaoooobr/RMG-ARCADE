@@ -81,6 +81,11 @@ void CoreResetFbneoDips(void);
 void CoreSetFbneoDipOverrides(const std::vector<std::pair<int, uint8_t> >& overrides);
 void CoreGetFbneoDipOverrides(std::vector<std::pair<int, uint8_t> >& out);
 
+// Asks the frontend to open the arcade DIP switch dialog. Used by the input
+// plugin hotkey; the frontend ignores the request unless an arcade (FBNeo)
+// session is running. Safe to call from any thread.
+void CoreRequestArcadeDipSwitches(void);
+
 // pauses emulation
 bool CorePauseEmulation(void);
 

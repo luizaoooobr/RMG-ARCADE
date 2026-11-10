@@ -877,6 +877,24 @@
         </layout>
        </item>
        <item>
+        <layout class="QHBoxLayout" name="horizontalLayout_arcadeDip">
+         <item>
+          <widget class="QLabel" name="label_arcadeDip">
+           <property name="text">
+            <string>Arcade DIP Switches</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="UserInterface::Widget::HotkeyButton" name="arcadeDipKeyButton">
+           <property name="text">
+            <string/>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
         <spacer name="verticalSpacer">
          <property name="orientation">
           <enum>Qt::Vertical</enum>
