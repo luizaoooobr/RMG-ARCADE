@@ -2751,6 +2751,7 @@ void MainWindow::updateActions(bool inEmulation, bool isPaused)
     this->menuArcade->menuAction()->setVisible(true);
     this->action_Arcade_Input->setEnabled(true);
     this->action_Arcade_Dip->setEnabled(fbneoSessionActive && !CoreIsSynchronizedNetplayActive());
+    this->action_Arcade_Test->setEnabled(fbneoSessionActive && !CoreIsSynchronizedNetplayActive());
 
     const bool synchronizedNetplayActive = CoreIsSynchronizedNetplayActive();
     const bool blockEmulationPauseForNetplay = this->shouldBlockEmulationPauseForNetplay();
@@ -3253,6 +3254,7 @@ void MainWindow::connectActionSignals(void)
     connect(this->action_Settings_Plugins, &QAction::triggered, this, &MainWindow::on_Action_Settings_Plugins);
     connect(this->action_Arcade_Input, &QAction::triggered, this, &MainWindow::on_Action_Arcade_Input);
     connect(this->action_Arcade_Dip, &QAction::triggered, this, &MainWindow::on_Action_Arcade_Dip);
+    connect(this->action_Arcade_Test, &QAction::triggered, this, &MainWindow::on_Action_Arcade_Test);
     connect(this->action_Toolbar_Input, &QAction::triggered, this, &MainWindow::on_Action_Settings_Input);
     connect(this->action_Toolbar_Playback, &QAction::triggered, this, &MainWindow::on_Action_Playback);
 
@@ -4519,6 +4521,36 @@ void MainWindow::on_Action_Arcade_Dip(void)
     }
     Dialog::ArcadeDipDialog dialog(this);
     dialog.exec();
+}
+
+void MainWindow::on_Action_Arcade_Test(void)
+{
+    if (!CoreIsFbneoSessionActive())
+    {
+        this->showErrorMessage(tr("Arcade Test / Service"),
+                               tr("The test/service button is only available while an arcade game is running."));
+        return;
+    }
+    if (CoreIsSynchronizedNetplayActive())
+    {
+        return;
+    }
+
+    // FBNeo samples the cabinet test switch every frame and clears it together
+    // with the other digital inputs, so hold it for a short pulse: long enough
+    // for the driver to latch the press, short enough to behave like a tap in
+    // the game's own test menu.
+    ++this->arcadeTestPulseId;
+    const int pulseId = this->arcadeTestPulseId;
+    CoreSetFbneoTestPressed(true);
+    QTimer::singleShot(500, this, [this, pulseId]()
+    {
+        if (pulseId != this->arcadeTestPulseId)
+        {
+            return;
+        }
+        CoreSetFbneoTestPressed(false);
+    });
 }
 
 #ifdef NETPLAY

@@ -146,6 +146,7 @@
      </property>
      <addaction name="action_Arcade_Input"/>
      <addaction name="action_Arcade_Dip"/>
+     <addaction name="action_Arcade_Test"/>
     </widget>
     <addaction name="action_Settings_Input"/>
     <addaction name="separator"/>
@@ -478,6 +479,14 @@
    </property>
    <property name="text">
     <string>Set &amp;DIP Switches...</string>
+   </property>
+  </action>
+  <action name="action_Arcade_Test">
+   <property name="icon">
+    <iconset theme="settings-3-line"/>
+   </property>
+   <property name="text">
+    <string>&amp;Test / Service Button</string>
    </property>
   </action>
   <action name="action_Settings_Rsp">
