@@ -140,4 +140,11 @@ target_include_directories(RMG-Core PRIVATE
     ${MINIZIP_INCLUDE_DIRS}
 )
 
-set_target_properties(RMG-Core PROPERTIES CXX_VISIBILITY_PRESET hidden)
+# ELF platforms need default symbol visibility so RMG-K can resolve the
+# Core*/rmgk_gekko::* API at link time (most public functions are declared
+# without CORE_EXPORT, and only Windows exports everything through
+# --export-all-symbols). Keep the hidden preset on Windows, where the flag has
+# no effect anyway, so the Windows build stays byte-for-byte unchanged.
+if (WIN32)
+    set_target_properties(RMG-Core PROPERTIES CXX_VISIBILITY_PRESET hidden)
+endif()

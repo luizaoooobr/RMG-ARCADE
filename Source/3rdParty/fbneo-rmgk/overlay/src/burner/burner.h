@@ -47,6 +47,8 @@ typedef struct tagIMAGE {
  #include "burner_sdl.h"
 #elif defined (BUILD_HEADLESS)
  #include "burner_headless.h"
+#elif defined (BUILD_LIB)
+ #include "burner_rmgk.h"
 #elif defined (_XBOX) && !defined(__LIBRETRO__)
  #include "burner_xbox.h"
 #elif defined(__LIBRETRO__)

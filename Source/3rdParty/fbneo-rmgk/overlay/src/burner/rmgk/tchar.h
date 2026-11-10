@@ -1,7 +1,10 @@
 #include <stdint.h>
+// Always available so non-_UNICODE code that still handles wide buffers
+// (e.g. burn.cpp zip-name parsing) can call wcslen/wcscpy. Mirrors the
+// headless frontend's tchar.h.
+#include <wchar.h>
 #ifdef _UNICODE
 //TODO: bah
-#include <wchar.h>
 #ifndef __TEXT
 #define __TEXT(q)    L ## q
 #endif
