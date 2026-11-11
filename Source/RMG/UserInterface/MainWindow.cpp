@@ -4544,12 +4544,14 @@ void MainWindow::on_Action_Arcade_Test(void)
 
     // FBNeo clears the digital inputs every frame and samples the cabinet test
     // switch from that same state, so the press has to survive at least one
-    // emulated frame. The runtime counts the hold in frames (12 ~= 200 ms at
-    // 60 Hz) instead of wall-clock time, which also covers the click landing
+    // emulated frame. The runtime counts the hold in frames (30 ~= 500 ms at
+    // 60 Hz, long enough for a driver that samples the switch only every few
+    // frames) instead of wall-clock time, which also covers the click landing
     // while the session is paused: a QTimer-based release would expire before
     // the driver ever saw the switch.
-    CorePulseFbneoTest(12);
-    this->setStatusBarMessage(tr("Test / Service switch pressed."));
+    CorePulseFbneoTest(30);
+    this->setStatusBarMessage(tr("Test / Service switch pressed. If the game is still booting, "
+                                 "try again once the demo screen appears."));
 }
 
 #ifdef NETPLAY

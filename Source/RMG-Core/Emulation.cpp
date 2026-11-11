@@ -1080,6 +1080,12 @@ void CoreRequestArcadeDipSwitches(void)
 
 void CoreSetFbneoTestPressed(bool pressed)
 {
+    if (pressed)
+    {
+        // Local sessions run through the rollback layer with a single actor, so
+        // the switch may bypass that gate; synchronized netplay never does.
+        fbneo_rt::SetTestDeliveryAllowed(!CoreIsSynchronizedNetplayActive());
+    }
     fbneo_rt::SetTestPressed(pressed);
 }
 
@@ -1092,6 +1098,10 @@ void CorePulseFbneoTest(int frames)
     {
         return;
     }
+    // Local sessions also run through the rollback layer (one actor, no remote
+    // peer), so the press may skip that gate there; synchronized netplay must
+    // never let an unsynchronized switch reach the driver.
+    fbneo_rt::SetTestDeliveryAllowed(!CoreIsSynchronizedNetplayActive());
     fbneo_rt::PulseTestButton(frames);
 }
 

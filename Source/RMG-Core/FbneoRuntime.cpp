@@ -137,6 +137,9 @@ std::atomic<bool>   g_testPressed(false);
 // thread is a frame behind, a timer-based release expires before the driver
 // ever samples the switch, and the game ignores the press entirely.
 std::atomic<int>    g_testPulseFrames(0);
+// True when the current tap may be delivered even though the rollback layer owns
+// the input stream (local sessions: one actor, no remote peer).
+std::atomic<bool>   g_testAllowLocalRollback(false);
 
 // Driver short-name -> full display name. The rom browser queries this for every
 // archive in a directory, and walking the driver table mutates the global
@@ -450,10 +453,13 @@ void apply_input_masks(const std::vector<uint32_t>& masks)
     }
 
     // The cabinet test switch is not part of the player input map, so the reset
-    // above clears it every frame: reapply it while the hotkey is held. Skip it
-    // when rollback/netplay owns the input stream, since an unsynchronized extra
-    // press would desync the session.
-    if (g_testPressed.load(std::memory_order_relaxed) && g_inputCallback == nullptr)
+    // above clears it every frame: reapply it while the hotkey is held. Rollback
+    // sessions normally own the input stream (an extra unsynchronized press would
+    // desync a netplay peer), but a local session has no peer to desync: the
+    // frontend allows the press there through g_testAllowLocalRollback.
+    const bool deliverTest = g_testPressed.load(std::memory_order_relaxed) &&
+        (g_inputCallback == nullptr || g_testAllowLocalRollback.load(std::memory_order_relaxed));
+    if (deliverTest)
     {
         for (size_t t = 0; t < g_testInputTargets.size(); t++)
         {
@@ -1551,6 +1557,7 @@ void SetInputCallback(int (*callback)(void* values, int size, int players))
     // the synchronized stream.
     g_testPulseFrames.store(0, std::memory_order_relaxed);
     g_testPressed.store(false, std::memory_order_relaxed);
+    g_testAllowLocalRollback.store(false, std::memory_order_relaxed);
     g_inputCallback = callback;
 }
 
@@ -1573,11 +1580,18 @@ void SetTestPressed(bool pressed)
     }
 }
 
+void SetTestDeliveryAllowed(bool allowed)
+{
+    g_testAllowLocalRollback.store(allowed, std::memory_order_relaxed);
+}
+
 void PulseTestButton(int frames)
 {
+    const bool allowLocalRollback = g_testAllowLocalRollback.load(std::memory_order_relaxed);
     // Rollback/netplay owns the input stream; an extra unsynchronized press
-    // would desync the session.
-    if (g_inputCallback != nullptr) return;
+    // would desync the session. Local sessions also run through that layer but
+    // have no peer to desync, so the frontend opts in for them.
+    if (g_inputCallback != nullptr && !allowLocalRollback) return;
     if (frames < 1) frames = 1;
     if (frames > 600) frames = 600;
 

@@ -155,11 +155,19 @@ namespace fbneo_rt
     // Ignored while a rollback/netplay input callback is active.
     void SetTestPressed(bool pressed);
 
+    // Allows the test/service switch to be delivered even though the rollback
+    // layer currently owns the input stream. Only for local sessions (single
+    // actor, no remote peer): synchronized netplay must never set this, because
+    // the switch is not part of the synchronized input packet. Cleared whenever
+    // a new session installs its input callback.
+    void SetTestDeliveryAllowed(bool allowed);
+
     // Presses the cabinet test/service switch for `frames` emulated frames. Used
     // by the frontend's Test/Service action: unlike SetTestPressed(), the hold is
     // counted on the emulation side, so a tap that arrives while the session is
     // paused is still delivered to the driver once it runs again. Ignored while a
-    // rollback/netplay input callback is active.
+    // rollback input callback is active unless SetTestDeliveryAllowed(true) was
+    // called for this (local, non-netplay) session.
     void PulseTestButton(int frames);
 
     // True when the running driver actually exposes a test ("diag"/"test") or
