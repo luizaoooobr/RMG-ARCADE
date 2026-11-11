@@ -55,6 +55,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <dwmapi.h>
 #include <GL/gl.h>
 
 #include <string>
@@ -2739,6 +2740,74 @@ static m64p_error VidExt_VK_GetInstanceExtensions(const char** Extensions[], uin
 // Exported Functions
 //
 
+#ifdef _WIN32
+// Feed the rollback present pacer the desktop's vblank timing. On Windows the
+// desktop compositor always composes OpenGL output (there is no true exclusive
+// fullscreen path for OpenGL), so DWM's composition timing is exactly what a
+// presented frame is synchronized to. Reports the time since the most recent
+// vblank, normalized into one refresh period, plus the current period. Returns
+// false when timing is unavailable (composition disabled, RDP, stale data), in
+// which case the pacer keeps using its free-running clock grid.
+static bool RMG_QueryPresentTiming(long long* vblankAgeUs, long long* refreshUs)
+{
+    if (vblankAgeUs == nullptr || refreshUs == nullptr)
+    {
+        return false;
+    }
+
+    DWM_TIMING_INFO info = {};
+    info.cbSize = sizeof(info);
+    if (FAILED(DwmGetCompositionTimingInfo(nullptr, &info)))
+    {
+        return false;
+    }
+    if (info.qpcRefreshPeriod == 0 || info.qpcVBlank == 0)
+    {
+        return false;
+    }
+
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER now;
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
+        !QueryPerformanceCounter(&now))
+    {
+        return false;
+    }
+
+    const double qpcFrequency =
+        static_cast<double>(frequency.QuadPart);
+    const double periodTicks =
+        static_cast<double>(info.qpcRefreshPeriod);
+    const double periodUs =
+        periodTicks * 1000000.0 / qpcFrequency;
+    if (periodUs < 5000.0 || periodUs > 40000.0)
+    {
+        return false;
+    }
+
+    // qpcVBlank names either the previous or the next vblank depending on the
+    // driver; normalize the signed delta into [0, period) either way. Reject
+    // obviously stale timing info instead of steering to a bogus phase.
+    double ageTicks =
+        static_cast<double>(now.QuadPart) -
+        static_cast<double>(info.qpcVBlank);
+    if (std::fabs(ageTicks) > periodTicks * 4.0)
+    {
+        return false;
+    }
+    ageTicks -= std::floor(ageTicks / periodTicks) * periodTicks;
+    if (ageTicks < 0.0)
+    {
+        ageTicks += periodTicks;
+    }
+
+    *vblankAgeUs = static_cast<long long>(
+        ageTicks * 1000000.0 / qpcFrequency);
+    *refreshUs = static_cast<long long>(periodUs + 0.5);
+    return true;
+}
+#endif
+
 bool SetupVidExt(Thread::EmulationThread* emuThread, UserInterface::MainWindow* mainWindow, 
     UserInterface::Widget::OGLWidget** oglWidget, UserInterface::Widget::VKWidget** vulkanWidget)
 {
@@ -2777,6 +2846,14 @@ bool SetupVidExt(Thread::EmulationThread* emuThread, UserInterface::MainWindow* 
     // extension; register our presenter to blit its frames into the same OGL widget.
     CoreSetFbneoFrameCallback(&RMG_FbneoVideoPresent, nullptr);
     CoreSetFbneoStopCallback(&RMG_FbneoVideoStop, nullptr);
+
+#ifdef _WIN32
+    // Optional present phase lock: give the core pacer access to the
+    // compositor's vblank timing so it can present just before the vblank.
+    rmgk_gekko::set_present_timing_provider(&RMG_QueryPresentTiming);
+#else
+    rmgk_gekko::set_present_timing_provider(nullptr);
+#endif
 
     // Feed FBNeo's live input from the mapping the user configured for the RMG
     // (N64) input plugin. The handler is installed once, on the GUI thread,

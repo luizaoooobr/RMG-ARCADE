@@ -612,6 +612,10 @@ enum class SettingsID
     KeyBinding_NetplayPassTurnP3,
     KeyBinding_NetplayPassTurnP4,
 
+    // Phase-lock the visible frame to the display refresh (lower input lag).
+    // Appended here for the same ABI reason as the keybindings above.
+    Rollback_PresentPhaseAlign,
+
     Invalid
 };
 

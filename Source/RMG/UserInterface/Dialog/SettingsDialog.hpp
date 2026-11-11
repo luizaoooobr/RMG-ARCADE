@@ -73,6 +73,7 @@ class SettingsDialog : public QDialog, private Ui::SettingsDialog
     QCheckBox* rollbackStallDiagnosticsCheckBox = nullptr;
     QCheckBox* rollbackPacingTraceCheckBox = nullptr;
     QCheckBox* rollbackEnableLocalTestingCheckBox = nullptr;
+    QCheckBox* rollbackPresentPhaseAlignCheckBox = nullptr;
     QCheckBox* rollbackVerbosePifInputLoggingCheckBox = nullptr;
     QCheckBox* rollbackVerboseGlideInputLoggingCheckBox = nullptr;
     QCheckBox* rollbackPingDiagnosticsCheckBox = nullptr;

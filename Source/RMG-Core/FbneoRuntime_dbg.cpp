@@ -468,9 +468,10 @@ bool Execute(const m64p_rollback_execute_callbacks& callbacks)
     {
         int r = callbacks.begin_frame ? callbacks.begin_frame(callbacks.user_data) : 0;
         if (r != 1) break;
+        RunFrame(Output_Video | Output_Audio);
+        // Pace immediately before the present (see FbneoRuntime.cpp).
         if (callbacks.pace_before_present)
             callbacks.pace_before_present(callbacks.user_data);
-        RunFrame(Output_Video | Output_Audio);
         if (callbacks.visible_frame_complete)
             callbacks.visible_frame_complete(callbacks.user_data, &g_stats);
         if (callbacks.end_frame && callbacks.end_frame(callbacks.user_data) == 0)

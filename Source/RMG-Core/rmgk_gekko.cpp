@@ -389,6 +389,11 @@ struct RmgkPacingTraceRow
     long long presentLateUs = 0;
     long long presentIntervalAfterWaitUs = 0;
 
+    int presentPhaseAlign = 0;
+    long long presentVblankAgeUs = 0;
+    long long presentRefreshUs = 0;
+    long long presentPhaseSteerUs = 0;
+
     long long swapUs = 0;
     long long makeCurrentUs = 0;
     int swapPath = 0; // 1 = native WGL, 2 = Qt OpenGL
@@ -480,11 +485,62 @@ std::chrono::steady_clock::time_point g_RollbackPresentTargetTime;
 std::chrono::steady_clock::time_point g_RollbackPresentHookReturnTime;
 bool g_RollbackPresentHookReturnValid = false;
 
+// Display phase lock (opt-in, local sessions only). When the frontend can
+// report vblank timing, the pacer moves the deadline so the swap lands just
+// before a vblank instead of free-running against the refresh. The correction
+// per frame is limited to 0.5% of a period, so the frame rate never jumps and
+// settles within 0.5% of nominal while holding the display phase. Disabled for
+// netplay, where the GekkoNet tick owns the schedule.
+bool g_RollbackPresentPhaseAlign = false;
+rmgk_gekko::PresentTimingProvider g_PresentTimingProvider = nullptr;
+// How long the visible frame takes from the pacer returning to the actual
+// swap (render + texture upload). Aiming the wait at the vblank without
+// subtracting this would make every swap land after the vblank. Tracked as an
+// exponential moving average of the previous frames.
+long long g_RollbackPresentRenderUs = 0;
+// Target: swap this long before the vblank. Leaves room for scheduler jitter
+// and for a slower-than-average render without missing the vblank.
+constexpr long long kGekkoPresentPhaseLeadUs = 2000;
+// Never compensate more than this, so there is always a margin left even when
+// a render spike would otherwise eat the whole lead.
+constexpr long long kGekkoPresentRenderCompensationMaxUs = 1600;
+// Ignore corrections smaller than this: below it the display-timing sample
+// noise is larger than the correction, and not steering keeps the cadence
+// perfectly even.
+constexpr long long kGekkoPresentPhaseDeadbandUs = 50;
+constexpr double g_GekkoPresentPhaseMaxStepFraction = 0.005;
+constexpr long long kGekkoPresentRefreshMinUs = 5000;
+constexpr long long kGekkoPresentRefreshMaxUs = 40000;
+// Only phase-lock when the panel refresh is within this fraction of the
+// emulated rate. Holding the phase means matching the panel rate, so a wider
+// window would audibly speed up slower boards (NeoGeo runs at 59.18 Hz, which
+// is 1.4% off a 60 Hz panel). 0.3% covers the 59.94 -> 60.000 beat (~0.1%).
+constexpr double kGekkoPresentRateToleranceFraction = 0.003;
+
+// Whether the frontend can currently report usable vblank timing.
+bool sample_present_timing(long long* vblankAgeUs, long long* refreshUs)
+{
+    if (g_PresentTimingProvider == nullptr ||
+        !g_PresentTimingProvider(vblankAgeUs, refreshUs))
+    {
+        return false;
+    }
+
+    if (*refreshUs < kGekkoPresentRefreshMinUs ||
+        *refreshUs > kGekkoPresentRefreshMaxUs)
+    {
+        return false;
+    }
+
+    return true;
+}
+
 // Full-loop-iteration phase marks (absolute steady_clock microseconds since
 // epoch), recorded once per visible frame at well-defined points around the
-// Execute() loop so the unaccounted gap between the pacing hook and SwapBuffers
-// can be split into: hook->RunFrame, RunFrame, RunFrame->present, present,
-// present->end_frame, end_frame, end_frame->next hook.
+// Execute() loop so the unaccounted gap before SwapBuffers can be split into:
+// begin->RunFrame, RunFrame, RunFrame->pacer, pacer, present. The present pacer
+// runs after RunFrame now, so its exit mark lands between RunFrameExit and
+// PresentEntry rather than before RunFrameEntry.
 enum RmgkLoopMark
 {
     kRmgkLoopMarkBeginEntry = 0,
@@ -507,6 +563,9 @@ void reset_rollback_present_pacer()
     // The rollback presentation pacer is a permanent part of the rollback
     // frame path. It remains gated below by the active session/execution checks.
     g_RollbackPresentPacerEnabled = true;
+    g_RollbackPresentPhaseAlign = false;
+    g_RollbackPresentRenderUs = 0;
+    g_RollbackPresentHookReturnValid = false;
 
     g_RollbackPresentBaseHz = 60.0;
     g_RollbackPresentBaseHzOverridden = false;
@@ -545,7 +604,11 @@ void record_rollback_present_pacing(
     long long waitRequestedUs,
     long long waitActualUs,
     long long lateUs,
-    long long intervalAfterWaitUs)
+    long long intervalAfterWaitUs,
+    int phaseAlign,
+    long long vblankAgeUs,
+    long long refreshUs,
+    long long phaseSteerUs)
 {
     if (!g_RmgkPacingTraceEnabled ||
         g_RmgkPacingTraceActiveRow ==
@@ -572,6 +635,10 @@ void record_rollback_present_pacing(
     row.presentLateUs = lateUs;
     row.presentIntervalAfterWaitUs =
         intervalAfterWaitUs;
+    row.presentPhaseAlign = phaseAlign;
+    row.presentVblankAgeUs = vblankAgeUs;
+    row.presentRefreshUs = refreshUs;
+    row.presentPhaseSteerUs = phaseSteerUs;
 }
 
 long long rmgk_pacing_trace_now_us()
@@ -619,6 +686,8 @@ void rmgk_pacing_trace_flush()
             << "present_interval_before_wait_us,"
             << "present_wait_requested_us,present_wait_actual_us,"
             << "present_late_us,present_interval_after_wait_us,"
+            << "present_phase_align,present_vblank_age_us,"
+            << "present_refresh_us,present_phase_steer_us,"
             << "swap_us,make_current_us,swap_path,"
             << "present_hook_to_swap_begin_us,present_hook_to_swap_end_us,"
             << "visible_total_us,visible_interrupt_us,"
@@ -693,6 +762,10 @@ void rmgk_pacing_trace_flush()
                 << row.presentWaitActualUs << ','
                 << row.presentLateUs << ','
                 << row.presentIntervalAfterWaitUs << ','
+                << row.presentPhaseAlign << ','
+                << row.presentVblankAgeUs << ','
+                << row.presentRefreshUs << ','
+                << row.presentPhaseSteerUs << ','
                 << row.swapUs << ','
                 << row.makeCurrentUs << ','
                 << row.swapPath << ','
@@ -3591,6 +3664,13 @@ bool rmgk_gekko::start_local_session(const char* gameName, int players, int inpu
     gekko_start(g_GekkoSession, &config);
     gekko_set_runahead(g_GekkoSession, 0);
 
+    // Local play is the only place the display phase lock is safe: there is no
+    // GekkoNet tick to keep in step, and running the emulator at the panel's
+    // exact refresh rate is what makes the phase lock hold. Netplay forces
+    // this off through close_session().
+    g_RollbackPresentPhaseAlign =
+        CoreSettingsGetBoolValue(SettingsID::Rollback_PresentPhaseAlign);
+
     g_GekkoPlayers = players;
     g_GekkoActors = players; // local/stress seats are always contiguous 1..players
     g_GekkoInputSize = inputSize;
@@ -3668,6 +3748,7 @@ void rmgk_gekko::close_session()
 {
 #ifdef RMGK_HAVE_GEKKONET
     rmgk_pacing_trace_flush();
+    g_RollbackPresentPhaseAlign = false;
     g_GekkoStopRequested.store(false, std::memory_order_relaxed);
     clear_core_input_callback();
     if (g_GekkoSession != nullptr)
@@ -3933,6 +4014,11 @@ GekkoLiveStats rmgk_gekko::get_live_stats()
 }
 
 
+void rmgk_gekko::set_present_timing_provider(PresentTimingProvider provider)
+{
+    g_PresentTimingProvider = provider;
+}
+
 void rmgk_gekko::pace_before_present()
 {
 #ifdef RMGK_HAVE_GEKKONET
@@ -3994,6 +4080,10 @@ void rmgk_gekko::pace_before_present()
             0,
             0,
             0,
+            0,
+            0,
+            0,
+            0,
             0);
         return;
     }
@@ -4005,8 +4095,105 @@ void rmgk_gekko::pace_before_present()
                     double,
                     std::micro>(periodUs));
 
-    const auto deadline =
+    const auto gridDeadline =
         g_RollbackPresentTargetTime + period;
+
+    auto deadline = gridDeadline;
+
+    /*
+     * Optional display phase lock. The free-running grid beats against the
+     * monitor: at 59.94 Hz on a 60.000 Hz panel the swap phase walks ~16.7 us
+     * later every frame, so roughly once every 16 s it lands just after a
+     * vblank and the visible frame waits a whole extra refresh. With vblank
+     * timing from the frontend, aim the swap at a fixed point just before the
+     * vblank instead. That means matching the panel rate (up to 0.3%, gated
+     * below) and correcting at most 0.5% of a period per frame, so the
+     * cadence never jumps. Falling back to the grid is always safe: the grid
+     * is the same pacer that has always run here.
+     */
+    int phaseAlign = 0;
+    long long vblankAgeUs = 0;
+    long long refreshUs = 0;
+    long long phaseSteerUs = 0;
+
+    // Sample display timing whenever it might matter: for steering, or for the
+    // pacing trace (so the "did we miss the vblank" question is measurable even
+    // with the lock disabled, e.g. during netplay).
+    const bool havePresentTiming =
+        (g_RollbackPresentPhaseAlign || g_RmgkPacingTraceEnabled) &&
+        sample_present_timing(&vblankAgeUs, &refreshUs);
+
+    if (havePresentTiming &&
+        g_RollbackPresentPhaseAlign &&
+        static_cast<double>(refreshUs) > periodUs * (1.0 - kGekkoPresentRateToleranceFraction) &&
+        static_cast<double>(refreshUs) < periodUs * (1.0 + kGekkoPresentRateToleranceFraction))
+    {
+        long long ageUs = vblankAgeUs % refreshUs;
+        if (ageUs < 0)
+        {
+            ageUs += refreshUs;
+        }
+
+        const long long renderUs =
+            std::clamp<long long>(
+                g_RollbackPresentRenderUs,
+                0,
+                kGekkoPresentRenderCompensationMaxUs);
+
+        // Time from now to the wait deadline that would put the swap
+        // kGekkoPresentPhaseLeadUs before the next vblank.
+        long long untilPhaseUs =
+            (refreshUs - ageUs) -
+            kGekkoPresentPhaseLeadUs -
+            renderUs;
+        if (untilPhaseUs < 0)
+        {
+            // That vblank is already too close (or just passed): target the
+            // one after it rather than presenting in the middle of the scan.
+            untilPhaseUs += refreshUs;
+        }
+
+        const auto phaseDeadline =
+            now + std::chrono::duration_cast<
+                std::chrono::steady_clock::duration>(
+                    std::chrono::duration<
+                        double,
+                        std::micro>(
+                            static_cast<double>(untilPhaseUs)));
+
+        if (std::llabs(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    phaseDeadline - gridDeadline).count()) >
+            kGekkoPresentPhaseDeadbandUs)
+        {
+            const auto maxStep =
+                std::chrono::duration_cast<
+                    std::chrono::steady_clock::duration>(
+                        std::chrono::duration<
+                            double,
+                            std::micro>(
+                                periodUs *
+                                g_GekkoPresentPhaseMaxStepFraction));
+
+            deadline = std::clamp(phaseDeadline, gridDeadline - maxStep, gridDeadline + maxStep);
+            phaseSteerUs =
+                std::chrono::duration_cast<
+                    std::chrono::microseconds>(
+                        deadline - gridDeadline).count();
+        }
+
+        // A saturated loop (the emulated frame already ran past the grid
+        // deadline) has no slack to give: delaying it further to chase the
+        // display phase would only slow the frame rate down. Present as soon
+        // as possible and let the lock re-acquire when there is slack again.
+        if (now >= gridDeadline)
+        {
+            deadline = gridDeadline;
+            phaseSteerUs = 0;
+        }
+
+        phaseAlign = 1;
+    }
 
     const long long intervalBeforeWaitUs =
         std::chrono::duration_cast<
@@ -4101,7 +4288,11 @@ void rmgk_gekko::pace_before_present()
         waitRequestedUs,
         waitActualUs,
         lateUs,
-        intervalAfterWaitUs);
+        intervalAfterWaitUs,
+        phaseAlign,
+        vblankAgeUs,
+        refreshUs,
+        phaseSteerUs);
 #else
     return;
 #endif
@@ -4138,6 +4329,38 @@ void rmgk_gekko::trace_swap_duration(
     int path)
 {
 #ifdef RMGK_HAVE_GEKKONET
+    // Track how long the visible frame takes from the pacer's return to the
+    // swap regardless of tracing: the phase lock has to end its wait early
+    // enough for the swap to still land before the vblank.
+    if (g_RollbackPresentHookReturnValid)
+    {
+        const long long hookToSwapEndUs =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() -
+                g_RollbackPresentHookReturnTime).count();
+        const long long renderUs =
+            std::clamp<long long>(
+                hookToSwapEndUs - swapUs - makeCurrentUs,
+                0,
+                kGekkoPresentRenderCompensationMaxUs);
+
+        g_RollbackPresentRenderUs =
+            g_RollbackPresentRenderUs == 0
+                ? renderUs
+                : (g_RollbackPresentRenderUs * 3 + renderUs) / 4;
+        g_RollbackPresentHookReturnValid = false;
+
+        if (g_RmgkPacingTraceEnabled &&
+            g_RmgkPacingTraceActiveRow != kRmgkPacingTraceInvalidRow &&
+            g_RmgkPacingTraceActiveRow < g_RmgkPacingTraceRows.size())
+        {
+            auto& row =
+                g_RmgkPacingTraceRows[g_RmgkPacingTraceActiveRow];
+            row.presentHookToSwapEndUs = hookToSwapEndUs;
+            row.presentHookToSwapBeginUs = renderUs;
+        }
+    }
+
     if (!g_RmgkPacingTraceEnabled ||
         g_RmgkPacingTraceActiveRow ==
             kRmgkPacingTraceInvalidRow ||
@@ -4156,18 +4379,15 @@ void rmgk_gekko::trace_swap_duration(
     row.makeCurrentUs = makeCurrentUs;
     row.swapPath = path;
 
-    if (g_RollbackPresentHookReturnValid)
+    // Present age at the swap itself (not at the pacer entry): this is the
+    // number that says whether the frame actually landed before a vblank.
+    // Diagnostic only, so it is sampled just when the pacing trace is on.
+    long long presentAgeUs = 0;
+    long long presentRefreshUs = 0;
+    if (sample_present_timing(&presentAgeUs, &presentRefreshUs))
     {
-        const long long hookToSwapEndUs =
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() -
-                g_RollbackPresentHookReturnTime).count();
-        row.presentHookToSwapEndUs = hookToSwapEndUs;
-        row.presentHookToSwapBeginUs =
-            std::max<long long>(
-                0,
-                hookToSwapEndUs - swapUs - makeCurrentUs);
-        g_RollbackPresentHookReturnValid = false;
+        row.presentVblankAgeUs = presentAgeUs;
+        row.presentRefreshUs = presentRefreshUs;
     }
 #else
     (void)swapUs;
@@ -4181,11 +4401,12 @@ static void rollback_pace_before_present(void* userData)
     (void)userData;
     rmgk_gekko::pace_before_present();
 
+    g_RollbackPresentHookReturnTime =
+        std::chrono::steady_clock::now();
+    g_RollbackPresentHookReturnValid = true;
+
     if (g_RmgkPacingTraceEnabled)
     {
-        g_RollbackPresentHookReturnTime =
-            std::chrono::steady_clock::now();
-        g_RollbackPresentHookReturnValid = true;
         g_RmgkLoopMarks[kRmgkLoopMarkPacerExit].store(
             rmgk_pacing_trace_now_us(), std::memory_order_relaxed);
     }

@@ -103,6 +103,15 @@ class rmgk_gekko
     // plugin rendering callback immediately before OpenGL or Vulkan presents.
     static void pace_before_present();
 
+    // Display vblank timing provider, registered by the frontend. When it
+    // returns true, the present pacer can phase-lock the visible frame to the
+    // display refresh instead of a free-running clock grid. `vblankAgeUs` is
+    // the time since the most recent vblank (normalized into one refresh
+    // period) and `refreshUs` is the current refresh period, both in
+    // microseconds. The provider must be cheap and thread-safe.
+    typedef bool (*PresentTimingProvider)(long long* vblankAgeUs, long long* refreshUs);
+    static void set_present_timing_provider(PresentTimingProvider provider);
+
     // Buffered rollback-pacing trace hook used by VidExt.cpp.
     // No-op unless Rollback -> Logging -> Pacing Trace is enabled.
     static void trace_swap_duration(long long swapUs, long long makeCurrentUs, int path);

@@ -239,7 +239,7 @@ install(FILES ${RMG_TRANSLATION_QM_FILES}
 )
 
 if (WIN32)
-    target_link_libraries(RMG opengl32 gdi32 user32)
+    target_link_libraries(RMG opengl32 gdi32 user32 dwmapi)
 endif(WIN32)
 
 if (NOT WIN32)

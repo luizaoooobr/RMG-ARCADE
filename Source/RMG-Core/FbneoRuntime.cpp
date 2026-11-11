@@ -1512,12 +1512,16 @@ bool Execute(const m64p_rollback_execute_callbacks& callbacks)
     {
         int r = callbacks.begin_frame ? callbacks.begin_frame(callbacks.user_data) : 0;
         if (r != 1) break;
-        if (callbacks.pace_before_present)
-            callbacks.pace_before_present(callbacks.user_data);
         rmgk_gekko_trace_loop_mark(3);
         RunFrame(Output_Video | Output_Audio);
         rmgk_gekko_trace_loop_mark(4);
         debug_maybe_dump_frame();
+        // Pace immediately before the present, not before the emulated frame.
+        // The pacer's deadline is a presentation deadline: sleeping before
+        // RunFrame makes the swap land one frame_time late, which pushes it
+        // past the display vblank and costs a full refresh of latency.
+        if (callbacks.pace_before_present)
+            callbacks.pace_before_present(callbacks.user_data);
         if (g_presentCallback)
         {
             rmgk_gekko_trace_loop_mark(5);

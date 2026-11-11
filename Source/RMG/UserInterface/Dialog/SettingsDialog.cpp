@@ -241,6 +241,15 @@ SettingsDialog::SettingsDialog(QWidget *parent, QString file) : QDialog(parent)
     QGroupBox* rollbackLoggingGroupBox = new QGroupBox(tr("Logging"), rollbackTab);
     QVBoxLayout* rollbackLoggingLayout = new QVBoxLayout(rollbackLoggingGroupBox);
     this->rollbackEnableLocalTestingCheckBox = new QCheckBox(tr("Use rollback engine for local play"), rollbackTab);
+    this->rollbackPresentPhaseAlignCheckBox = new QCheckBox(tr("Align presentation to the display refresh (lower input lag)"), rollbackTab);
+    this->rollbackPresentPhaseAlignCheckBox->setToolTip(
+        tr("Local play only. Aligns frame presentation with the display's vblank so the\n"
+            "frame reaches the screen at the first opportunity instead of occasionally\n"
+            "waiting an extra refresh, which cuts average input lag by around half a frame\n"
+            "and removes the periodic judder from the game rate beating against the panel.\n"
+            "Holds the phase by adjusting the frame rate by at most 0.5%. Needs the Windows\n"
+            "desktop compositor; falls back to the normal pacing and is disabled during\n"
+            "netplay."));
     this->rollbackVerboseStatsCheckBox = new QCheckBox(tr("Enable verbose rollback stats logging"), rollbackLoggingGroupBox);
     this->rollbackStallDiagnosticsCheckBox = new QCheckBox(tr("Log netplay stalls only (lightweight freeze diagnostics)"), rollbackLoggingGroupBox);
     this->rollbackStallDiagnosticsCheckBox->setToolTip(
@@ -272,6 +281,7 @@ SettingsDialog::SettingsDialog(QWidget *parent, QString file) : QDialog(parent)
         "including Quick Match. Choosing Auto remembers Auto instead of its calculated value.\n"
         "When disabled, each new room starts on Auto. Applies the next time you enter a room.");
     rollbackLayout->addWidget(this->rollbackEnableLocalTestingCheckBox);
+    rollbackLayout->addWidget(this->rollbackPresentPhaseAlignCheckBox);
     rollbackLayout->addWidget(this->rollbackHideLocationCheckBox);
     rollbackLayout->addWidget(this->rollbackRememberInputDelayCheckBox);
     rollbackLoggingLayout->addWidget(this->rollbackVerboseStatsCheckBox);
@@ -1025,6 +1035,7 @@ void SettingsDialog::loadRollbackSettings(void)
     this->rollbackStallDiagnosticsCheckBox->setChecked(CoreSettingsGetBoolValue(SettingsID::Rollback_StallDiagnostics));
     this->rollbackPacingTraceCheckBox->setChecked(CoreSettingsGetBoolValue(SettingsID::Rollback_PacingTrace));
     this->rollbackEnableLocalTestingCheckBox->setChecked(CoreSettingsGetBoolValue(SettingsID::Rollback_EnableLocalTesting));
+    this->rollbackPresentPhaseAlignCheckBox->setChecked(CoreSettingsGetBoolValue(SettingsID::Rollback_PresentPhaseAlign));
     this->rollbackVerbosePifInputLoggingCheckBox->setChecked(CoreSettingsGetBoolValue(SettingsID::Rollback_VerbosePifInputLogging));
     this->rollbackVerboseGlideInputLoggingCheckBox->setChecked(CoreSettingsGetBoolValue(SettingsID::Rollback_VerboseGlideInputLogging));
     this->rollbackPingDiagnosticsCheckBox->setChecked(CoreSettingsGetBoolValue(SettingsID::Rollback_PingDiagnostics));
@@ -1248,6 +1259,7 @@ void SettingsDialog::loadDefaultRollbackSettings(void)
     this->rollbackStallDiagnosticsCheckBox->setChecked(CoreSettingsGetDefaultBoolValue(SettingsID::Rollback_StallDiagnostics));
     this->rollbackPacingTraceCheckBox->setChecked(CoreSettingsGetDefaultBoolValue(SettingsID::Rollback_PacingTrace));
     this->rollbackEnableLocalTestingCheckBox->setChecked(CoreSettingsGetDefaultBoolValue(SettingsID::Rollback_EnableLocalTesting));
+    this->rollbackPresentPhaseAlignCheckBox->setChecked(CoreSettingsGetDefaultBoolValue(SettingsID::Rollback_PresentPhaseAlign));
     this->rollbackVerbosePifInputLoggingCheckBox->setChecked(CoreSettingsGetDefaultBoolValue(SettingsID::Rollback_VerbosePifInputLogging));
     this->rollbackVerboseGlideInputLoggingCheckBox->setChecked(CoreSettingsGetDefaultBoolValue(SettingsID::Rollback_VerboseGlideInputLogging));
     this->rollbackPingDiagnosticsCheckBox->setChecked(CoreSettingsGetDefaultBoolValue(SettingsID::Rollback_PingDiagnostics));
@@ -1529,6 +1541,7 @@ void SettingsDialog::saveRollbackSettings(void)
     CoreSettingsSetValue(SettingsID::Rollback_StallDiagnostics, this->rollbackStallDiagnosticsCheckBox->isChecked());
     CoreSettingsSetValue(SettingsID::Rollback_PacingTrace, this->rollbackPacingTraceCheckBox->isChecked());
     CoreSettingsSetValue(SettingsID::Rollback_EnableLocalTesting, this->rollbackEnableLocalTestingCheckBox->isChecked());
+    CoreSettingsSetValue(SettingsID::Rollback_PresentPhaseAlign, this->rollbackPresentPhaseAlignCheckBox->isChecked());
     CoreSettingsSetValue(SettingsID::Rollback_VerbosePifInputLogging, this->rollbackVerbosePifInputLoggingCheckBox->isChecked());
     CoreSettingsSetValue(SettingsID::Rollback_VerboseGlideInputLogging, this->rollbackVerboseGlideInputLoggingCheckBox->isChecked());
     CoreSettingsSetValue(SettingsID::Rollback_PingDiagnostics, this->rollbackPingDiagnosticsCheckBox->isChecked());
